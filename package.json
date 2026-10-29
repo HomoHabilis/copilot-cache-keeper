@@ -1,0 +1,99 @@
+{
+  "name": "copilot-cache-keeper",
+  "displayName": "Copilot Cache Keeper",
+  "description": "Warns before a Copilot chat's prompt cache expires; keep it warm or write a handoff summary.",
+  "version": "0.7.5",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cacheKeeper.options",
+        "title": "Cache Keeper: Manage chats in this window"
+      },
+      {
+        "command": "cacheKeeper.keepWarmNow",
+        "title": "Cache Keeper: Keep warm now"
+      },
+      {
+        "command": "cacheKeeper.summaryNow",
+        "title": "Cache Keeper: Write handoff summary now"
+      },
+      {
+        "command": "cacheKeeper.stop",
+        "title": "Cache Keeper: Stop keeping warm"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Cache Keeper",
+      "properties": {
+        "cacheKeeper.warnSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Warn this many seconds before the cache expires."
+        },
+        "cacheKeeper.thresholdCredits": {
+          "type": "number",
+          "default": 60,
+          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn."
+        },
+        "cacheKeeper.autoSummary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Above the threshold, write a handoff summary if nobody answers the warning."
+        },
+        "cacheKeeper.minCredits": {
+          "type": "number",
+          "default": 5,
+          "description": "Ignore sessions where an expired cache would cost less than this."
+        },
+        "cacheKeeper.ttlSeconds": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Cache lifetime override per model id, in seconds, e.g. {\"claude-opus-5.5\": 300}. Otherwise learned from Copilot CLI logs, then built-in defaults (Claude 300, Sol 6.1 1800, others 300)."
+        },
+        "cacheKeeper.keepAliveLeadSeconds": {
+          "type": "number",
+          "default": 5,
+          "minimum": 2,
+          "description": "Send keep-alives this many seconds before the cache expires (all models). A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper; too late risks missing it."
+        },
+        "cacheKeeper.afterSend": {
+          "type": "string",
+          "default": "restoreLastTyped",
+          "enum": [
+            "restoreLastTyped",
+            "closeTab",
+            "keepTab"
+          ],
+          "enumDescriptions": [
+            "Put the chat where you last typed back into the Chat view; close the other tabs. Right as long as you type in the chat you are looking at.",
+            "Just close the tab. If the chat was in the Chat view, the view falls back to the sessions list.",
+            "Leave the tab open; nothing is moved or closed."
+          ],
+          "description": "What to do with the chat tab Cache Keeper opened to send a keep-alive or summary, once the reply is in. (VS Code does not tell extensions which chat the Chat view shows, so only where you last typed is known.)"
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HomoHabilis/copilot-cache-keeper.git"
+  }
+}
