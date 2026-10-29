@@ -145,3 +145,20 @@ python3 build.py
 
 This writes `copilot-cache-keeper-<version>.vsix` next to the sources.
 
+
+## Tests and releases
+
+- **Smoke test** (`.github/workflows/ci.yml`, on every push and pull request): syntax check,
+  `node test/smoke.js`, and a check of the built `.vsix`. `test/smoke.js` tests the cost and
+  timing logic on a synthetic Copilot log, and the extension itself with a stand-in for the
+  VS Code API, sending a keep-alive before the cache expires. Run it locally with
+  `node test/smoke.js`.
+- **Release** (`.github/workflows/release.yml`): GitHub → *Actions* → **Release** →
+  **Run workflow**. It runs the smoke test first, then:
+  - **Existing tag:** pick it in *Use workflow from*, and leave "tag" empty.
+  - **New tag:** stay on a branch (e.g. `main`) and type the tag, e.g. `v0.7.6`. It's
+    created on that branch's latest commit.
+  - **Both empty:** the tag is `v` + the version in `package.json`.
+
+  The `.vsix` is built with the tag's version and attached to a GitHub release with generated
+  notes.

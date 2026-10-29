@@ -1,0 +1,50 @@
+name: Smoke test
+
+on:
+  push:
+  pull_request:
+  workflow_call:      # reused by the release workflow before publishing
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Syntax check
+        run: |
+          node --check extension.js
+          node --check core.js
+          node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
+
+      - name: Smoke test (core logic + extension with a stand-in VS Code)
+        run: node test/smoke.js
+
+      - name: Build the .vsix
+        run: python3 build.py
+
+      - name: Check the .vsix contents
+        run: |
+          set -e
+          VSIX=$(ls copilot-cache-keeper-*.vsix)
+          python3 - "$VSIX" <<'EOF'
+          import json, sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          names = set(z.namelist())
+          need = {"[Content_Types].xml", "extension.vsixmanifest", "extension/package.json",
+                  "extension/extension.js", "extension/core.js"}
+          missing = need - names
+          assert not missing, f"missing in vsix: {missing}"
+          pkg = json.loads(z.read("extension/package.json"))
+          manifest = z.read("extension.vsixmanifest").decode()
+          assert f'Version="{pkg["version"]}"' in manifest, "manifest version differs from package.json"
+          assert pkg["main"] == "./extension.js"
+          print(f"{sys.argv[1]}: {len(names)} files, version {pkg['version']}, OK")
+          EOF
