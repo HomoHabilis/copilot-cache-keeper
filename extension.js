@@ -11,6 +11,7 @@ const HEARTBEAT = `${core.MARKER} Keep-alive while I'm away. Reply with only: OK
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
 const SUMMARY_LEAD = 15;       // seconds before expiry for an automatic summary
+const QUEUED_AFTER_MS = 8000;  // our message not in the log by then: it was queued
 // Automatic actions only for chats seen active since this window started: after a reload the
 // Chat view may show another chat, and a brand-new chat leaves no trace in the logs.
 const startedAt = Date.now();
@@ -265,21 +266,31 @@ function withUi(fn) {
   return run;
 }
 
-async function trySend(context, s, text, label) {
+async function trySend(context, s, text, label, opts = {}) {
   if (sending) { logx(`${label} for ${s.id.slice(0, 8)} waits: another chat is being handled`); return false; }
-  return withUi(() => sendNow(context, s, text, label));
+  return withUi(() => sendNow(context, s, text, label, opts));
 }
 
-async function sendNow(context, s, text, label) {
+// Never let a message land on an expired cache: it would re-send the whole context. Last check
+// just before submitting: the chat must be idle, on the same cache window, with this much left.
+const MIN_LEFT_S = 1.5;
+
+/** Is it still safe to send into this chat now? Returns why not, or "". */
+async function unsafeToSend(s, opts) {
+  const fresh = (await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {})) || s;
+  if (fresh.busy) return "agent working (it would be queued and could run after the cache expired)";
+  if (fresh.cacheFrom !== s.cacheFrom) return "a newer call refreshed the cache";
+  if (!opts.allowCold && live(s) < MIN_LEFT_S) return `only ${live(s).toFixed(1)} s left, too late to be sure it lands warm`;
+  return "";
+}
+
+async function sendNow(context, s, text, label, opts = {}) {
   // timed from the decision, so the measured offset includes opening the tab, submitting and the
   // network: the countdown then shifts earlier by the whole delay
   const decidedAt = Date.now();
   const st = stateFor(s.id);
-  const fresh = (await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {})) || s;
-  if (fresh.busy || fresh.cacheFrom !== s.cacheFrom) {             // you or the agent moved on
-    logx(`${label} for ${s.id.slice(0, 8)} not sent: ${fresh.busy ? "agent working" : "a newer call refreshed the cache"}`);
-    return false;
-  }
+  const why = await unsafeToSend(s, opts);
+  if (why) { logx(`${label} for ${s.id.slice(0, 8)} not sent: ${why}`); return false; }
   try {
     const before = allTabKeys();
     await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: sessionUri(s.id) });
@@ -294,8 +305,15 @@ async function sendNow(context, s, text, label) {
     const restore = !!opened && s.lastRealUserTs === latestReal;
     // remember each chat's last message time (remote clock) to recognise ours when it lands
     const lastMsgs = new Map(all.map(x => [x.id, x.lastUserTs || 0]));
-    if (live(s) < 1.5) logx(`warning: ${label} for ${s.id.slice(0, 8)} sent with only ${live(s).toFixed(1)} s left`);
-    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, before: lastMsgs };
+    // opening the tab took time: check again right before submitting
+    const late = await unsafeToSend(s, opts);
+    if (late) {
+      logx(`${label} for ${s.id.slice(0, 8)} not sent: ${late}`);
+      if (opened) await finishTab({ tab: opened, restore, sessionId: s.id });
+      return false;
+    }
+    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, before: lastMsgs,
+                   miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
     await vscode.commands.executeCommand("workbench.action.chat.submit", { inputValue: text });
     logx(`${label} sent to ${s.id.slice(0, 8)} (${describe(s)})${opened ? ", in a tab opened for it" : ""}`);
@@ -354,9 +372,18 @@ async function verifyPending() {
           "Stopped acting on the original chat.");
       }
     }
+    // Not in the log a few seconds after submitting: Copilot queued it behind work that started in
+    // the meantime. It cannot be taken back from here, and it may run on an expired cache.
+    if (!p.landed && !p.queuedWarned && Date.now() - p.sentAt > QUEUED_AFTER_MS) {
+      p.queuedWarned = true;
+      logx(`${p.label} for ${p.expectId.slice(0, 8)} not started after ${QUEUED_AFTER_MS / 1000} s: probably queued`);
+      vscode.window.showWarningMessage(`Cache Keeper: the ${p.label} did not start; the chat is probably busy and ` +
+        "it is queued. If it runs after the cache expires it re-sends the whole context" +
+        (p.miss ? ` (~${core.fmt(p.miss)} cr extra)` : "") + ". Remove it from the chat's queue if you don't want that.");
+    }
     const done = p.landed && !(pool.find(x => x.id === p.landed) || {}).busy;
     if (done || Date.now() - p.sentAt > 90000) {
-      if (!p.landed) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
+      if (!p.landed && !p.queuedWarned) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
       if (p.tab) withUi(() => finishTab(p));
       st.pending = null;
     }
@@ -415,9 +442,9 @@ async function summary(context, s, why) {
   return true;
 }
 
-async function keepAlive(context, s) {
+async function keepAlive(context, s, opts = {}) {
   const cold = live(s) <= 0;     // only possible from the command: the whole context is re-sent
-  const ok = await trySend(context, s, HEARTBEAT, "keep-alive");
+  const ok = await trySend(context, s, HEARTBEAT, "keep-alive", opts);
   if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;
   return ok;
 }
@@ -431,7 +458,7 @@ async function keepWarmNow(context, s) {
       price + " The cache is then warm again.", { modal: true }, "Send anyway");
     if (go !== "Send anyway") return;
   }
-  await keepAlive(context, s);
+  await keepAlive(context, s, { allowCold: true });   // you chose to send it, cold or warm
 }
 
 // ---------------------------------------------------------------- choices

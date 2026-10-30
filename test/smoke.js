@@ -66,7 +66,7 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = fals
  * undefined (closed with X) or a promise that never settles (not answered). Messages Cache Keeper
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
-async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
+async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -105,6 +105,8 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
       executeCommand: async (id, a) => {
         if (id === "workbench.action.chat.openSessionInEditorGroup") {
           vscode.window.tabGroups.all[0].tabs = [tab]; vscode.window.tabGroups.all[0].activeTab = tab;
+          // the agent starts working (e.g. a subagent) while the tab is being opened
+          if (busyOnOpen) append([{ type: "turn_start", ts: clock }]);
         }
         if (id === "workbench.action.chat.submit") {
           sent.push({ at: clock, text: a.inputValue });
@@ -280,6 +282,14 @@ const never = () => new Promise(() => {});
       const leftAtSend = 300 - (h.sent[0].at - startedCall) / 1000;
       // 5 s lead + 3 s margin until the clock offset is measured, decided once per second
       assert.ok(leftAtSend > 1.5 && leftAtSend <= 9, `sent with ${leftAtSend.toFixed(1)} s left`);
+    } finally { h.close(); }
+  });
+
+  await check("send: not submitted if the agent starts working while the chat tab opens", async () => {
+    const h = await harness({ answer: () => "Auto keep warm", busyOnOpen: true });
+    try {
+      await h.run(320);
+      assert.strictEqual(h.sent.length, 0, "nothing queued behind the agent");
     } finally { h.close(); }
   });
 
