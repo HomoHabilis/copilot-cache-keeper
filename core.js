@@ -17,6 +17,7 @@ const UNKNOWN_TTL = 300;       // assume the short lifetime for other models
 const KEEPALIVE_MIN_NEW = 400; // never assume a keep-alive adds fewer uncached tokens than this
 const KEEPALIVE_NEW = 600;     // tokens a keep-alive adds uncached besides the agent's last reply
                                // (VS Code's per-message context block + our one-line message)
+const BUSY_CAP_MS = 6 * 3600 * 1000; // an open turn this quiet is taken as one that never logged its end
 const HEARTBEAT_OUT = 30;      // "OK"
 const SUMMARY_CALLS = 2;       // write the file, then confirm
 const TOKENS_PER_WORD = 1.4;
@@ -141,11 +142,20 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const userMessages = events.filter(e => e.type === "user_message");
   const lastUser = userMessages[userMessages.length - 1];
   const isOurs = u => String((u.attrs && u.attrs.content) || "").startsWith(MARKER);
-  // Busy: a message was sent or a turn started after the last turn ended. (Not "the log changed":
-  // VS Code also appends discovery lines to a chat's log when another chat is opened.)
-  const lastStart = Math.max(0, ...events.filter(e => e.type === "turn_start" || e.type === "user_message").map(e => e.ts || 0));
-  const lastTurnEnd = Math.max(0, ...events.filter(e => e.type === "turn_end").map(e => e.ts || 0));
-  const busy = lastStart > lastTurnEnd && now - lastStart < 15 * 60 * 1000;   // cap: a turn that never logged its end
+  // Busy: a turn is still open. Turns nest (a subagent logs its own turn_start/turn_end inside the
+  // agent's turn), so count depth rather than comparing the last start with the last end; a message
+  // sent after everything closed also counts (its turn_start may not be logged yet). (Not "the log
+  // changed": VS Code also appends discovery lines to a chat's log when another chat is opened.)
+  let depth = 0, pendingMsg = false, lastActivity = 0;
+  for (const e of [...events].sort((x, y) => (x.ts || 0) - (y.ts || 0))) {
+    if (e.type === "turn_start") { depth++; pendingMsg = false; }
+    else if (e.type === "turn_end") { depth = Math.max(0, depth - 1); if (!depth) pendingMsg = false; }
+    else if (e.type === "user_message" && depth === 0) pendingMsg = true;
+    if (/^(turn_start|turn_end|user_message|llm_request|tool_call)$/.test(e.type)) lastActivity = Math.max(lastActivity, e.ts || 0);
+  }
+  // A long tool run (tests, a push) logs nothing until it ends, so no short cap: only a turn quiet
+  // for hours is taken as one that never logged its end.
+  const busy = (depth > 0 || pendingMsg) && now - lastActivity < BUSY_CAP_MS;
   const ttl = ttlFor(model, ttlOverrides);
   // What the chat contains, for sizing a handoff summary.
   const realTurns = userMessages.filter(u => !isOurs(u)).length;

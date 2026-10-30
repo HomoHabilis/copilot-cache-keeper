@@ -213,6 +213,21 @@ const never = () => new Promise(() => {});
     assert.ok(Math.abs(s.cost.missExtra - 57) < 0.1, `missExtra ${s.cost.missExtra}`);
   });
 
+  await check("analyze: busy through a long tool run and a subagent's own turns", () => {
+    const t0 = now - 40 * 60000;                      // turn started 40 min ago, still open
+    const ev = [
+      { type: "user_message", ts: t0, attrs: { content: "run the mutation tests then push" } },
+      { type: "turn_start", ts: t0 + 10 },
+      { type: "llm_request", ts: t0 + 50, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 80000, cachedTokens: 0, outputTokens: 300, copilotUsageNanoAiu: 40e9 } },
+      { type: "turn_start", ts: t0 + 3000 },          // subagent
+      { type: "turn_end", ts: t0 + 9000 },            // subagent done; the agent's turn is still open
+      { type: "tool_call", ts: t0 + 10000, name: "run_in_terminal" },   // long run: nothing logged since
+    ];
+    const s = core.analyze("/logs/long", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, true);
+  });
+
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
     const busy = chatLog(now - 5000).replace(/.*"turn_end".*\n$/, "");
     assert.strictEqual(core.analyze("/logs/b", busy, MODELS, now).busy, true);
