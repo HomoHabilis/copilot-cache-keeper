@@ -16,7 +16,7 @@ full price.
     `agent working · cache 2:41` and never sends anything into that chat: a message would be
     queued and could run after the cache expired.
   - **Expired and large:** when that chat's cache has expired and its context is at least
-    `cacheKeeper.expiredWarnTokens` (default 50k tokens), the status bar turns orange:
+    `cacheKeeper.thresholdTokens` (default 100k tokens), the status bar turns orange:
     `⚠ cache expired: next msg +72 cr`. Coming back to an old chat, this tells you before you type
     that your next message re-sends all of it. The threshold is in tokens because a cold send
     costs about context × the model's input price, so one value fits Haiku and Opus alike; the
@@ -28,9 +28,9 @@ full price.
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
   - **No click:** what `cacheKeeper.noResponseAction` says. By default (`nothing`) the cache
-    expires. If letting it expire would add at least `cacheKeeper.thresholdCredits` (default 60)
-    to your next message, a handoff summary is written 15 s before expiry first. Below that, it
-    just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
+    expires. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
+    tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
+    first. Below that, or when the model's price is unknown, it just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
   - **Keep warm:** sends one tiny keep-alive
@@ -130,8 +130,10 @@ full price.
   Cache Keeper's first read.
 - **After a reload or update:** no automatic action for chats last active before Cache Keeper
   started in this window. It only warns.
-- **Ignored chats:** chats with only Cache Keeper messages, and chats where an expired cache
-  costs less than `cacheKeeper.minCredits`.
+- **Ignored chats:** chats with only Cache Keeper messages, and chats whose context is under
+  `cacheKeeper.minTokens` (default 10k tokens).
+- **Thresholds are in tokens,** not credits: an expiry costs about context × the model's input
+  price, so one value fits cheap and expensive models alike. Costs are still shown in credits.
 - **No settings changes:** it never changes mode or model, since either would invalidate the
   cache.
 
@@ -190,12 +192,11 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
 | `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
-| `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer |
-| `cacheKeeper.expiredWarnTokens` | 50000 | Show an expired chat in orange when its context is at least this many tokens |
+| `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
-| `cacheKeeper.minCredits` | 5 | Ignore chats where an expired cache costs less than this |
+| `cacheKeeper.minTokens` | 10000 | Ignore chats with a smaller context than this |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |

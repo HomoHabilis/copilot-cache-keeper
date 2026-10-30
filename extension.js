@@ -165,8 +165,8 @@ function noteWhy(id, why) {
 }
 function unmanagedWhy(s) {
   if (!s.lastRealUserTs) return "no message from you in its log";
-  if (s.cost && s.cost.missExtra < cfg("minCredits")) {
-    return `an expiry would add only ${core.fmt(s.cost.missExtra)} cr (below cacheKeeper.minCredits ${cfg("minCredits")}); ` +
+  if (s.ctx < cfg("minTokens")) {
+    return `its context is only ${Math.round(s.ctx / 1000)}k tokens (below cacheKeeper.minTokens ${cfg("minTokens")}); ` +
       "rechecked on every read as the context grows";
   }
   return "";
@@ -230,9 +230,11 @@ function setAll(r) {
   if (!baseline && logRootPath) baseline = new Map(r.map(x => [x.id, x.cacheFrom]));
   all = r;
 }
-function aboveThreshold(s) { return !!s.cost && s.cost.missExtra >= cfg("thresholdCredits"); }
+// Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
+// fits cheap and expensive models. Acting on its own still needs a known price.
+function aboveThreshold(s) { return !!s.cost && s.ctx >= cfg("thresholdTokens"); }
 function managed(s) {
-  return s.lastRealUserTs && !(s.cost && s.cost.missExtra < cfg("minCredits"));
+  return s.lastRealUserTs && s.ctx >= cfg("minTokens");
 }
 
 // ---------------------------------------------------------------- sending into a given chat
@@ -739,7 +741,7 @@ function updateStatus(context) {
   // Coming back to an expired chat: make an expensive next message stand out (orange). Measured in
   // context tokens, since a cold send costs about context x the model's input price: the same
   // setting then fits a cheap model and an expensive one.
-  const costlyRestart = r <= 0 && !s.busy && s.ctx >= cfg("expiredWarnTokens");
+  const costlyRestart = r <= 0 && !s.busy && s.ctx >= cfg("thresholdTokens");
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
@@ -751,7 +753,7 @@ function updateStatus(context) {
       `Session so far ${core.fmt(s.credits)} cr. `
     : "No price for this model in Copilot's price sheet. ") +
     (costlyRestart ? `Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context ` +
-      `(over cacheKeeper.expiredWarnTokens = ${Math.round(cfg("expiredWarnTokens") / 1000)}k): ` +
+      `(over cacheKeeper.thresholdTokens = ${Math.round(cfg("thresholdTokens") / 1000)}k): ` +
       (st.handoff
         ? `handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}. `
         : "consider starting a new chat from a handoff summary instead. ") : "") +

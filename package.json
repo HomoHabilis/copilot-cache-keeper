@@ -64,15 +64,10 @@
           ],
           "description": "What to do when a warning gets no answer before the cache expires. Either way, warnings for that chat then stop until you write in it again. Applies only to chats active since VS Code started and whose price is known."
         },
-        "cacheKeeper.expiredWarnTokens": {
+        "cacheKeeper.thresholdTokens": {
           "type": "number",
-          "default": 50000,
-          "description": "Turn the status bar orange when the chat's cache has expired and its context is at least this many tokens: your next message there re-sends all of it at full price. Counted in tokens so one value fits cheap and expensive models alike; the label still shows the cost in credits."
-        },
-        "cacheKeeper.thresholdCredits": {
-          "type": "number",
-          "default": 60,
-          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn."
+          "default": 100000,
+          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary (if cacheKeeper.autoSummary is on and the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
         },
         "cacheKeeper.autoSummary": {
           "type": "boolean",
@@ -101,10 +96,10 @@
           "default": true,
           "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap. Off: the cache just expires."
         },
-        "cacheKeeper.minCredits": {
+        "cacheKeeper.minTokens": {
           "type": "number",
-          "default": 5,
-          "description": "Ignore sessions where an expired cache would cost less than this."
+          "default": 10000,
+          "description": "Ignore chats whose context is smaller than this many tokens (10k is about 4 credits with Opus 5.5): an expiry costs them little."
         },
         "cacheKeeper.ttlSeconds": {
           "type": "object",
