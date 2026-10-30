@@ -35,6 +35,10 @@
       {
         "command": "cacheKeeper.stop",
         "title": "Cache Keeper: Stop keeping warm"
+      },
+      {
+        "command": "cacheKeeper.diagnose",
+        "title": "Cache Keeper: Show which chats are tracked (diagnostics)"
       }
     ],
     "configuration": {

@@ -199,6 +199,20 @@ const never = () => new Promise(() => {});
     assert.strictEqual(unknown.ttl, 300);
   });
 
+  await check("readSessions: a chat whose calls are not recognised is reported, not silently dropped", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-skip-"));
+    try {
+      fs.mkdirSync(path.join(tmp, "odd-chat"));
+      fs.writeFileSync(path.join(tmp, "odd-chat", "main.jsonl"),
+        JSON.stringify({ type: "llm_request", ts: now - 1000, attrs: { debugName: "agent/other", model: "x", promptTokens: 5 } }) + "\n");
+      const skipped = [];
+      const r = await core.readSessions(core.nodeIo, tmp, now, 3600e3, {}, skipped);
+      assert.strictEqual(r.length, 0);
+      assert.strictEqual(skipped.length, 1);
+      assert.ok(skipped[0].why.includes("agent/other") && skipped[0].why.includes("promptTokens"), skipped[0].why);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
   await check("rates: long-context tier above 272k for Sol", () => {
     const sheet = JSON.parse(MODELS)[1].billing.token_prices;
     assert.strictEqual(core.rates(sheet, 100000).read, 10 / 1e6);

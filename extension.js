@@ -89,7 +89,9 @@ const io = {
 /**
  * Find this workspace's Copilot debug-logs folder. Local window: next to our own storage.
  * Remote window: in the VS Code server's data folder on the remote side, under the same
- * workspace id as our (local) storage folder.
+ * workspace id as our (local) storage folder. The server sometimes moves to a sibling folder
+ * with a suffix (<id>-1, <id>-2, ...: e.g. when it restarts while the old one is still locked),
+ * so all of them are candidates and the one with the latest chat activity wins.
  */
 async function locateLogs(context) {
   if (!context.storageUri) return null;
@@ -105,25 +107,87 @@ async function locateLogs(context) {
   const homes = ["/root", ...(await io.list("/home")).map(h => `/home/${h}`)];
   const servers = homes.flatMap(h => [`${h}/.vscode-server`, `${h}/.vscode-server-insiders`])
     .concat(["/vscode/vscode-server", "/vscode/vscode-server-insiders"]);
+  let best = null;
   for (const server of servers) {
-    const dir = `${server}/data/User/workspaceStorage/${wsId}/GitHub.copilot-chat/debug-logs`;
-    if (await io.stat(dir)) {
-      remoteHome = server.startsWith("/vscode/") ? null : server.replace(/\/\.vscode-server(-insiders)?$/, "");
-      return dir;
+    const storage = `${server}/data/User/workspaceStorage`;
+    const ids = (await io.list(storage)).filter(n => n === wsId || new RegExp(`^${wsId}-\\d+$`).test(n));
+    for (const id of ids) {
+      const dir = `${storage}/${id}/GitHub.copilot-chat/debug-logs`;
+      if (!(await io.stat(dir))) continue;
+      const latest = await latestActivity(dir);
+      if (!best || latest > best.latest) best = { dir, latest, server };
     }
   }
-  return null;                 // no Copilot chat in this workspace yet: try again later
+  if (!best) return null;      // no Copilot chat in this workspace yet: try again later
+  remoteHome = best.server.startsWith("/vscode/") ? null : best.server.replace(/\/\.vscode-server(-insiders)?$/, "");
+  return best.dir;
 }
 
+/** Newest chat log change in a debug-logs folder (0 if none). */
+async function latestActivity(dir) {
+  let latest = 0;
+  for (const n of await io.list(dir)) {
+    const st = await io.stat(io.join(dir, n, "main.jsonl"));
+    if (st && st.mtime > latest) latest = st.mtime;
+  }
+  return latest;
+}
+
+const RELOCATE_MS = 60000;     // look again for a newer sibling storage folder this often
+let locatedAt = 0;
+
 async function readAll(context) {
-  if (!logRootPath) {
-    logRootPath = await locateLogs(context);
-    if (logRootPath) {
-      logx(`reading Copilot logs at ${remote ? remote.authority + ":" : ""}${logRootPath}`);
+  if (!logRootPath || Date.now() - locatedAt > RELOCATE_MS) {
+    locatedAt = Date.now();
+    const found = await locateLogs(context);
+    if (found && found !== logRootPath) {
+      logx(`reading Copilot logs at ${remote ? remote.authority + ":" : ""}${found}`);
+      logRootPath = found;
+      baseline = null;         // "seen active since start" is judged afresh in the new folder
       core.learnTtls(io, remoteHome || require("os").homedir()).catch(() => {});
     }
   }
-  return logRootPath ? core.readSessions(io, logRootPath, Date.now(), 3 * 3600 * 1000, cfg("ttlSeconds") || {}) : [];
+  if (!logRootPath) return [];
+  const skipped = [];
+  const r = await core.readSessions(io, logRootPath, Date.now(), 3 * 3600 * 1000, cfg("ttlSeconds") || {}, skipped);
+  // Say once (and again when it changes) why a chat is not in the list.
+  for (const k of skipped) noteWhy(k.id, k.why);
+  for (const s of r) noteWhy(s.id, unmanagedWhy(s));
+  return r;
+}
+
+const whyShown = new Map();    // chat id -> reason last logged for not listing it ("" = listed)
+function noteWhy(id, why) {
+  if ((whyShown.get(id) || "") === why) return;
+  whyShown.set(id, why);
+  logx(why ? `chat ${id.slice(0, 8)} not listed: ${why}` : `chat ${id.slice(0, 8)} listed`);
+}
+function unmanagedWhy(s) {
+  if (!s.lastRealUserTs) return "no message from you in its log";
+  if (s.cost && s.cost.missExtra < cfg("minCredits")) {
+    return `an expiry would add only ${core.fmt(s.cost.missExtra)} cr (below cacheKeeper.minCredits ${cfg("minCredits")}); ` +
+      "rechecked on every read as the context grows";
+  }
+  return "";
+}
+
+/** Output panel: every chat folder of this workspace and whether it is tracked. */
+async function diagnose(context) {
+  out.show(true);
+  logx(`--- diagnostics: Copilot logs at ${logRootPath ? (remote ? remote.authority + ":" : "") + logRootPath : "(not found yet)"}`);
+  if (!logRootPath) return;
+  const now = Date.now();
+  for (const n of await io.list(logRootPath)) {
+    const dir = io.join(logRootPath, n);
+    const st = await io.stat(io.join(dir, "main.jsonl"));
+    const age = st ? `${Math.round((now - st.mtime) / 60000)} min ago` : "no main.jsonl";
+    const s = st && await core.readSession(io, dir, now, cfg("ttlSeconds") || {});
+    const text = st && !s ? await io.readText(io.join(dir, "main.jsonl")) : null;
+    logx(`${n.slice(0, 8)} (log changed ${age}): ` + (s
+      ? `${describe(s)}, ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, ` +
+        (unmanagedWhy(s) ? `not listed: ${unmanagedWhy(s)}` : "listed")
+      : st ? `not tracked: ${core.describeLog(text)}` : "not tracked"));
+  }
 }
 
 // Log timestamps come from the machine where Copilot runs (WSL, SSH host, container); the
@@ -648,6 +712,7 @@ function activate(context) {
   const shownOrNewest = () => all.filter(managed)[0];
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
+    vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepAlive(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summary(context, s, "on request"); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).

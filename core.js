@@ -191,15 +191,37 @@ async function readSession(io, dir, now = Date.now(), ttlOverrides = {}) {
   return analyze(dir, main, await io.readText(io.join(dir, "models.json")), now, ttlOverrides);
 }
 
-/** All chats under a debug-logs folder whose log changed in the last `maxAgeMs`. */
-async function readSessions(io, root, now = Date.now(), maxAgeMs = 3 * 3600 * 1000, ttlOverrides = {}) {
+/**
+ * Why a chat log gave no session: what model calls it has, so a log format Cache Keeper doesn't
+ * recognise yet can be diagnosed from the output panel.
+ */
+function describeLog(mainText) {
+  const events = parseJsonl(mainText);
+  const llm = events.filter(e => e.type === "llm_request");
+  const names = [...new Set(llm.map(e => String((e.attrs && e.attrs.debugName) || "?")))];
+  const last = llm[llm.length - 1];
+  const types = [...new Set(events.map(e => e.type))];
+  return `${events.length} events (types: ${types.slice(0, 12).join(", ")}), ` +
+    `${events.filter(e => e.type === "user_message").length} user messages, ${llm.length} model calls` +
+    (llm.length ? ` (debugNames: ${names.slice(0, 8).join(", ")}; last call's fields: ` +
+      `${Object.keys((last && last.attrs) || {}).join(", ")})` : "") +
+    "; tracked calls need a debugName starting with panel/ and an inputTokens field";
+}
+
+/**
+ * All chats under a debug-logs folder whose log changed in the last `maxAgeMs`. Chats skipped for
+ * another reason are added to `skipped` ({ id, why }) when given.
+ */
+async function readSessions(io, root, now = Date.now(), maxAgeMs = 3 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
   const out = [];
   for (const n of await io.list(root)) {
     const dir = io.join(root, n);
     const st = await io.stat(io.join(dir, "main.jsonl"));
-    if (!st || now - st.mtime > maxAgeMs) continue;
+    if (!st) { if (skipped) skipped.push({ id: n, why: "no main.jsonl in its folder" }); continue; }
+    if (now - st.mtime > maxAgeMs) continue;
     const s = await readSession(io, dir, now, ttlOverrides);
     if (s) out.push(s);
+    else if (skipped) skipped.push({ id: n, why: "no agent model call recognised: " + describeLog(await io.readText(io.join(dir, "main.jsonl"))) });
   }
   return out.sort((x, y) => y.lastEnd - x.lastEnd);
 }
@@ -228,5 +250,5 @@ function fmt(credits) {
 
 module.exports = {
   MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
-  rates, priceSheetFrom, fmt, summaryWords,
+  rates, priceSheetFrom, fmt, summaryWords, describeLog,
 };
