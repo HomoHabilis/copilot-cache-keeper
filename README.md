@@ -104,24 +104,49 @@ full price.
 Download the `.vsix` from the [latest release](https://github.com/HomoHabilis/copilot-cache-keeper/releases/latest).
 It contains the whole extension, so it's the only file anyone needs.
 
-Cache Keeper runs where the VS Code window runs (Windows, Linux or macOS). One install on that
-machine covers every window: local folders, WSL, SSH, dev containers, and SSH + container.
-Nothing needs installing inside a container. It reads Copilot's debug logs wherever Copilot runs,
-through VS Code's own file access.
+**Install it once, on Windows, and it covers every window.** Cache Keeper is a UI extension
+(`"extensionKind": ["ui"]`): it always runs on the machine that shows the VS Code window, never
+on the remote side. It reads Copilot's debug logs wherever Copilot runs (WSL, SSH host,
+container) through VS Code's own remote file access. So nothing needs installing in WSL, on an
+SSH host or inside a container.
 
-Install it from a terminal on that machine (Windows PowerShell or cmd, Linux or macOS shell):
+From **PowerShell** (or cmd) on Windows, in the folder where you saved the file:
 
-```bash
-code --install-extension copilot-cache-keeper-0.7.5.vsix
+```powershell
+code --install-extension .\copilot-cache-keeper-0.7.5.vsix
 ```
 
-Or in VS Code: *Extensions* view → **…** menu → **Install from VSIX…**. Then reload the windows.
+Then reload any open VS Code windows (*Developer: Reload Window*).
 
-Notes:
-- **From WSL:** a `code` command typed in a WSL terminal installs into WSL, not Windows. Use a
-  Windows terminal, or the *Install from VSIX…* menu in a local (non-WSL) window.
-- **Older copies:** if an older copy was installed inside WSL or a container, remove it there with
-  `code --uninstall-extension local.copilot-cache-keeper`.
+Or in VS Code: *Extensions* view → **…** menu → **Install from VSIX…**, from a local (non-WSL,
+non-remote) window. On Linux or macOS, run the same `code --install-extension` command in a
+local shell.
+
+### What one install covers
+
+| Window | Where Copilot and its logs are | Install needed there? |
+|---|---|---|
+| Local Windows folder | Windows | No, the Windows install covers it |
+| WSL (`WSL: …` in the status bar) | WSL distro | No |
+| Dev container (local Docker or in WSL) | Container | No |
+| Remote SSH | SSH host | No |
+| SSH + dev container | Container on the SSH host | No |
+
+In every case the extension runs on Windows and reads the logs on the remote side.
+
+### Running it from a WSL terminal
+
+A `code` command typed in a WSL terminal (including VS Code's terminal in a WSL window) talks to
+the WSL side, so `code --install-extension` there installs into WSL, not Windows. A UI extension
+installed there is not the one the window uses. Either use a Windows terminal, or call the
+Windows `code` from WSL with a Windows path to the file:
+
+```bash
+cmd.exe /c code --install-extension "$(wslpath -w copilot-cache-keeper-0.7.5.vsix)"
+```
+
+If an older copy was installed inside WSL or a container, remove it there (from a terminal on that
+side) with `code --uninstall-extension local.copilot-cache-keeper`.
 
 ## Settings
 
