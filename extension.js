@@ -757,18 +757,29 @@ function updateStatus(context) {
       (autoHere || (st.mode === "once" ? " (keep-alive armed)" : "")) + autoElsewhere + others;
   } else statusItem.text = (costlyRestart ? "$(warning)" : "$(circle-slash)") + " cache expired" +
     (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
-  statusItem.tooltip = `${describe(s)}. ` + (s.cost
-    ? `Keep-alive ~${core.fmt(s.cost.heartbeat)} cr, expiry adds ~${core.fmt(s.cost.missExtra)} cr, summary ~${core.fmt(s.cost.summary)} cr. ` +
-      `Session so far ${core.fmt(s.credits)} cr. `
-    : "No price for this model in Copilot's price sheet. ") +
-    (costlyRestart ? `Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context ` +
-      `(over cacheKeeper.thresholdTokens = ${Math.round(cfg("thresholdTokens") / 1000)}k): ` +
-      (st.handoff
-        ? `handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}. `
-        : "consider starting a new chat from a handoff summary instead. ") : "") +
-    `Cache lifetime ${s.ttl}s. Click to manage the ${shownInList} chat(s) in the list.` +
-    (autoChats.length ? ` Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
-      "click to change it, or run \"Cache Keeper: Stop keeping warm\"." : "");
+  // Tooltip: short Markdown lines rather than one long sentence.
+  const md = [`**${s.title ? s.title.replace(/[\\`*_[\]<>]/g, "") : s.id.slice(0, 8)}**  `,
+              `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s`, ""];
+  if (costlyRestart) {
+    md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
+      (s.cost ? ` (**+${core.fmt(s.cost.missExtra)} cr**)` : "") + ".", "");
+    md.push(st.handoff
+      ? `Handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}.`
+      : "Consider starting a new chat from a handoff summary instead.", "");
+  }
+  if (s.cost) {
+    md.push("| | |", "|---|--:|",
+      `| Keep-alive | ~${core.fmt(s.cost.heartbeat)} cr |`,
+      `| Expiry adds | ~${core.fmt(s.cost.missExtra)} cr |`,
+      `| Handoff summary | ~${core.fmt(s.cost.summary)} cr |`,
+      `| Session so far | ${core.fmt(s.credits)} cr |`, "");
+  } else md.push("No price for this model in Copilot's price sheet.", "");
+  if (autoChats.length) md.push(`$(zap) Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
+    "click to change it, or run *Cache Keeper: Stop keeping warm*.", "");
+  if (costlyRestart) md.push(`*Orange: expired and over cacheKeeper.thresholdTokens (${Math.round(cfg("thresholdTokens") / 1000)}k).*  `);
+  md.push(`Click to manage the ${shownInList} chat(s) in the list.`);
+  const tip = new vscode.MarkdownString(md.join("\n"), true);
+  statusItem.tooltip = tip;
   statusItem.backgroundColor = autoChats.length ? new vscode.ThemeColor("statusBarItem.errorBackground")
     : costlyRestart || (r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
   statusItem.show();

@@ -120,7 +120,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
         }
       },
     },
-    StatusBarAlignment: { Right: 2 }, ThemeColor: class { constructor(id) { this.id = id; } },
+    StatusBarAlignment: { Right: 2 },
+    MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
+    ThemeColor: class { constructor(id) { this.id = id; } },
     Uri: { file: f => ({ scheme: "file", fsPath: f, path: f }),
            from: o => ({ ...o, toString: () => `${o.scheme}://${o.authority}${o.path}` }),
            joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return { scheme: "file", fsPath: f, path: f }; } },
@@ -415,7 +417,7 @@ const never = () => new Promise(() => {});
         const bg = (h.status.backgroundColor || {}).id;
         assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
         assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
-        assert.strictEqual(h.status.tooltip.includes("thresholdTokens"), orange, h.status.tooltip);
+        assert.strictEqual(h.status.tooltip.value.includes("thresholdTokens"), orange, h.status.tooltip);
       } finally { h.close(); }
     }
   });
@@ -434,7 +436,7 @@ const never = () => new Promise(() => {});
            inputTokens: 90900, cachedTokens: 90000, outputTokens: 4, copilotUsageNanoAiu: 3e9 } },
          { type: "turn_end", ts: h.clock - 400 }].map(e => JSON.stringify(e)).join("\n") + "\n");
       await h.run(6);
-      assert.ok(h.status.tooltip.includes("40k context"), h.status.tooltip);
+      assert.ok(h.status.tooltip.value.includes("40k context"), h.status.tooltip);
     } finally { h.close(); }
   });
 
@@ -454,7 +456,7 @@ const never = () => new Promise(() => {});
       await h.run(900);
       assert.ok(h.sent.some(x => x.text.includes("handoff summary")), "summary written");
       assert.ok(h.status.text.includes("cache expired"), h.status.text);
-      assert.ok(/handoff summary ready: a new chat from it ≈ [\d.]+ cr/.test(h.status.tooltip), h.status.tooltip);
+      assert.ok(/Handoff summary ready: a new chat from it ≈ [\d.]+ cr/.test(h.status.tooltip.value), h.status.tooltip);
     } finally { h.close(); }
   });
 
