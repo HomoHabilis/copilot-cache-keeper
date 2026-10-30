@@ -2,7 +2,7 @@
   "name": "copilot-cache-keeper",
   "displayName": "Copilot Cache Keeper",
   "description": "Warns before a Copilot chat's prompt cache expires; keep it warm or write a handoff summary.",
-  "version": "0.7.5",
+  "version": "0.8.0",
   "publisher": "local",
   "license": "UNLICENSED",
   "engines": {
@@ -45,6 +45,21 @@
           "default": 60,
           "description": "Warn this many seconds before the cache expires."
         },
+        "cacheKeeper.noResponseAction": {
+          "type": "string",
+          "default": "nothing",
+          "enum": [
+            "nothing",
+            "keepWarmOnce",
+            "autoKeepWarm"
+          ],
+          "enumDescriptions": [
+            "Do nothing: the cache expires (after a handoff summary if it is above your summary threshold).",
+            "Keep warm once: send one keep-alive before it expires.",
+            "Auto keep warm: keep it warm before each expiry, up to the auto keep warm cap."
+          ],
+          "description": "What to do when a warning gets no answer before the cache expires. Either way, warnings for that chat then stop until you write in it again. Applies only to chats active since VS Code started and whose price is known."
+        },
         "cacheKeeper.thresholdCredits": {
           "type": "number",
           "default": 60,
@@ -54,6 +69,28 @@
           "type": "boolean",
           "default": true,
           "description": "Above the threshold, write a handoff summary if nobody answers the warning."
+        },
+        "cacheKeeper.autoKeepWarmCapPercent": {
+          "type": "number",
+          "default": 50,
+          "enum": [
+            25,
+            50,
+            75,
+            100
+          ],
+          "enumDescriptions": [
+            "25% of an expiry's cost",
+            "50% of an expiry's cost",
+            "75% of an expiry's cost",
+            "100%: never spend more than the expiry would have cost"
+          ],
+          "description": "Auto keep warm stops once its keep-alives, plus the closing handoff summary (when cacheKeeper.summaryAfterKeepWarm is on), would cost more than this share of what letting the cache expire would have added, priced when auto keep warm started."
+        },
+        "cacheKeeper.summaryAfterKeepWarm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap. Off: the cache just expires."
         },
         "cacheKeeper.minCredits": {
           "type": "number",
