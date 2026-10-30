@@ -130,10 +130,12 @@ full price.
   Cache Keeper's first read.
 - **After a reload or update:** no automatic action for chats last active before Cache Keeper
   started in this window. It only warns.
-- **Ignored chats:** chats with only Cache Keeper messages, and chats whose context is under
-  `cacheKeeper.minTokens` (default 10k tokens).
-- **Thresholds are in tokens,** not credits: an expiry costs about context × the model's input
-  price, so one value fits cheap and expensive models alike. Costs are still shown in credits.
+- **Ignored chats:** chats with only Cache Keeper messages, and chats where an expiry would add
+  less than `cacheKeeper.minCredits` (default 5). Nothing at all happens for them: no listing,
+  warning, automatic action or orange status.
+- **The "expensive" threshold is in tokens** (`cacheKeeper.thresholdTokens`): an expiry costs
+  about context × the model's input price, so one value fits cheap and expensive models alike.
+  It applies only to chats that already pass `minCredits`. Costs are still shown in credits.
 - **No settings changes:** it never changes mode or model, since either would invalidate the
   cache.
 
@@ -196,7 +198,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
-| `cacheKeeper.minTokens` | 10000 | Ignore chats with a smaller context than this |
+| `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |

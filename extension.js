@@ -165,8 +165,8 @@ function noteWhy(id, why) {
 }
 function unmanagedWhy(s) {
   if (!s.lastRealUserTs) return "no message from you in its log";
-  if (s.ctx < cfg("minTokens")) {
-    return `its context is only ${Math.round(s.ctx / 1000)}k tokens (below cacheKeeper.minTokens ${cfg("minTokens")}); ` +
+  if (s.cost && s.cost.missExtra < cfg("minCredits")) {
+    return `an expiry would add only ${core.fmt(s.cost.missExtra)} cr (below cacheKeeper.minCredits ${cfg("minCredits")}); ` +
       "rechecked on every read as the context grows";
   }
   return "";
@@ -234,7 +234,8 @@ function setAll(r) {
 // fits cheap and expensive models. Acting on its own still needs a known price.
 function aboveThreshold(s) { return !!s.cost && s.ctx >= cfg("thresholdTokens"); }
 function managed(s) {
-  return s.lastRealUserTs && s.ctx >= cfg("minTokens");
+  // minCredits filters everything (list, warnings, actions, orange status): a cheap expiry isn't worth a word
+  return s.lastRealUserTs && !(s.cost && s.cost.missExtra < cfg("minCredits"));
 }
 
 // ---------------------------------------------------------------- sending into a given chat

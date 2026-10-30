@@ -81,7 +81,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
     writeFile: async (u, b) => fs.writeFileSync(u.fsPath, b),
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
-  const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minTokens: 10000, ttlSeconds: {},
+  const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
                      keepAliveLeadSeconds: 5, afterSend: "closeTab", noResponseAction: "nothing",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
@@ -399,6 +399,16 @@ const never = () => new Promise(() => {});
         assert.strictEqual(h.status.tooltip.includes("thresholdTokens"), orange, h.status.tooltip);
       } finally { h.close(); }
     }
+  });
+
+  await check("minCredits filters everything: no warning and no orange status for a cheap chat", async () => {
+    const h = await harness({ answer: () => undefined, settings: { thresholdTokens: 30000, minCredits: 1000 } });
+    try {
+      await h.run(400);
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.sent.length, 0);
+      assert.notStrictEqual((h.status.backgroundColor || {}).id, "statusBarItem.warningBackground");
+    } finally { h.close(); }
   });
 
   await check("expired chat with a handoff summary: tooltip gives the new-chat cost", async () => {

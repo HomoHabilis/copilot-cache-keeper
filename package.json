@@ -96,10 +96,10 @@
           "default": true,
           "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap. Off: the cache just expires."
         },
-        "cacheKeeper.minTokens": {
+        "cacheKeeper.minCredits": {
           "type": "number",
-          "default": 10000,
-          "description": "Ignore chats whose context is smaller than this many tokens (10k is about 4 credits with Opus 5.5): an expiry costs them little."
+          "default": 5,
+          "description": "Ignore chats where letting the cache expire would add less than this many credits: no listing, warnings, automatic actions or orange status for them. Applies on top of cacheKeeper.thresholdTokens."
         },
         "cacheKeeper.ttlSeconds": {
           "type": "object",
