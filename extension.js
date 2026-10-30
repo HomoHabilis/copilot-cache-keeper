@@ -416,9 +416,22 @@ async function summary(context, s, why) {
 }
 
 async function keepAlive(context, s) {
+  const cold = live(s) <= 0;     // only possible from the command: the whole context is re-sent
   const ok = await trySend(context, s, HEARTBEAT, "keep-alive");
-  if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat : 0;
+  if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;
   return ok;
+}
+
+/** "Keep warm now" from the command palette: on an expired cache, say what it costs first. */
+async function keepWarmNow(context, s) {
+  if (!s.busy && live(s) <= 0) {
+    const price = s.cost ? ` It re-sends the whole context: ~${core.fmt(s.cost.heartbeat + s.cost.missExtra)} cr ` +
+      `instead of ~${core.fmt(s.cost.heartbeat)} cr for a warm one.` : " It re-sends the whole context at full price.";
+    const go = await vscode.window.showWarningMessage(`Cache Keeper: the cache has already expired (${describe(s)}).` +
+      price + " The cache is then warm again.", { modal: true }, "Send anyway");
+    if (go !== "Send anyway") return;
+  }
+  await keepAlive(context, s);
 }
 
 // ---------------------------------------------------------------- choices
@@ -713,7 +726,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
-    vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepAlive(context, s); }),
+    vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summary(context, s, "on request"); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {
