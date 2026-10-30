@@ -67,7 +67,7 @@
         "cacheKeeper.thresholdCredits": {
           "type": "number",
           "default": 60,
-          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn."
+          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn. Also turns the status bar orange when you come back to an expired chat whose next message would cost at least this much."
         },
         "cacheKeeper.autoSummary": {
           "type": "boolean",

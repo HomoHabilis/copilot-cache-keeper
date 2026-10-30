@@ -736,20 +736,25 @@ function updateStatus(context) {
     statusItem.show();
     return;
   }
+  // Coming back to an expired chat: make an expensive next message stand out (orange).
+  const costlyRestart = r <= 0 && !s.busy && s.cost && s.cost.missExtra >= cfg("thresholdCredits");
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
       (autoHere || (st.mode === "once" ? " (keep-alive armed)" : "")) + autoElsewhere + others;
-  } else statusItem.text = "$(circle-slash) cache expired" + (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
+  } else statusItem.text = (costlyRestart ? "$(warning)" : "$(circle-slash)") + " cache expired" +
+    (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
   statusItem.tooltip = `${describe(s)}. ` + (s.cost
     ? `Keep-alive ~${core.fmt(s.cost.heartbeat)} cr, expiry adds ~${core.fmt(s.cost.missExtra)} cr, summary ~${core.fmt(s.cost.summary)} cr. ` +
       `Session so far ${core.fmt(s.credits)} cr. `
     : "No price for this model in Copilot's price sheet. ") +
+    (costlyRestart ? `Your next message in this chat re-sends the whole context (at least cacheKeeper.thresholdCredits = ${cfg("thresholdCredits")} cr): ` +
+      "consider starting a new chat from a summary instead. " : "") +
     `Cache lifetime ${s.ttl}s. Click to manage the ${shownInList} chat(s) in the list.` +
     (autoChats.length ? ` Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
       "click to change it, or run \"Cache Keeper: Stop keeping warm\"." : "");
   statusItem.backgroundColor = autoChats.length ? new vscode.ThemeColor("statusBarItem.errorBackground")
-    : r > 0 && r <= cfg("warnSeconds") && !s.busy ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
+    : costlyRestart || (r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
   statusItem.show();
 }
 

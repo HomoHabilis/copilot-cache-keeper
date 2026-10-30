@@ -1,17 +1,27 @@
 # Copilot Cache Keeper
 
 Warns before a Copilot agent chat's prompt cache expires, and offers to keep it warm or to
-write a handoff summary. Copilot keeps a chat's cache for **5 minutes with Claude models**
-and **30 minutes with Sol 6.1**. After that, your next message re-sends the whole context at
+write a handoff summary. Copilot keeps a chat's prompt cache only for a while after the last
+call, and how long depends on the model: for example, **Opus 5.5 has a 5-minute timeout**
+while **Sol 6.1 has 30 minutes**. After that, your next message re-sends the whole context at
 full price.
 
 ## What it does
 
-- **Status bar:** the countdown for the chat shown in the Chat view, for example `cache 3:12 +1`
+- **Status bar:** the countdown for the most recently active chat, for example `cache 3:12 +1`
   (`+1` = one more chat managed in this window). Click it to see the chats in the window (all
-  warm ones plus the most recently expired, at most 10) with live countdowns,
-  with its countdown, model, context, cost if it expires and spend so far. Pick one to choose
-  what happens to it.
+  warm ones plus the most recently expired, at most 10), each with its live countdown, model,
+  context, cost if it expires and spend so far. Pick one to choose what happens to it.
+  - **While the agent works** (including subagents and long terminal commands), it shows
+    `agent working · cache 2:41` and never sends anything into that chat: a message would be
+    queued and could run after the cache expired.
+  - **Expired and expensive:** when that chat's cache has expired and your next message there
+    would add at least `cacheKeeper.thresholdCredits` (default 60), the status bar turns orange:
+    `⚠ cache expired: next msg +72 cr`. Coming back to an old chat, this tells you before you type
+    that starting a new chat from a handoff summary may be cheaper.
+  - **While Cache Keeper sends** a keep-alive or summary, it shows
+    `Cache Keeper sending… wait before typing`: for those seconds the target chat is focused, so
+    something you type would land there.
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
   - **No click:** what `cacheKeeper.noResponseAction` says. By default (`nothing`) the cache
@@ -45,6 +55,10 @@ full price.
   Auto keep warm).
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
   from the handoff file.
+- **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
+  since that message re-sends the whole context.
+- **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
+  it found and why each one is or isn't in the list. Start there when a chat gets no warning.
 - **Every new cache window** (each time you or the agent sends something) brings the warning back,
   as long as you answered the last one. After Ignore, a summary, or a warning you closed or left
   unanswered, it comes back only once you send a real message yourself.
@@ -85,12 +99,14 @@ full price.
 - **Prices** come from the price sheet Copilot sends VS Code for each chat (`models.json` in that
   chat's debug-log folder), at the tier for the chat's current context size (for example Sol's
   higher rate above 272k). They're applied to the last call's actual context, after any
-  compaction. Nothing in the code is model-specific.
+  compaction. The cache write rate is then corrected from what Copilot actually billed for that
+  chat's recent uncached calls, so the expiry cost matches the bill rather than the list price.
+  Nothing in the code is model-specific.
 - **Unknown prices:** if a model isn't in the sheet, Cache Keeper shows no costs and never acts on
   its own.
-- **Cache lifetimes** aren't in the price sheet. They're learned from Copilot CLI logs
-  (`cacheTtlSeconds`). Otherwise the defaults are Claude 300 s, Sol 6.1 1800 s and 300 s for
-  anything else, and `cacheKeeper.ttlSeconds` overrides them. The countdown starts when the last
+- **Cache lifetimes** vary by model and aren't in the price sheet. They're learned from Copilot
+  CLI logs (`cacheTtlSeconds`). Otherwise the defaults are 300 s for Claude models, 1800 s for
+  Sol 6.1 and 300 s for anything else, and `cacheKeeper.ttlSeconds` overrides them per model id. The countdown starts when the last
   model call started, since that is when the cache was refreshed. (Your message comes earlier, but
   every call of an agent turn refreshes the cache, so counting from the message would send
   keep-alives far too early on long turns.)
@@ -99,7 +115,14 @@ full price.
   offset between its decision and the time the remote log recorded the message. That offset
   covers clock difference, opening the tab, submitting and the network. The countdown is shifted
   earlier by the largest recent value, and never later. Until the first measurement it adds
-  3 s of margin. A keep-alive sent with less than 1.5 s left is logged as a warning.
+  3 s of margin. With less than 1.5 s left, a keep-alive is not sent at all (it would arrive
+  cold and cost the full re-send).
+- **Late or queued sends:** right before submitting, after the tab is open, Cache Keeper checks
+  again that the agent isn't working and enough time is left. If its message still isn't in the
+  log 8 s later, it was queued, and you get a warning.
+- **Log folder:** Copilot's logs are in the window's `workspaceStorage/<id>` folder, but VS Code
+  sometimes moves to a sibling `<id>-1`, `<id>-2`… Cache Keeper reads whichever has the newest
+  activity and looks again every minute.
 - **"Active since this window started"** is decided without clocks: the chat's log changed after
   Cache Keeper's first read.
 - **After a reload or update:** no automatic action for chats last active before Cache Keeper
@@ -123,7 +146,7 @@ SSH host or inside a container.
 From **PowerShell** (or cmd) on Windows, in the folder where you saved the file:
 
 ```powershell
-code --install-extension .\copilot-cache-keeper-0.7.5.vsix
+code --install-extension .\copilot-cache-keeper-<version>.vsix
 ```
 
 Then reload any open VS Code windows (*Developer: Reload Window*).
@@ -152,7 +175,7 @@ installed there is not the one the window uses. Either use a Windows terminal, o
 Windows `code` from WSL with a Windows path to the file:
 
 ```bash
-cmd.exe /c code --install-extension "$(wslpath -w copilot-cache-keeper-0.7.5.vsix)"
+cmd.exe /c code --install-extension "$(wslpath -w copilot-cache-keeper-<version>.vsix)"
 ```
 
 If an older copy was installed inside WSL or a container, remove it there (from a terminal on that
@@ -164,7 +187,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
 | `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
-| `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer |
+| `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer, and show an expired chat in orange |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |

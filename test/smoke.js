@@ -386,6 +386,20 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("expired chat: orange status only when the next message costs at least thresholdCredits", async () => {
+    for (const [threshold, orange] of [[10, true], [100, false]]) {
+      const h = await harness({ answer: () => undefined, settings: { thresholdCredits: threshold, autoSummary: false } });
+      try {
+        await h.run(400);
+        assert.strictEqual(h.sent.length, 0);
+        assert.ok(h.status.text.includes("cache expired"), h.status.text);
+        const bg = (h.status.backgroundColor || {}).id;
+        assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
+        assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
+      } finally { h.close(); }
+    }
+  });
+
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
   process.exit(failures ? 1 : 0);
 })();
