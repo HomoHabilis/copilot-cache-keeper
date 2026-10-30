@@ -85,7 +85,12 @@
             "75% of an expiry's cost",
             "100%: never spend more than the expiry would have cost"
           ],
-          "description": "Auto keep warm stops once its keep-alives have cost this share of what letting the cache expire would have added, priced when auto keep warm started. It then writes a handoff summary and lets the cache expire."
+          "description": "Auto keep warm stops once its keep-alives, plus the closing handoff summary (when cacheKeeper.summaryAfterKeepWarm is on), would cost more than this share of what letting the cache expire would have added, priced when auto keep warm started."
+        },
+        "cacheKeeper.summaryAfterKeepWarm": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap. Off: the cache just expires."
         },
         "cacheKeeper.minCredits": {
           "type": "number",

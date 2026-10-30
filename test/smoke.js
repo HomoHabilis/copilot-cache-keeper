@@ -67,6 +67,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
   const chat = path.join(logs, "sess-1");
   let clock = now;
   const sent = [], warnings = [];
+  let status;
   const fakeFs = {
     stat: async u => ({ mtime: fs.statSync(u.fsPath).mtimeMs }),
     readFile: async u => fs.readFileSync(u.fsPath),
@@ -84,7 +85,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
     workspace: { getConfiguration: () => ({ get: k => settings[k] }), fs: fakeFs,
                  workspaceFolders: [{ uri: { scheme: "file", fsPath: tmp, path: tmp } }] },
     window: {
-      createStatusBarItem: () => ({ show() {}, hide() {}, text: "" }),
+      createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
       showWarningMessage: async (msg, ...buttons) => { warnings.push({ at: clock, msg }); return answer(msg, buttons, warnings.length); },
       showInformationMessage: async () => undefined,
@@ -110,7 +111,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
         }
       },
     },
-    StatusBarAlignment: { Right: 2 }, ThemeColor: class {},
+    StatusBarAlignment: { Right: 2 }, ThemeColor: class { constructor(id) { this.id = id; } },
     Uri: { file: f => ({ scheme: "file", fsPath: f, path: f }),
            from: o => ({ ...o, toString: () => `${o.scheme}://${o.authority}${o.path}` }),
            joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return { scheme: "file", fsPath: f, path: f }; } },
@@ -131,7 +132,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
   fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx }));
   await ext._read();
   const h = {
-    sent, warnings, ext, logFile: path.join(chat, "main.jsonl"), cacheFrom: clock - 7000 + 4000,
+    sent, warnings, ext, get status() { return status; }, logFile: path.join(chat, "main.jsonl"), cacheFrom: clock - 7000 + 4000,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
@@ -212,6 +213,8 @@ const never = () => new Promise(() => {});
     assert.strictEqual(core.canAffordHeartbeat(s, 0, cap), true);
     assert.strictEqual(core.canAffordHeartbeat(s, 33, cap), true);    // 33 + 3 = 36
     assert.strictEqual(core.canAffordHeartbeat(s, 34, cap), false);
+    assert.strictEqual(core.canAffordHeartbeat(s, 24, cap, true), true);   // 24 + 3 + 9 = 36: summary fits
+    assert.strictEqual(core.canAffordHeartbeat(s, 25, cap, true), false);
     assert.strictEqual(core.autoCap({ cost: null }, 50), null);
     assert.strictEqual(core.canAffordHeartbeat({ cost: null }, 0, null), false);
   });
@@ -233,8 +236,17 @@ const never = () => new Promise(() => {});
     const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
     try {
       await h.run(700);
-      assert.strictEqual(h.sent.length, 1, "one keep-alive");
       assert.strictEqual(h.warnings.length, 2, "warned again after Keep warm once");
+      assert.strictEqual(h.sent.length, 2, "keep-alive, then the closing summary");
+      assert.ok(h.sent[0].text.includes("Keep-alive") && h.sent[1].text.includes("handoff summary"));
+    } finally { h.close(); }
+  });
+
+  await check("summaryAfterKeepWarm off: Keep warm once sends no summary", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), settings: { summaryAfterKeepWarm: false } });
+    try {
+      await h.run(700);
+      assert.strictEqual(h.sent.length, 1, "only the keep-alive");
     } finally { h.close(); }
   });
 
@@ -265,7 +277,8 @@ const never = () => new Promise(() => {});
     const h = await harness({ answer: never, settings: { noResponseAction: "keepWarmOnce" } });
     try {
       await h.run(700);
-      assert.strictEqual(h.sent.length, 1, "one keep-alive");
+      assert.strictEqual(h.sent.length, 2, "one keep-alive, then the closing summary");
+      assert.ok(h.sent[1].text.includes("handoff summary"));
       assert.strictEqual(h.warnings.length, 1, "no warning after it was ignored");
     } finally { h.close(); }
   });
@@ -275,13 +288,18 @@ const never = () => new Promise(() => {});
     try {
       const start = core.analyze("/x", fs.readFileSync(h.logFile, "utf8"), MODELS, h.clock);
       const cap = start.cost.missExtra / 2;
-      await h.run(300 * 30, () => h.sent.some(x => !x.text.includes("Keep-alive")));
+      let red = false;
+      await h.run(300 * 30, () => {
+        red = red || (h.status.backgroundColor || {}).id === "statusBarItem.errorBackground";
+        return h.sent.some(x => !x.text.includes("Keep-alive"));
+      });
+      assert.ok(red, "status bar turns red while auto keep warm runs");
       const alives = h.sent.filter(x => x.text.includes("Keep-alive"));
       assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "ends with a summary");
       assert.ok(alives.length >= 3, `${alives.length} keep-alives`);
       // estimate at each send, as the extension counted it: under the cap, and one more would not fit
-      const per = start.cost.heartbeat;
-      assert.ok(alives.length * per <= cap * 1.05 && (alives.length + 2) * per > cap,
+      const per = start.cost.heartbeat, sum = start.cost.summary;
+      assert.ok(alives.length * per + sum <= cap * 1.05 && (alives.length + 2) * per + sum > cap,
         `${alives.length} keep-alives at ~${per.toFixed(2)} cr vs cap ${cap.toFixed(2)}`);
       assert.strictEqual(h.warnings.length, 1);
     } finally { h.close(); }

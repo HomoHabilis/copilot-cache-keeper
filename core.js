@@ -212,11 +212,14 @@ function autoCap(session, percent) {
   return session.cost ? session.cost.missExtra * percent / 100 : null;
 }
 
-/** Whether one more keep-alive still fits under the cap, counting what was already spent. */
-function canAffordHeartbeat(session, spentSoFar, cap) {
+/**
+ * Whether one more keep-alive still fits under the cap, counting what was already spent and,
+ * with `withSummary`, the handoff summary written when keeping warm ends.
+ */
+function canAffordHeartbeat(session, spentSoFar, cap, withSummary = false) {
   const c = session.cost;
   if (!c || cap === null || cap === undefined) return false;
-  return spentSoFar + c.heartbeat <= cap;
+  return spentSoFar + c.heartbeat + (withSummary ? c.summary : 0) <= cap;
 }
 
 function fmt(credits) {
