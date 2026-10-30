@@ -552,7 +552,9 @@ function listChats() {
 
 function chatItem(s) {
   const r = live(s), st = stateFor(s.id);
-  const when = s.busy ? "working" : r > 0 ? `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` : "expired";
+  const clock = r > 0 ? mmss(r) : "expired";
+  // while the agent works (a long tool run makes no model call), the cache can still run out
+  const when = s.busy ? `working · cache ${clock}` : clock;
   return {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
     description: `${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
@@ -710,6 +712,8 @@ async function newChatFromHandoff(uri) {
   });
 }
 
+function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}`; }
+
 function updateStatus(context) {
   const list = all.filter(managed);
   const s = list[0];            // most recently active chat
@@ -722,7 +726,7 @@ function updateStatus(context) {
   const autoHere = st.mode === "auto"
     ? ` (auto keep warm${st.cap !== null ? ` ${core.fmt(st.spent)}/${core.fmt(st.cap)} cr` : ""})` : "";
   const autoElsewhere = autoChats.length && st.mode !== "auto" ? ` $(zap) auto keep warm ×${autoChats.length}` : "";
-  if (s.busy) statusItem.text = `$(sync~spin) cache: agent working${autoElsewhere}${others}`;
+  if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
       (autoHere || (st.mode === "once" ? " (keep-alive armed)" : "")) + autoElsewhere + others;
