@@ -150,7 +150,9 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   for (const e of [...events].sort((x, y) => (x.ts || 0) - (y.ts || 0))) {
     if (e.type === "turn_start") { depth++; pendingMsg = false; }
     else if (e.type === "turn_end") { depth = Math.max(0, depth - 1); if (!depth) pendingMsg = false; }
-    else if (e.type === "user_message" && depth === 0) pendingMsg = true;
+    // A new message ends whatever came before: Copilot leaves a turn open, with no turn_end, when
+    // the request is stopped or when you send a message while a tool is still running.
+    else if (e.type === "user_message") { depth = 0; pendingMsg = true; }
     if (/^(turn_start|turn_end|user_message|llm_request|tool_call)$/.test(e.type)) lastActivity = Math.max(lastActivity, e.ts || 0);
   }
   // A long tool run (tests, a push) logs nothing until it ends, so no short cap: only a turn quiet

@@ -230,6 +230,25 @@ const never = () => new Promise(() => {});
     assert.strictEqual(s.busy, true);
   });
 
+  await check("analyze: a turn left open by a stopped request or a message sent mid-run is not busy", () => {
+    // as seen in a real log: turn 7 runs a terminal command, you send a new message, turn 7 never ends
+    const t0 = now - 30 * 60000;
+    const ev = [
+      { type: "user_message", ts: t0, attrs: { content: "run the mutation tests" } },
+      { type: "turn_start", ts: t0 + 10 },
+      { type: "llm_request", ts: t0 + 50, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 80000, cachedTokens: 0, outputTokens: 300, copilotUsageNanoAiu: 40e9 } },
+      { type: "tool_call", ts: t0 + 2100, name: "run_in_terminal" },
+      { type: "user_message", ts: t0 + 60000, attrs: { content: "commit in the meantime" } },
+      { type: "turn_start", ts: t0 + 60000 },
+      { type: "llm_request", ts: t0 + 60050, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 81000, cachedTokens: 80000, outputTokens: 300, copilotUsageNanoAiu: 5e9 } },
+      { type: "turn_end", ts: t0 + 62100 },
+    ];
+    const s = core.analyze("/logs/stopped", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, false);
+  });
+
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
     const busy = chatLog(now - 5000).replace(/.*"turn_end".*\n$/, "");
     assert.strictEqual(core.analyze("/logs/b", busy, MODELS, now).busy, true);
