@@ -736,8 +736,10 @@ function updateStatus(context) {
     statusItem.show();
     return;
   }
-  // Coming back to an expired chat: make an expensive next message stand out (orange).
-  const costlyRestart = r <= 0 && !s.busy && s.cost && s.cost.missExtra >= cfg("thresholdCredits");
+  // Coming back to an expired chat: make an expensive next message stand out (orange). Measured in
+  // context tokens, since a cold send costs about context x the model's input price: the same
+  // setting then fits a cheap model and an expensive one.
+  const costlyRestart = r <= 0 && !s.busy && s.ctx >= cfg("expiredWarnTokens");
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
@@ -748,8 +750,11 @@ function updateStatus(context) {
     ? `Keep-alive ~${core.fmt(s.cost.heartbeat)} cr, expiry adds ~${core.fmt(s.cost.missExtra)} cr, summary ~${core.fmt(s.cost.summary)} cr. ` +
       `Session so far ${core.fmt(s.credits)} cr. `
     : "No price for this model in Copilot's price sheet. ") +
-    (costlyRestart ? `Your next message in this chat re-sends the whole context (at least cacheKeeper.thresholdCredits = ${cfg("thresholdCredits")} cr): ` +
-      "consider starting a new chat from a summary instead. " : "") +
+    (costlyRestart ? `Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context ` +
+      `(over cacheKeeper.expiredWarnTokens = ${Math.round(cfg("expiredWarnTokens") / 1000)}k): ` +
+      (st.handoff
+        ? `handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}. `
+        : "consider starting a new chat from a handoff summary instead. ") : "") +
     `Cache lifetime ${s.ttl}s. Click to manage the ${shownInList} chat(s) in the list.` +
     (autoChats.length ? ` Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
       "click to change it, or run \"Cache Keeper: Stop keeping warm\"." : "");

@@ -64,10 +64,15 @@
           ],
           "description": "What to do when a warning gets no answer before the cache expires. Either way, warnings for that chat then stop until you write in it again. Applies only to chats active since VS Code started and whose price is known."
         },
+        "cacheKeeper.expiredWarnTokens": {
+          "type": "number",
+          "default": 50000,
+          "description": "Turn the status bar orange when the chat's cache has expired and its context is at least this many tokens: your next message there re-sends all of it at full price. Counted in tokens so one value fits cheap and expensive models alike; the label still shows the cost in credits."
+        },
         "cacheKeeper.thresholdCredits": {
           "type": "number",
           "default": 60,
-          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn. Also turns the status bar orange when you come back to an expired chat whose next message would cost at least this much."
+          "description": "Act automatically (handoff summary) only when letting the cache expire would add at least this many credits to the next message, priced from the price sheet Copilot sent for that chat at the chat's current context size. Below it, or when the model's price is unknown, only warn."
         },
         "cacheKeeper.autoSummary": {
           "type": "boolean",

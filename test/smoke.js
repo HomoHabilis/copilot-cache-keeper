@@ -82,7 +82,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
   const settings = { warnSeconds: 60, thresholdCredits: 60, autoSummary: true, minCredits: 5, ttlSeconds: {},
-                     keepAliveLeadSeconds: 5, afterSend: "closeTab", noResponseAction: "nothing",
+                     keepAliveLeadSeconds: 5, afterSend: "closeTab", noResponseAction: "nothing", expiredWarnTokens: 50000,
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
   const append = evs => fs.appendFileSync(path.join(chat, "main.jsonl"), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
@@ -386,9 +386,9 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("expired chat: orange status only when the next message costs at least thresholdCredits", async () => {
-    for (const [threshold, orange] of [[10, true], [100, false]]) {
-      const h = await harness({ answer: () => undefined, settings: { thresholdCredits: threshold, autoSummary: false } });
+  await check("expired chat: orange status only when its context is at least expiredWarnTokens", async () => {
+    for (const [threshold, orange] of [[30000, true], [100000, false]]) {     // the chat has 40k tokens
+      const h = await harness({ answer: () => undefined, settings: { expiredWarnTokens: threshold, autoSummary: false } });
       try {
         await h.run(400);
         assert.strictEqual(h.sent.length, 0);
@@ -396,8 +396,19 @@ const never = () => new Promise(() => {});
         const bg = (h.status.backgroundColor || {}).id;
         assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
         assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
+        assert.strictEqual(h.status.tooltip.includes("expiredWarnTokens"), orange, h.status.tooltip);
       } finally { h.close(); }
     }
+  });
+
+  await check("expired chat with a handoff summary: tooltip gives the new-chat cost", async () => {
+    const h = await harness({ answer: () => "Summarize", settings: { expiredWarnTokens: 30000 } });
+    try {
+      await h.run(900);
+      assert.ok(h.sent.some(x => x.text.includes("handoff summary")), "summary written");
+      assert.ok(h.status.text.includes("cache expired"), h.status.text);
+      assert.ok(/handoff summary ready: a new chat from it ≈ [\d.]+ cr/.test(h.status.tooltip), h.status.tooltip);
+    } finally { h.close(); }
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

@@ -15,10 +15,13 @@ full price.
   - **While the agent works** (including subagents and long terminal commands), it shows
     `agent working · cache 2:41` and never sends anything into that chat: a message would be
     queued and could run after the cache expired.
-  - **Expired and expensive:** when that chat's cache has expired and your next message there
-    would add at least `cacheKeeper.thresholdCredits` (default 60), the status bar turns orange:
+  - **Expired and large:** when that chat's cache has expired and its context is at least
+    `cacheKeeper.expiredWarnTokens` (default 50k tokens), the status bar turns orange:
     `⚠ cache expired: next msg +72 cr`. Coming back to an old chat, this tells you before you type
-    that starting a new chat from a handoff summary may be cheaper.
+    that your next message re-sends all of it. The threshold is in tokens because a cold send
+    costs about context × the model's input price, so one value fits Haiku and Opus alike; the
+    label still shows credits. If a handoff summary was written, the tooltip says what a new chat
+    from it would cost instead.
   - **While Cache Keeper sends** a keep-alive or summary, it shows
     `Cache Keeper sending… wait before typing`: for those seconds the target chat is focused, so
     something you type would land there.
@@ -187,7 +190,8 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
 | `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
-| `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer, and show an expired chat in orange |
+| `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer |
+| `cacheKeeper.expiredWarnTokens` | 50000 | Show an expired chat in orange when its context is at least this many tokens |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
