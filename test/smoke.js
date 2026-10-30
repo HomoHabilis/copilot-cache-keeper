@@ -31,16 +31,23 @@ const MODELS = JSON.stringify([{
     long_context: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 1500, max_prompt_tokens: 922000 } } },
 }]);
 
-function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = false } = {}) {
+function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = false, writePrice = 500, coldKeepAlive = false } = {}) {
   const ev = [
     { type: "user_message", ts: t0, attrs: { content: "Refactor the parser" } },
     { type: "turn_start", ts: t0 + 10 },
     { type: "llm_request", ts: t0 + 50, dur: 3000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx - 20000,
-      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: 30e9 } },
+      // billed: uncached at writePrice per 1M, output at 2000 per 1M (as Copilot's log reports it)
+      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: ((ctx - 20000) * writePrice + 800 * 2000) * 1e3 } },
     { type: "llm_request", ts: t0 + 4000, dur: 2000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx,
       cachedTokens: ctx - 1000, outputTokens: 300, copilotUsageNanoAiu: 5e9 } },
     { type: "turn_end", ts: t0 + 6500 },
   ];
+  if (coldKeepAlive) {            // a keep-alive sent after the cache expired: everything re-sent
+    ev.push({ type: "user_message", ts: t0 + 8000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
+            { type: "llm_request", ts: t0 + 8050, dur: 800, attrs: { debugName: "panel/editAgent", model,
+              inputTokens: ctx + 600, cachedTokens: 0, outputTokens: 4, copilotUsageNanoAiu: ((ctx + 600) * writePrice + 4 * 2000) * 1e3 } },
+            { type: "turn_end", ts: t0 + 8900 });
+  }
   if (keepAlive) {
     ev.push({ type: "user_message", ts: t0 + 9000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
             { type: "turn_start", ts: t0 + 9010 },
@@ -59,7 +66,7 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = fals
  * undefined (closed with X) or a promise that never settles (not answered). Messages Cache Keeper
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
-async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
+async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -98,6 +105,8 @@ async function harness({ answer, settings: extra = {}, ctx = 40000 }) {
       executeCommand: async (id, a) => {
         if (id === "workbench.action.chat.openSessionInEditorGroup") {
           vscode.window.tabGroups.all[0].tabs = [tab]; vscode.window.tabGroups.all[0].activeTab = tab;
+          // the agent starts working (e.g. a subagent) while the tab is being opened
+          if (busyOnOpen) append([{ type: "turn_start", ts: clock }]);
         }
         if (id === "workbench.action.chat.submit") {
           sent.push({ at: clock, text: a.inputValue });
@@ -191,6 +200,36 @@ const never = () => new Promise(() => {});
     assert.strictEqual(s.lastRealUserTs, now - 60000, "keep-alives are not counted as your messages");
   });
 
+  await check("analyze: a keep-alive on an expired cache is not used to estimate a warm one", () => {
+    const s = core.analyze("/logs/k2", chatLog(now - 60000, { keepAlive: true, coldKeepAlive: true }), MODELS, now);
+    // only the warm keep-alive counts: its 900 new tokens minus the 4-token reply before it, plus
+    // the last reply (4). The cold one (150k uncached) would have made this ~78 cr.
+    const expected = (150900 * 20 + 900 * 500 + 30 * 2000) / 1e6;
+    assert.ok(Math.abs(s.cost.heartbeat - expected) < 0.05, `heartbeat ${s.cost.heartbeat} vs ${expected}`);
+  });
+
+  await check("analyze: expiry priced at what Copilot actually billed for uncached tokens", () => {
+    const s = core.analyze("/logs/c", chatLog(now - 60000, { writePrice: 400 }), MODELS, now);
+    assert.ok(Math.abs(s.billedWrite * 1e6 - 400) < 0.5, `billed ${s.billedWrite * 1e6}`);
+    // 150k * (400 - 20) / 1e6 = 57, not the price sheet's 150k * (500 - 20) / 1e6 = 72
+    assert.ok(Math.abs(s.cost.missExtra - 57) < 0.1, `missExtra ${s.cost.missExtra}`);
+  });
+
+  await check("analyze: busy through a long tool run and a subagent's own turns", () => {
+    const t0 = now - 40 * 60000;                      // turn started 40 min ago, still open
+    const ev = [
+      { type: "user_message", ts: t0, attrs: { content: "run the mutation tests then push" } },
+      { type: "turn_start", ts: t0 + 10 },
+      { type: "llm_request", ts: t0 + 50, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 80000, cachedTokens: 0, outputTokens: 300, copilotUsageNanoAiu: 40e9 } },
+      { type: "turn_start", ts: t0 + 3000 },          // subagent
+      { type: "turn_end", ts: t0 + 9000 },            // subagent done; the agent's turn is still open
+      { type: "tool_call", ts: t0 + 10000, name: "run_in_terminal" },   // long run: nothing logged since
+    ];
+    const s = core.analyze("/logs/long", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, true);
+  });
+
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
     const busy = chatLog(now - 5000).replace(/.*"turn_end".*\n$/, "");
     assert.strictEqual(core.analyze("/logs/b", busy, MODELS, now).busy, true);
@@ -246,6 +285,14 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("send: not submitted if the agent starts working while the chat tab opens", async () => {
+    const h = await harness({ answer: () => "Auto keep warm", busyOnOpen: true });
+    try {
+      await h.run(320);
+      assert.strictEqual(h.sent.length, 0, "nothing queued behind the agent");
+    } finally { h.close(); }
+  });
+
   await check("warnings: Keep warm once brings the warning back on the next timeout", async () => {
     const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
     try {
@@ -273,6 +320,14 @@ const never = () => new Promise(() => {});
       h.userTypes();
       await h.run(310);
       assert.strictEqual(h.warnings.length, 2, "your new message brings the warning back");
+    } finally { h.close(); }
+  });
+
+  await check("closing the warning acts as Ignore: nothing sent, not even the summary or noResponseAction", async () => {
+    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", thresholdCredits: 0 } });
+    try {
+      await h.run(310);
+      assert.strictEqual(h.sent.length, 0);
     } finally { h.close(); }
   });
 

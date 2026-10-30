@@ -11,6 +11,7 @@ const HEARTBEAT = `${core.MARKER} Keep-alive while I'm away. Reply with only: OK
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
 const SUMMARY_LEAD = 15;       // seconds before expiry for an automatic summary
+const QUEUED_AFTER_MS = 8000;  // our message not in the log by then: it was queued
 // Automatic actions only for chats seen active since this window started: after a reload the
 // Chat view may show another chat, and a brand-new chat leaves no trace in the logs.
 const startedAt = Date.now();
@@ -265,21 +266,31 @@ function withUi(fn) {
   return run;
 }
 
-async function trySend(context, s, text, label) {
+async function trySend(context, s, text, label, opts = {}) {
   if (sending) { logx(`${label} for ${s.id.slice(0, 8)} waits: another chat is being handled`); return false; }
-  return withUi(() => sendNow(context, s, text, label));
+  return withUi(() => sendNow(context, s, text, label, opts));
 }
 
-async function sendNow(context, s, text, label) {
+// Never let a message land on an expired cache: it would re-send the whole context. Last check
+// just before submitting: the chat must be idle, on the same cache window, with this much left.
+const MIN_LEFT_S = 1.5;
+
+/** Is it still safe to send into this chat now? Returns why not, or "". */
+async function unsafeToSend(s, opts) {
+  const fresh = (await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {})) || s;
+  if (fresh.busy) return "agent working (it would be queued and could run after the cache expired)";
+  if (fresh.cacheFrom !== s.cacheFrom) return "a newer call refreshed the cache";
+  if (!opts.allowCold && live(s) < MIN_LEFT_S) return `only ${live(s).toFixed(1)} s left, too late to be sure it lands warm`;
+  return "";
+}
+
+async function sendNow(context, s, text, label, opts = {}) {
   // timed from the decision, so the measured offset includes opening the tab, submitting and the
   // network: the countdown then shifts earlier by the whole delay
   const decidedAt = Date.now();
   const st = stateFor(s.id);
-  const fresh = (await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {})) || s;
-  if (fresh.busy || fresh.cacheFrom !== s.cacheFrom) {             // you or the agent moved on
-    logx(`${label} for ${s.id.slice(0, 8)} not sent: ${fresh.busy ? "agent working" : "a newer call refreshed the cache"}`);
-    return false;
-  }
+  const why = await unsafeToSend(s, opts);
+  if (why) { logx(`${label} for ${s.id.slice(0, 8)} not sent: ${why}`); return false; }
   try {
     const before = allTabKeys();
     await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: sessionUri(s.id) });
@@ -294,8 +305,15 @@ async function sendNow(context, s, text, label) {
     const restore = !!opened && s.lastRealUserTs === latestReal;
     // remember each chat's last message time (remote clock) to recognise ours when it lands
     const lastMsgs = new Map(all.map(x => [x.id, x.lastUserTs || 0]));
-    if (live(s) < 1.5) logx(`warning: ${label} for ${s.id.slice(0, 8)} sent with only ${live(s).toFixed(1)} s left`);
-    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, before: lastMsgs };
+    // opening the tab took time: check again right before submitting
+    const late = await unsafeToSend(s, opts);
+    if (late) {
+      logx(`${label} for ${s.id.slice(0, 8)} not sent: ${late}`);
+      if (opened) await finishTab({ tab: opened, restore, sessionId: s.id });
+      return false;
+    }
+    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, before: lastMsgs,
+                   miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
     await vscode.commands.executeCommand("workbench.action.chat.submit", { inputValue: text });
     logx(`${label} sent to ${s.id.slice(0, 8)} (${describe(s)})${opened ? ", in a tab opened for it" : ""}`);
@@ -354,9 +372,18 @@ async function verifyPending() {
           "Stopped acting on the original chat.");
       }
     }
+    // Not in the log a few seconds after submitting: Copilot queued it behind work that started in
+    // the meantime. It cannot be taken back from here, and it may run on an expired cache.
+    if (!p.landed && !p.queuedWarned && Date.now() - p.sentAt > QUEUED_AFTER_MS) {
+      p.queuedWarned = true;
+      logx(`${p.label} for ${p.expectId.slice(0, 8)} not started after ${QUEUED_AFTER_MS / 1000} s: probably queued`);
+      vscode.window.showWarningMessage(`Cache Keeper: the ${p.label} did not start; the chat is probably busy and ` +
+        "it is queued. If it runs after the cache expires it re-sends the whole context" +
+        (p.miss ? ` (~${core.fmt(p.miss)} cr extra)` : "") + ". Remove it from the chat's queue if you don't want that.");
+    }
     const done = p.landed && !(pool.find(x => x.id === p.landed) || {}).busy;
     if (done || Date.now() - p.sentAt > 90000) {
-      if (!p.landed) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
+      if (!p.landed && !p.queuedWarned) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
       if (p.tab) withUi(() => finishTab(p));
       st.pending = null;
     }
@@ -415,10 +442,23 @@ async function summary(context, s, why) {
   return true;
 }
 
-async function keepAlive(context, s) {
-  const ok = await trySend(context, s, HEARTBEAT, "keep-alive");
-  if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat : 0;
+async function keepAlive(context, s, opts = {}) {
+  const cold = live(s) <= 0;     // only possible from the command: the whole context is re-sent
+  const ok = await trySend(context, s, HEARTBEAT, "keep-alive", opts);
+  if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;
   return ok;
+}
+
+/** "Keep warm now" from the command palette: on an expired cache, say what it costs first. */
+async function keepWarmNow(context, s) {
+  if (!s.busy && live(s) <= 0) {
+    const price = s.cost ? ` It re-sends the whole context: ~${core.fmt(s.cost.heartbeat + s.cost.missExtra)} cr ` +
+      `instead of ~${core.fmt(s.cost.heartbeat)} cr for a warm one.` : " It re-sends the whole context at full price.";
+    const go = await vscode.window.showWarningMessage(`Cache Keeper: the cache has already expired (${describe(s)}).` +
+      price + " The cache is then warm again.", { modal: true }, "Send anyway");
+    if (go !== "Send anyway") return;
+  }
+  await keepAlive(context, s, { allowCold: true });   // you chose to send it, cold or warm
 }
 
 // ---------------------------------------------------------------- choices
@@ -479,7 +519,10 @@ async function offer(context, s) {
   const buttons = c ? Object.keys(CHOICES) : ["Keep warm", "Summarize", "Ignore"];
   const pick = await vscode.window.showWarningMessage(msg, ...buttons);
   o.answered = true;
-  if (!pick) { goQuiet(st, s, "warning closed"); return; }
+  // Closed (X): a deliberate "not now", so the same as Ignore: nothing automatic, nothing spent,
+  // no more warnings until you write in the chat again. (A warning that just slides into the
+  // notification center is not closed: it stays unanswered and noResponseAction applies.)
+  if (!pick) { goQuiet(st, s, "warning closed"); setMode(st, s, "ignore"); return; }
   st.quietFor = undefined;
   await choose(context, s, pick);
 }
@@ -512,7 +555,9 @@ function listChats() {
 
 function chatItem(s) {
   const r = live(s), st = stateFor(s.id);
-  const when = s.busy ? "working" : r > 0 ? `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` : "expired";
+  const clock = r > 0 ? mmss(r) : "expired";
+  // while the agent works (a long tool run makes no model call), the cache can still run out
+  const when = s.busy ? `working · cache ${clock}` : clock;
   return {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
     description: `${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
@@ -670,6 +715,8 @@ async function newChatFromHandoff(uri) {
   });
 }
 
+function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}`; }
+
 function updateStatus(context) {
   const list = all.filter(managed);
   const s = list[0];            // most recently active chat
@@ -682,7 +729,14 @@ function updateStatus(context) {
   const autoHere = st.mode === "auto"
     ? ` (auto keep warm${st.cap !== null ? ` ${core.fmt(st.spent)}/${core.fmt(st.cap)} cr` : ""})` : "";
   const autoElsewhere = autoChats.length && st.mode !== "auto" ? ` $(zap) auto keep warm ×${autoChats.length}` : "";
-  if (s.busy) statusItem.text = `$(sync~spin) cache: agent working${autoElsewhere}${others}`;
+  if (sending) {
+    // a chat is being opened as a tab and sent to: typing in the Chat view now would go elsewhere
+    statusItem.text = "$(loading~spin) Cache Keeper sending… wait before typing";
+    statusItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    statusItem.show();
+    return;
+  }
+  if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
       (autoHere || (st.mode === "once" ? " (keep-alive armed)" : "")) + autoElsewhere + others;
@@ -713,7 +767,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
-    vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepAlive(context, s); }),
+    vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summary(context, s, "on request"); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {

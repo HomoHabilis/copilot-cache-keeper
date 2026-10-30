@@ -17,6 +17,7 @@ const UNKNOWN_TTL = 300;       // assume the short lifetime for other models
 const KEEPALIVE_MIN_NEW = 400; // never assume a keep-alive adds fewer uncached tokens than this
 const KEEPALIVE_NEW = 600;     // tokens a keep-alive adds uncached besides the agent's last reply
                                // (VS Code's per-message context block + our one-line message)
+const BUSY_CAP_MS = 6 * 3600 * 1000; // an open turn this quiet is taken as one that never logged its end
 const HEARTBEAT_OUT = 30;      // "OK"
 const SUMMARY_CALLS = 2;       // write the file, then confirm
 const TOKENS_PER_WORD = 1.4;
@@ -101,6 +102,27 @@ function rates(sheet, ctx) {
   };
 }
 
+const CALIBRATE_MIN_UNCACHED = 2000;  // only calls that sent at least this much uncached
+
+/**
+ * Credits per uncached prompt token as billed, from recent calls with a large uncached part:
+ * (cost - cached * read price - output * output price) / uncached. Median of the last 5, or null
+ * when there is no such call (then the price sheet's cache write price is used).
+ */
+function billedWriteRate(calls, sheet) {
+  const samples = [];
+  for (const c of calls) {
+    const a = c.attrs, nano = a.copilotUsageNanoAiu;
+    const input = a.inputTokens || 0, cached = a.cachedTokens || 0, uncached = input - cached;
+    if (!nano || uncached < CALIBRATE_MIN_UNCACHED) continue;
+    const r = rates(sheet, input);
+    const w = (nano / 1e9 - cached * r.read - (a.outputTokens || 0) * r.out) / uncached;
+    if (w > 0) samples.push(w);
+  }
+  const recent = samples.slice(-5).sort((x, y) => x - y);
+  return recent.length ? recent[Math.floor((recent.length - 1) / 2)] : null;
+}
+
 /** State of one chat from its log text, or null if it has no agent call yet. Pure. */
 function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
   const events = parseJsonl(mainText);
@@ -120,11 +142,20 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const userMessages = events.filter(e => e.type === "user_message");
   const lastUser = userMessages[userMessages.length - 1];
   const isOurs = u => String((u.attrs && u.attrs.content) || "").startsWith(MARKER);
-  // Busy: a message was sent or a turn started after the last turn ended. (Not "the log changed":
-  // VS Code also appends discovery lines to a chat's log when another chat is opened.)
-  const lastStart = Math.max(0, ...events.filter(e => e.type === "turn_start" || e.type === "user_message").map(e => e.ts || 0));
-  const lastTurnEnd = Math.max(0, ...events.filter(e => e.type === "turn_end").map(e => e.ts || 0));
-  const busy = lastStart > lastTurnEnd && now - lastStart < 15 * 60 * 1000;   // cap: a turn that never logged its end
+  // Busy: a turn is still open. Turns nest (a subagent logs its own turn_start/turn_end inside the
+  // agent's turn), so count depth rather than comparing the last start with the last end; a message
+  // sent after everything closed also counts (its turn_start may not be logged yet). (Not "the log
+  // changed": VS Code also appends discovery lines to a chat's log when another chat is opened.)
+  let depth = 0, pendingMsg = false, lastActivity = 0;
+  for (const e of [...events].sort((x, y) => (x.ts || 0) - (y.ts || 0))) {
+    if (e.type === "turn_start") { depth++; pendingMsg = false; }
+    else if (e.type === "turn_end") { depth = Math.max(0, depth - 1); if (!depth) pendingMsg = false; }
+    else if (e.type === "user_message" && depth === 0) pendingMsg = true;
+    if (/^(turn_start|turn_end|user_message|llm_request|tool_call)$/.test(e.type)) lastActivity = Math.max(lastActivity, e.ts || 0);
+  }
+  // A long tool run (tests, a push) logs nothing until it ends, so no short cap: only a turn quiet
+  // for hours is taken as one that never logged its end.
+  const busy = (depth > 0 || pendingMsg) && now - lastActivity < BUSY_CAP_MS;
   const ttl = ttlFor(model, ttlOverrides);
   // What the chat contains, for sizing a handoff summary.
   const realTurns = userMessages.filter(u => !isOurs(u)).length;
@@ -148,7 +179,10 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   for (const u of userMessages.filter(isOurs)) {
     const i = calls.findIndex(c => c.ts >= u.ts);
     if (i <= 0) continue;
-    const uncached = (calls[i].attrs.inputTokens || 0) - (calls[i].attrs.cachedTokens || 0);
+    const input = calls[i].attrs.inputTokens || 0, cached = calls[i].attrs.cachedTokens || 0;
+    // a keep-alive sent after the cache expired re-sent everything: says nothing about a warm one
+    if (cached < input / 2) continue;
+    const uncached = input - cached;
     fixedParts.push(Math.max(0, uncached - (calls[i - 1].attrs.outputTokens || 0)));
   }
   const recent = fixedParts.slice(-5).sort((x, y) => x - y);
@@ -158,9 +192,15 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const heartbeatNew = fixedNew + (a.outputTokens || 0);
   const sheet = modelsText ? priceSheetFrom(modelsText, model) : null;
   let cost = null;                                   // null = price unknown for this model
+  let billedWrite = null;
   if (sheet) {
-    const r = rates(sheet, ctx);                     // tier that applies at the current context size
-    const fresh = rates(sheet, firstCtx);
+    // What Copilot actually billed per uncached prompt token, from this chat's own calls (the log
+    // has each call's exact cost). Observed: a cold call is billed near the input price, below the
+    // sheet's cache_write_price, so the sheet alone over-estimates an expiry by ~15%.
+    billedWrite = billedWriteRate(calls, sheet);
+    const scale = r0 => billedWrite === null ? r0 : { ...r0, write: billedWrite };
+    const r = scale(rates(sheet, ctx));              // tier that applies at the current context size
+    const fresh = scale(rates(sheet, firstCtx));
     const hit = ctx * r.read;
     cost = {
       heartbeat: hit + heartbeatNew * r.write + HEARTBEAT_OUT * r.out,
@@ -173,7 +213,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, lastEnd, busy, credits,
-    cost, stats, summaryWords: words,
+    cost, stats, summaryWords: words, billedWrite,
     // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
     cacheFrom: last.ts,
     remaining: ttl - (now - last.ts) / 1000,
