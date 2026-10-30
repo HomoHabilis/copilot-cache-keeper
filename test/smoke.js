@@ -301,7 +301,19 @@ const never = () => new Promise(() => {});
       const per = start.cost.heartbeat, sum = start.cost.summary;
       assert.ok(alives.length * per + sum <= cap * 1.05 && (alives.length + 2) * per + sum > cap,
         `${alives.length} keep-alives at ~${per.toFixed(2)} cr vs cap ${cap.toFixed(2)}`);
-      assert.strictEqual(h.warnings.length, 1);
+      assert.strictEqual(h.warnings.length, 2, "first warning, then one at the cap");
+      assert.ok(h.warnings[1].msg.includes("reached its 50% cap"), h.warnings[1].msg);
+    } finally { h.close(); }
+  });
+
+  await check("auto keep warm at its cap: choosing Auto keep warm again starts a new cap", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : n === 2 ? "Auto keep warm" : never() });
+    try {
+      await h.run(300 * 60, () => h.sent.some(x => !x.text.includes("Keep-alive")));
+      const capAt = h.warnings[1].at;
+      assert.ok(h.warnings[2] && h.warnings[2].msg.includes("cap"), "warned again at the new cap");
+      assert.ok(h.sent.filter(x => x.at > capAt && x.text.includes("Keep-alive")).length >= 3, "kept going after the cap");
+      assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "summary at the second cap");
     } finally { h.close(); }
   });
 

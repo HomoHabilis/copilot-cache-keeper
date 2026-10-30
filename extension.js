@@ -420,6 +420,24 @@ async function offer(context, s) {
   await choose(context, s, pick);
 }
 
+/**
+ * Auto keep warm is about to reach its cap (the next keep-alive would not fit): warn once, so you
+ * can choose again. No click: what the cap does anyway (summary, or just stop).
+ */
+async function offerAtCap(context, s) {
+  const st = stateFor(s.id);
+  const c = s.cost;
+  const fresh = core.autoCap(s, capPercent());
+  const msg = `Auto keep warm reached its ${capPercent()}% cap: ${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr spent ` +
+    `(${describe(s)}). Cache expires in ${Math.max(0, Math.round(live(s)))}s; letting it expire adds ~${core.fmt(c.missExtra)} cr ` +
+    `to your next message. Keep warm: one more keep-alive (~${core.fmt(c.heartbeat)} cr). ` +
+    `Auto keep warm: start again with a new cap of ~${core.fmt(fresh)} cr. ` +
+    (summaryAfter() ? `If you don't click, a handoff summary (~${core.fmt(c.summary)} cr) is written and it expires.`
+      : "If you don't click, it expires.");
+  const pick = await vscode.window.showWarningMessage(msg, ...Object.keys(CHOICES));
+  if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
+}
+
 /** Chats for the list: all warm ones (soonest expiry first), plus the most recently expired. Max 10. */
 function listChats() {
   const list = all.filter(managed);
@@ -524,6 +542,11 @@ async function decide(context) {
         setMode(st, s, fallback === "keepWarmOnce" ? "once" : "auto");
         logx(`no answer for ${s.id.slice(0, 8)}: ${modeLabel(st.mode)}` + (st.mode === "auto" ? `, ${capText(st)}` : ""));
       }
+    }
+    if (st.mode === "auto" && seenLive(s) && r > 0 && r <= cfg("warnSeconds") && st.capWarnFor !== s.cacheFrom &&
+        s.cost && !core.canAffordHeartbeat(s, st.spent, st.cap, summaryAfter())) {
+      st.capWarnFor = s.cacheFrom;
+      offerAtCap(context, s);    // not awaited, like the expiry warning
     }
     const summaryRule = cfg("autoSummary") && aboveThreshold(s) && seenLive(s);
     const afterOnce = summaryAfter() && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
