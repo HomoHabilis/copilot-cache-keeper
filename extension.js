@@ -230,8 +230,19 @@ function setAll(r) {
   if (!baseline && logRootPath) baseline = new Map(r.map(x => [x.id, x.cacheFrom]));
   all = r;
 }
-function aboveThreshold(s) { return !!s.cost && s.cost.missExtra >= cfg("thresholdCredits"); }
+// Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
+// fits cheap and expensive models. Acting on its own still needs a known price.
+function aboveThreshold(s) { return !!s.cost && s.ctx >= cfg("thresholdTokens"); }
+/**
+ * The chat you are most likely looking at: the one where you last typed. (Not the latest model call:
+ * Cache Keeper's own keep-alives and summaries, or another chat's agent, make those newer.)
+ */
+function currentChat() {
+  const list = all.filter(managed);
+  return list.reduce((best, s) => !best || (s.lastRealUserTs || 0) > (best.lastRealUserTs || 0) ? s : best, null);
+}
 function managed(s) {
+  // minCredits filters everything (list, warnings, actions, orange status): a cheap expiry isn't worth a word
   return s.lastRealUserTs && !(s.cost && s.cost.missExtra < cfg("minCredits"));
 }
 
@@ -719,7 +730,7 @@ function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).pa
 
 function updateStatus(context) {
   const list = all.filter(managed);
-  const s = list[0];            // most recently active chat
+  const s = currentChat();      // the chat where you last typed
   if (!s) { statusItem.hide(); return; }
   const st = stateFor(s.id), r = live(s);
   const shownInList = listChats().length;            // warm chats + the latest expired, max 10
@@ -736,20 +747,41 @@ function updateStatus(context) {
     statusItem.show();
     return;
   }
+  // Coming back to an expired chat: make an expensive next message stand out (orange). Measured in
+  // context tokens, since a cold send costs about context x the model's input price: the same
+  // setting then fits a cheap model and an expensive one.
+  const costlyRestart = r <= 0 && !s.busy && s.ctx >= cfg("thresholdTokens");
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
       (autoHere || (st.mode === "once" ? " (keep-alive armed)" : "")) + autoElsewhere + others;
-  } else statusItem.text = "$(circle-slash) cache expired" + (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
-  statusItem.tooltip = `${describe(s)}. ` + (s.cost
-    ? `Keep-alive ~${core.fmt(s.cost.heartbeat)} cr, expiry adds ~${core.fmt(s.cost.missExtra)} cr, summary ~${core.fmt(s.cost.summary)} cr. ` +
-      `Session so far ${core.fmt(s.credits)} cr. `
-    : "No price for this model in Copilot's price sheet. ") +
-    `Cache lifetime ${s.ttl}s. Click to manage the ${shownInList} chat(s) in the list.` +
-    (autoChats.length ? ` Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
-      "click to change it, or run \"Cache Keeper: Stop keeping warm\"." : "");
+  } else statusItem.text = (costlyRestart ? "$(warning)" : "$(circle-slash)") + " cache expired" +
+    (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
+  // Tooltip: short Markdown lines rather than one long sentence.
+  const md = [`**${s.title ? s.title.replace(/[\\`*_[\]<>]/g, "") : s.id.slice(0, 8)}**  `,
+              `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s`, ""];
+  if (costlyRestart) {
+    md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
+      (s.cost ? ` (**+${core.fmt(s.cost.missExtra)} cr**)` : "") + ".", "");
+    md.push(st.handoff
+      ? `Handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}.`
+      : "Consider starting a new chat from a handoff summary instead.", "");
+  }
+  if (s.cost) {
+    md.push("| | |", "|---|--:|",
+      `| Keep-alive | ~${core.fmt(s.cost.heartbeat)} cr |`,
+      `| Expiry adds | ~${core.fmt(s.cost.missExtra)} cr |`,
+      `| Handoff summary | ~${core.fmt(s.cost.summary)} cr |`,
+      `| Session so far | ${core.fmt(s.credits)} cr |`, "");
+  } else md.push("No price for this model in Copilot's price sheet.", "");
+  if (autoChats.length) md.push(`$(zap) Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
+    "click to change it, or run *Cache Keeper: Stop keeping warm*.", "");
+  if (costlyRestart) md.push(`*Orange: expired and over cacheKeeper.thresholdTokens (${Math.round(cfg("thresholdTokens") / 1000)}k).*  `);
+  md.push(`Click to manage the ${shownInList} chat(s) in the list.`);
+  const tip = new vscode.MarkdownString(md.join("\n"), true);
+  statusItem.tooltip = tip;
   statusItem.backgroundColor = autoChats.length ? new vscode.ThemeColor("statusBarItem.errorBackground")
-    : r > 0 && r <= cfg("warnSeconds") && !s.busy ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
+    : costlyRestart || (r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined;
   statusItem.show();
 }
 
@@ -763,7 +795,7 @@ function activate(context) {
   statusItem.command = "cacheKeeper.options";
   context.subscriptions.push(statusItem);
   // cache lifetimes from Copilot CLI logs: learned once the logs are located, refreshed every 30 min
-  const shownOrNewest = () => all.filter(managed)[0];
+  const shownOrNewest = () => currentChat();
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),

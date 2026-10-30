@@ -81,7 +81,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
     writeFile: async (u, b) => fs.writeFileSync(u.fsPath, b),
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
-  const settings = { warnSeconds: 60, thresholdCredits: 60, autoSummary: true, minCredits: 5, ttlSeconds: {},
+  const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
                      keepAliveLeadSeconds: 5, afterSend: "closeTab", noResponseAction: "nothing",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
@@ -120,7 +120,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
         }
       },
     },
-    StatusBarAlignment: { Right: 2 }, ThemeColor: class { constructor(id) { this.id = id; } },
+    StatusBarAlignment: { Right: 2 },
+    MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
+    ThemeColor: class { constructor(id) { this.id = id; } },
     Uri: { file: f => ({ scheme: "file", fsPath: f, path: f }),
            from: o => ({ ...o, toString: () => `${o.scheme}://${o.authority}${o.path}` }),
            joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return { scheme: "file", fsPath: f, path: f }; } },
@@ -230,6 +232,25 @@ const never = () => new Promise(() => {});
     assert.strictEqual(s.busy, true);
   });
 
+  await check("analyze: a turn left open by a stopped request or a message sent mid-run is not busy", () => {
+    // as seen in a real log: turn 7 runs a terminal command, you send a new message, turn 7 never ends
+    const t0 = now - 30 * 60000;
+    const ev = [
+      { type: "user_message", ts: t0, attrs: { content: "run the mutation tests" } },
+      { type: "turn_start", ts: t0 + 10 },
+      { type: "llm_request", ts: t0 + 50, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 80000, cachedTokens: 0, outputTokens: 300, copilotUsageNanoAiu: 40e9 } },
+      { type: "tool_call", ts: t0 + 2100, name: "run_in_terminal" },
+      { type: "user_message", ts: t0 + 60000, attrs: { content: "commit in the meantime" } },
+      { type: "turn_start", ts: t0 + 60000 },
+      { type: "llm_request", ts: t0 + 60050, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+        inputTokens: 81000, cachedTokens: 80000, outputTokens: 300, copilotUsageNanoAiu: 5e9 } },
+      { type: "turn_end", ts: t0 + 62100 },
+    ];
+    const s = core.analyze("/logs/stopped", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, false);
+  });
+
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
     const busy = chatLog(now - 5000).replace(/.*"turn_end".*\n$/, "");
     assert.strictEqual(core.analyze("/logs/b", busy, MODELS, now).busy, true);
@@ -324,7 +345,7 @@ const never = () => new Promise(() => {});
   });
 
   await check("closing the warning acts as Ignore: nothing sent, not even the summary or noResponseAction", async () => {
-    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", thresholdCredits: 0 } });
+    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", thresholdTokens: 0 } });
     try {
       await h.run(310);
       assert.strictEqual(h.sent.length, 0);
@@ -383,6 +404,59 @@ const never = () => new Promise(() => {});
       assert.ok(h.warnings[2] && h.warnings[2].msg.includes("cap"), "warned again at the new cap");
       assert.ok(h.sent.filter(x => x.at > capAt && x.text.includes("Keep-alive")).length >= 3, "kept going after the cap");
       assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "summary at the second cap");
+    } finally { h.close(); }
+  });
+
+  await check("expired chat: orange status only when its context is at least thresholdTokens", async () => {
+    for (const [threshold, orange] of [[30000, true], [100000, false]]) {     // the chat has 40k tokens
+      const h = await harness({ answer: () => undefined, settings: { thresholdTokens: threshold, autoSummary: false } });
+      try {
+        await h.run(400);
+        assert.strictEqual(h.sent.length, 0);
+        assert.ok(h.status.text.includes("cache expired"), h.status.text);
+        const bg = (h.status.backgroundColor || {}).id;
+        assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
+        assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
+        assert.strictEqual(h.status.tooltip.value.includes("thresholdTokens"), orange, h.status.tooltip);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("status bar follows the chat where you last typed, not the latest model call", async () => {
+    const h = await harness({ answer: () => undefined });
+    try {
+      // another chat: you typed in it earlier, but a Cache Keeper keep-alive ran there just now
+      const other = path.join(path.dirname(path.dirname(h.logFile)), "sess-2");
+      fs.mkdirSync(other);
+      fs.writeFileSync(path.join(other, "models.json"), MODELS);
+      fs.writeFileSync(path.join(other, "main.jsonl"), chatLog(h.clock - 200000, { ctx: 90000 }) +
+        [{ type: "user_message", ts: h.clock - 1000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
+         { type: "turn_start", ts: h.clock - 990 },
+         { type: "llm_request", ts: h.clock - 950, dur: 500, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+           inputTokens: 90900, cachedTokens: 90000, outputTokens: 4, copilotUsageNanoAiu: 3e9 } },
+         { type: "turn_end", ts: h.clock - 400 }].map(e => JSON.stringify(e)).join("\n") + "\n");
+      await h.run(6);
+      assert.ok(h.status.tooltip.value.includes("40k context"), h.status.tooltip);
+    } finally { h.close(); }
+  });
+
+  await check("minCredits filters everything: no warning and no orange status for a cheap chat", async () => {
+    const h = await harness({ answer: () => undefined, settings: { thresholdTokens: 30000, minCredits: 1000 } });
+    try {
+      await h.run(400);
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.sent.length, 0);
+      assert.notStrictEqual((h.status.backgroundColor || {}).id, "statusBarItem.warningBackground");
+    } finally { h.close(); }
+  });
+
+  await check("expired chat with a handoff summary: tooltip gives the new-chat cost", async () => {
+    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 } });
+    try {
+      await h.run(900);
+      assert.ok(h.sent.some(x => x.text.includes("handoff summary")), "summary written");
+      assert.ok(h.status.text.includes("cache expired"), h.status.text);
+      assert.ok(/Handoff summary ready: a new chat from it ≈ [\d.]+ cr/.test(h.status.tooltip.value), h.status.tooltip);
     } finally { h.close(); }
   });
 
