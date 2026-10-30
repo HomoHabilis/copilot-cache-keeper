@@ -101,6 +101,27 @@ function rates(sheet, ctx) {
   };
 }
 
+const CALIBRATE_MIN_UNCACHED = 2000;  // only calls that sent at least this much uncached
+
+/**
+ * Credits per uncached prompt token as billed, from recent calls with a large uncached part:
+ * (cost - cached * read price - output * output price) / uncached. Median of the last 5, or null
+ * when there is no such call (then the price sheet's cache write price is used).
+ */
+function billedWriteRate(calls, sheet) {
+  const samples = [];
+  for (const c of calls) {
+    const a = c.attrs, nano = a.copilotUsageNanoAiu;
+    const input = a.inputTokens || 0, cached = a.cachedTokens || 0, uncached = input - cached;
+    if (!nano || uncached < CALIBRATE_MIN_UNCACHED) continue;
+    const r = rates(sheet, input);
+    const w = (nano / 1e9 - cached * r.read - (a.outputTokens || 0) * r.out) / uncached;
+    if (w > 0) samples.push(w);
+  }
+  const recent = samples.slice(-5).sort((x, y) => x - y);
+  return recent.length ? recent[Math.floor((recent.length - 1) / 2)] : null;
+}
+
 /** State of one chat from its log text, or null if it has no agent call yet. Pure. */
 function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
   const events = parseJsonl(mainText);
@@ -148,7 +169,10 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   for (const u of userMessages.filter(isOurs)) {
     const i = calls.findIndex(c => c.ts >= u.ts);
     if (i <= 0) continue;
-    const uncached = (calls[i].attrs.inputTokens || 0) - (calls[i].attrs.cachedTokens || 0);
+    const input = calls[i].attrs.inputTokens || 0, cached = calls[i].attrs.cachedTokens || 0;
+    // a keep-alive sent after the cache expired re-sent everything: says nothing about a warm one
+    if (cached < input / 2) continue;
+    const uncached = input - cached;
     fixedParts.push(Math.max(0, uncached - (calls[i - 1].attrs.outputTokens || 0)));
   }
   const recent = fixedParts.slice(-5).sort((x, y) => x - y);
@@ -158,9 +182,15 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const heartbeatNew = fixedNew + (a.outputTokens || 0);
   const sheet = modelsText ? priceSheetFrom(modelsText, model) : null;
   let cost = null;                                   // null = price unknown for this model
+  let billedWrite = null;
   if (sheet) {
-    const r = rates(sheet, ctx);                     // tier that applies at the current context size
-    const fresh = rates(sheet, firstCtx);
+    // What Copilot actually billed per uncached prompt token, from this chat's own calls (the log
+    // has each call's exact cost). Observed: a cold call is billed near the input price, below the
+    // sheet's cache_write_price, so the sheet alone over-estimates an expiry by ~15%.
+    billedWrite = billedWriteRate(calls, sheet);
+    const scale = r0 => billedWrite === null ? r0 : { ...r0, write: billedWrite };
+    const r = scale(rates(sheet, ctx));              // tier that applies at the current context size
+    const fresh = scale(rates(sheet, firstCtx));
     const hit = ctx * r.read;
     cost = {
       heartbeat: hit + heartbeatNew * r.write + HEARTBEAT_OUT * r.out,
@@ -173,7 +203,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, lastEnd, busy, credits,
-    cost, stats, summaryWords: words,
+    cost, stats, summaryWords: words, billedWrite,
     // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
     cacheFrom: last.ts,
     remaining: ttl - (now - last.ts) / 1000,

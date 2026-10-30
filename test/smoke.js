@@ -31,16 +31,23 @@ const MODELS = JSON.stringify([{
     long_context: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 1500, max_prompt_tokens: 922000 } } },
 }]);
 
-function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = false } = {}) {
+function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = false, writePrice = 500, coldKeepAlive = false } = {}) {
   const ev = [
     { type: "user_message", ts: t0, attrs: { content: "Refactor the parser" } },
     { type: "turn_start", ts: t0 + 10 },
     { type: "llm_request", ts: t0 + 50, dur: 3000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx - 20000,
-      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: 30e9 } },
+      // billed: uncached at writePrice per 1M, output at 2000 per 1M (as Copilot's log reports it)
+      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: ((ctx - 20000) * writePrice + 800 * 2000) * 1e3 } },
     { type: "llm_request", ts: t0 + 4000, dur: 2000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx,
       cachedTokens: ctx - 1000, outputTokens: 300, copilotUsageNanoAiu: 5e9 } },
     { type: "turn_end", ts: t0 + 6500 },
   ];
+  if (coldKeepAlive) {            // a keep-alive sent after the cache expired: everything re-sent
+    ev.push({ type: "user_message", ts: t0 + 8000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
+            { type: "llm_request", ts: t0 + 8050, dur: 800, attrs: { debugName: "panel/editAgent", model,
+              inputTokens: ctx + 600, cachedTokens: 0, outputTokens: 4, copilotUsageNanoAiu: ((ctx + 600) * writePrice + 4 * 2000) * 1e3 } },
+            { type: "turn_end", ts: t0 + 8900 });
+  }
   if (keepAlive) {
     ev.push({ type: "user_message", ts: t0 + 9000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
             { type: "turn_start", ts: t0 + 9010 },
@@ -189,6 +196,21 @@ const never = () => new Promise(() => {});
     const expected = (150900 * 20 + 604 * 500 + 30 * 2000) / 1e6;
     assert.ok(Math.abs(s.cost.heartbeat - expected) < 0.01, `heartbeat ${s.cost.heartbeat} vs ${expected}`);
     assert.strictEqual(s.lastRealUserTs, now - 60000, "keep-alives are not counted as your messages");
+  });
+
+  await check("analyze: a keep-alive on an expired cache is not used to estimate a warm one", () => {
+    const s = core.analyze("/logs/k2", chatLog(now - 60000, { keepAlive: true, coldKeepAlive: true }), MODELS, now);
+    // only the warm keep-alive counts: its 900 new tokens minus the 4-token reply before it, plus
+    // the last reply (4). The cold one (150k uncached) would have made this ~78 cr.
+    const expected = (150900 * 20 + 900 * 500 + 30 * 2000) / 1e6;
+    assert.ok(Math.abs(s.cost.heartbeat - expected) < 0.05, `heartbeat ${s.cost.heartbeat} vs ${expected}`);
+  });
+
+  await check("analyze: expiry priced at what Copilot actually billed for uncached tokens", () => {
+    const s = core.analyze("/logs/c", chatLog(now - 60000, { writePrice: 400 }), MODELS, now);
+    assert.ok(Math.abs(s.billedWrite * 1e6 - 400) < 0.5, `billed ${s.billedWrite * 1e6}`);
+    // 150k * (400 - 20) / 1e6 = 57, not the price sheet's 150k * (500 - 20) / 1e6 = 72
+    assert.ok(Math.abs(s.cost.missExtra - 57) < 0.1, `missExtra ${s.cost.missExtra}`);
   });
 
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
