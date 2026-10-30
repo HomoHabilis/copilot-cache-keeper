@@ -1,7 +1,9 @@
 name: Smoke test
 
+# One run per change: pushes to main, and pull requests (which cover their branch's pushes).
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_call:      # reused by the release workflow before publishing
 
@@ -12,9 +14,9 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
 
@@ -48,3 +50,12 @@ jobs:
           assert pkg["main"] == "./extension.js"
           print(f"{sys.argv[1]}: {len(names)} files, version {pkg['version']}, OK")
           EOF
+
+      # Download it from the run's Summary page (Artifacts) to try a pull request's build.
+      - name: Upload the .vsix
+        uses: actions/upload-artifact@v5
+        with:
+          name: copilot-cache-keeper-vsix
+          path: copilot-cache-keeper-*.vsix
+          if-no-files-found: error
+          retention-days: 14
