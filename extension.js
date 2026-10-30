@@ -518,10 +518,11 @@ async function offer(context, s) {
        : "If you don't click, it just expires (below your summary threshold).");
   const buttons = c ? Object.keys(CHOICES) : ["Keep warm", "Summarize", "Ignore"];
   const pick = await vscode.window.showWarningMessage(msg, ...buttons);
-  // Closed without a choice (X, or VS Code dismissed it): same as no answer, so
-  // cacheKeeper.noResponseAction still applies when the time comes.
-  if (!pick) { goQuiet(st, s, "warning closed"); return; }
   o.answered = true;
+  // Closed (X): a deliberate "not now", so the same as Ignore: nothing automatic, nothing spent,
+  // no more warnings until you write in the chat again. (A warning that just slides into the
+  // notification center is not closed: it stays unanswered and noResponseAction applies.)
+  if (!pick) { goQuiet(st, s, "warning closed"); setMode(st, s, "ignore"); return; }
   st.quietFor = undefined;
   await choose(context, s, pick);
 }

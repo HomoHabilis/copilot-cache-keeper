@@ -323,12 +323,11 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("noResponseAction: also applies when the warning is closed without a choice", async () => {
-    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", summaryAfterKeepWarm: false } });
+  await check("closing the warning acts as Ignore: nothing sent, not even the summary or noResponseAction", async () => {
+    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", thresholdCredits: 0 } });
     try {
       await h.run(310);
-      assert.strictEqual(h.sent.length, 1, "keep-alive sent");
-      assert.ok(h.sent[0].text.includes("Keep-alive"));
+      assert.strictEqual(h.sent.length, 0);
     } finally { h.close(); }
   });
 

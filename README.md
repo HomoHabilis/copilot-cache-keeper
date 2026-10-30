@@ -18,7 +18,8 @@ full price.
     expires. If letting it expire would add at least `cacheKeeper.thresholdCredits` (default 60)
     to your next message, a handoff summary is written 15 s before expiry first. Below that, it
     just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
-    unanswered or closed warning means no more warnings for that chat until you write in it again.
+    unanswered warning means no more warnings for that chat until you write in it again.
+  - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
   - **Keep warm:** sends one tiny keep-alive
     (`[cache-keeper] Keep-alive … Reply with only: OK`) **5 s before expiry**, for every model.
     A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. The next
