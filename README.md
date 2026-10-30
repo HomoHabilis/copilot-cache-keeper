@@ -180,13 +180,21 @@ Requires Python 3 (no Node build step and no dependencies):
 python3 build.py
 ```
 
-This writes `copilot-cache-keeper-<version>.vsix` next to the sources.
+This writes `copilot-cache-keeper-<version>.vsix` next to the sources. The version is never
+hardcoded (`package.json` says `0.0.0-dev`). With `VERSION` set (`VERSION=v0.9.0 python3 build.py`,
+as the release workflow does with its tag) it is that. Otherwise it is a dev build: next patch
+after the latest tag, a build number, the short commit, e.g. `0.8.2-dev.14.9cfc211` after tag
+`v0.8.1`. That sorts above the `0.8.1` release and below `0.8.2`, and each later build sorts
+above the previous one, so it installs over it. (VS Code needs semver, so no 4-part
+`0.8.1.14` version.) The build number is CI's run number, or locally the commits since the tag.
 
 
 ## Tests and releases
 
-- **Smoke test** (`.github/workflows/ci.yml`, on every push and pull request): syntax check,
-  `node test/smoke.js`, and a check of the built `.vsix`. `test/smoke.js` tests the cost and
+- **Smoke test** (`.github/workflows/ci.yml`, on pull requests and pushes to `main`): syntax
+  check, `node test/smoke.js`, and a check of the built `.vsix`. The `.vsix` is uploaded as the
+  run's `copilot-cache-keeper-vsix` artifact, versioned as a dev build (see *Build from
+  source*), to try a pull request's build. `test/smoke.js` tests the cost and
   timing logic on a synthetic Copilot log, and the extension itself with a stand-in for the
   VS Code API, sending a keep-alive before the cache expires. Run it locally with
   `node test/smoke.js`.
@@ -195,7 +203,7 @@ This writes `copilot-cache-keeper-<version>.vsix` next to the sources.
   - **Existing tag:** pick it in *Use workflow from*, and leave "tag" empty.
   - **New tag:** stay on a branch (e.g. `main`) and type the tag, e.g. `v0.7.6`. It's
     created on that branch's latest commit.
-  - **Both empty:** the tag is `v` + the version in `package.json`.
+  - **Both empty:** it stops and asks for a tag.
 
   The `.vsix` is built with the tag's version and attached to a GitHub release with generated
   notes.

@@ -2,7 +2,7 @@
   "name": "copilot-cache-keeper",
   "displayName": "Copilot Cache Keeper",
   "description": "Warns before a Copilot chat's prompt cache expires; keep it warm or write a handoff summary.",
-  "version": "0.8.0",
+  "version": "0.0.0-dev",
   "publisher": "local",
   "license": "UNLICENSED",
   "engines": {
