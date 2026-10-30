@@ -14,16 +14,24 @@ full price.
   what happens to it.
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
-  - **No click (default):** the cache expires. If letting it expire would add at least
-    `cacheKeeper.thresholdCredits` (default 60) to your next message, a handoff summary is
-    written 15 s before expiry first. Below that, it just expires.
+  - **No click:** what `cacheKeeper.noResponseAction` says. By default (`nothing`) the cache
+    expires. If letting it expire would add at least `cacheKeeper.thresholdCredits` (default 60)
+    to your next message, a handoff summary is written 15 s before expiry first. Below that, it
+    just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
+    unanswered or closed warning means no more warnings for that chat until you write in it again.
   - **Keep warm:** sends one tiny keep-alive
     (`[cache-keeper] Keep-alive … Reply with only: OK`) **5 s before expiry**, for every model.
-    A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper.
-  - **Auto keep warm:** does that before each expiry for as long as it stays cheaper than the
-    cheapest way out (letting the cache expire, or a summary plus a new chat). Then it writes
-    the handoff summary and stops, or just stops if a summary written since your last message
-    is still current.
+    A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. The next
+    timeout warns you again. If you don't keep it warm again, a handoff summary is written before
+    that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
+  - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
+    (default 50%) of what letting the cache expire would add, priced when auto keep warm starts.
+    The closing handoff summary counts against the cap. When the next keep-alive would not fit,
+    you get a warning to choose again (Keep warm once more, Auto keep warm with a fresh cap,
+    Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
+    `summaryAfterKeepWarm` off, or if a summary written since your last message is still
+    current). While it runs, the status bar turns red and shows spent / cap, because it spends
+    credits on its own.
   - **Summarize:** asks the agent to write `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
@@ -36,8 +44,9 @@ full price.
   Auto keep warm).
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
   from the handoff file.
-- **Every new cache window** (each time you or the agent sends something) brings the warning back.
-  After Ignore or a summary, it comes back only once you send a real message yourself.
+- **Every new cache window** (each time you or the agent sends something) brings the warning back,
+  as long as you answered the last one. After Ignore, a summary, or a warning you closed or left
+  unanswered, it comes back only once you send a real message yourself.
 
 ## Which chat gets the message
 
@@ -153,8 +162,11 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | Setting | Default | |
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
+| `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
 | `cacheKeeper.thresholdCredits` | 60 | Above this expiry cost, write the summary automatically if you don't answer |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
+| `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
+| `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expired cache costs less than this |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
