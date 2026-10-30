@@ -180,13 +180,18 @@ Requires Python 3 (no Node build step and no dependencies):
 python3 build.py
 ```
 
-This writes `copilot-cache-keeper-<version>.vsix` next to the sources.
+This writes `copilot-cache-keeper-<version>.vsix` next to the sources. The version is never
+hardcoded (`package.json` says `0.0.0-dev`): it is the latest git tag plus the short commit,
+e.g. `0.8.1-9cfc211`, or `VERSION` if set (`VERSION=v0.9.0 python3 build.py`).
 
 
 ## Tests and releases
 
-- **Smoke test** (`.github/workflows/ci.yml`, on every push and pull request): syntax check,
-  `node test/smoke.js`, and a check of the built `.vsix`. `test/smoke.js` tests the cost and
+- **Smoke test** (`.github/workflows/ci.yml`, on pull requests and pushes to `main`): syntax
+  check, `node test/smoke.js`, and a check of the built `.vsix`. The `.vsix` is uploaded as the
+  run's `copilot-cache-keeper-vsix` artifact (latest tag + short commit, e.g. `0.8.1-9cfc211`)
+  to try a pull request's build. It counts as older than the tag's release, so installing it
+  over that release may need `code --install-extension <file> --force`. `test/smoke.js` tests the cost and
   timing logic on a synthetic Copilot log, and the extension itself with a stand-in for the
   VS Code API, sending a keep-alive before the cache expires. Run it locally with
   `node test/smoke.js`.
@@ -195,7 +200,7 @@ This writes `copilot-cache-keeper-<version>.vsix` next to the sources.
   - **Existing tag:** pick it in *Use workflow from*, and leave "tag" empty.
   - **New tag:** stay on a branch (e.g. `main`) and type the tag, e.g. `v0.7.6`. It's
     created on that branch's latest commit.
-  - **Both empty:** the tag is `v` + the version in `package.json`.
+  - **Both empty:** it stops and asks for a tag.
 
   The `.vsix` is built with the tag's version and attached to a GitHub release with generated
   notes.
