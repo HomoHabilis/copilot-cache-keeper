@@ -518,8 +518,10 @@ async function offer(context, s) {
        : "If you don't click, it just expires (below your summary threshold).");
   const buttons = c ? Object.keys(CHOICES) : ["Keep warm", "Summarize", "Ignore"];
   const pick = await vscode.window.showWarningMessage(msg, ...buttons);
-  o.answered = true;
+  // Closed without a choice (X, or VS Code dismissed it): same as no answer, so
+  // cacheKeeper.noResponseAction still applies when the time comes.
   if (!pick) { goQuiet(st, s, "warning closed"); return; }
+  o.answered = true;
   st.quietFor = undefined;
   await choose(context, s, pick);
 }
@@ -726,6 +728,13 @@ function updateStatus(context) {
   const autoHere = st.mode === "auto"
     ? ` (auto keep warm${st.cap !== null ? ` ${core.fmt(st.spent)}/${core.fmt(st.cap)} cr` : ""})` : "";
   const autoElsewhere = autoChats.length && st.mode !== "auto" ? ` $(zap) auto keep warm ×${autoChats.length}` : "";
+  if (sending) {
+    // a chat is being opened as a tab and sent to: typing in the Chat view now would go elsewhere
+    statusItem.text = "$(loading~spin) Cache Keeper sending… wait before typing";
+    statusItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+    statusItem.show();
+    return;
+  }
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
