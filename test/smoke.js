@@ -401,6 +401,24 @@ const never = () => new Promise(() => {});
     }
   });
 
+  await check("status bar follows the chat where you last typed, not the latest model call", async () => {
+    const h = await harness({ answer: () => undefined });
+    try {
+      // another chat: you typed in it earlier, but a Cache Keeper keep-alive ran there just now
+      const other = path.join(path.dirname(path.dirname(h.logFile)), "sess-2");
+      fs.mkdirSync(other);
+      fs.writeFileSync(path.join(other, "models.json"), MODELS);
+      fs.writeFileSync(path.join(other, "main.jsonl"), chatLog(h.clock - 200000, { ctx: 90000 }) +
+        [{ type: "user_message", ts: h.clock - 1000, attrs: { content: "[cache-keeper] Keep-alive while I'm away." } },
+         { type: "turn_start", ts: h.clock - 990 },
+         { type: "llm_request", ts: h.clock - 950, dur: 500, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+           inputTokens: 90900, cachedTokens: 90000, outputTokens: 4, copilotUsageNanoAiu: 3e9 } },
+         { type: "turn_end", ts: h.clock - 400 }].map(e => JSON.stringify(e)).join("\n") + "\n");
+      await h.run(6);
+      assert.ok(h.status.tooltip.includes("40k context"), h.status.tooltip);
+    } finally { h.close(); }
+  });
+
   await check("minCredits filters everything: no warning and no orange status for a cheap chat", async () => {
     const h = await harness({ answer: () => undefined, settings: { thresholdTokens: 30000, minCredits: 1000 } });
     try {

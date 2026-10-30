@@ -233,6 +233,14 @@ function setAll(r) {
 // Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
 // fits cheap and expensive models. Acting on its own still needs a known price.
 function aboveThreshold(s) { return !!s.cost && s.ctx >= cfg("thresholdTokens"); }
+/**
+ * The chat you are most likely looking at: the one where you last typed. (Not the latest model call:
+ * Cache Keeper's own keep-alives and summaries, or another chat's agent, make those newer.)
+ */
+function currentChat() {
+  const list = all.filter(managed);
+  return list.reduce((best, s) => !best || (s.lastRealUserTs || 0) > (best.lastRealUserTs || 0) ? s : best, null);
+}
 function managed(s) {
   // minCredits filters everything (list, warnings, actions, orange status): a cheap expiry isn't worth a word
   return s.lastRealUserTs && !(s.cost && s.cost.missExtra < cfg("minCredits"));
@@ -722,7 +730,7 @@ function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).pa
 
 function updateStatus(context) {
   const list = all.filter(managed);
-  const s = list[0];            // most recently active chat
+  const s = currentChat();      // the chat where you last typed
   if (!s) { statusItem.hide(); return; }
   const st = stateFor(s.id), r = live(s);
   const shownInList = listChats().length;            // warm chats + the latest expired, max 10
@@ -776,7 +784,7 @@ function activate(context) {
   statusItem.command = "cacheKeeper.options";
   context.subscriptions.push(statusItem);
   // cache lifetimes from Copilot CLI logs: learned once the logs are located, refreshed every 30 min
-  const shownOrNewest = () => all.filter(managed)[0];
+  const shownOrNewest = () => currentChat();
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),

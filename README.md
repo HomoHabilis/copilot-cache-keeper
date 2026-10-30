@@ -8,7 +8,7 @@ full price.
 
 ## What it does
 
-- **Status bar:** the countdown for the most recently active chat, for example `cache 3:12 +1`
+- **Status bar:** the countdown for the chat where you last typed, for example `cache 3:12 +1`
   (`+1` = one more chat managed in this window). Click it to see the chats in the window (all
   warm ones plus the most recently expired, at most 10), each with its live countdown, model,
   context, cost if it expires and spend so far. Pick one to choose what happens to it.
