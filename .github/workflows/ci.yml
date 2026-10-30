@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0      # tags, for the build's version (latest tag + short commit)
+          fetch-depth: 0      # tags, for the build's version
 
       - uses: actions/setup-node@v5
         with:
@@ -35,6 +35,8 @@ jobs:
         env:
           # a pull request is checked out as a merge commit: version it after the PR's own commit
           COMMIT: ${{ github.event.pull_request.head.sha }}
+          # only goes up, so each build installs over the previous one
+          BUILD_NUMBER: ${{ github.run_number }}
         run: python3 build.py
 
       - name: Check the .vsix contents
@@ -58,7 +60,7 @@ jobs:
 
       # Download it from the run's Summary page (Artifacts) to try a pull request's build.
       - name: Upload the .vsix
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: copilot-cache-keeper-vsix
           path: copilot-cache-keeper-*.vsix
