@@ -205,15 +205,18 @@ async function readSessions(io, root, now = Date.now(), maxAgeMs = 3 * 3600 * 10
 }
 
 /**
- * "Keep warm while worth it": keep sending heartbeats while that stays cheaper than the
- * cheapest way out. Ways out: let it expire (missExtra) or summary + new chat (summary + restart).
- * Before the budget would be exceeded, the caller writes the summary and stops.
+ * Auto keep warm's spending cap: `percent` of what letting the cache expire would add to the next
+ * message, priced when auto keep warm starts. Null when the model's price is unknown.
  */
-function canAffordHeartbeat(session, spentSoFar) {
+function autoCap(session, percent) {
+  return session.cost ? session.cost.missExtra * percent / 100 : null;
+}
+
+/** Whether one more keep-alive still fits under the cap, counting what was already spent. */
+function canAffordHeartbeat(session, spentSoFar, cap) {
   const c = session.cost;
-  if (!c) return false;
-  const budget = Math.min(c.missExtra, c.summary + c.restart);
-  return spentSoFar + c.heartbeat + c.summary <= budget;
+  if (!c || cap === null || cap === undefined) return false;
+  return spentSoFar + c.heartbeat <= cap;
 }
 
 function fmt(credits) {
@@ -221,6 +224,6 @@ function fmt(credits) {
 }
 
 module.exports = {
-  MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, ttlFor, learnTtls,
+  MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, summaryWords,
 };
