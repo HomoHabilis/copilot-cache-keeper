@@ -55,9 +55,10 @@ full price.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
-  Auto keep warm).
+  Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
-  from the handoff file.
+  from the handoff file. That notice can slide into the notification center while you are away;
+  the same action stays in the status-bar list.
 - **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
   since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log

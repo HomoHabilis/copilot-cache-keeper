@@ -480,6 +480,7 @@ const CHOICES = {
   "Keep warm": "once", "Auto keep warm": "auto", "Summarize": "summarize", "Ignore": "ignore",
 };
 const DEFAULT_CHOICE = "Back to default";
+const NEW_FROM_HANDOFF = "New chat from handoff";
 
 async function choose(context, s, pick) {
   const st = stateFor(s.id);
@@ -556,11 +557,15 @@ async function offerAtCap(context, s) {
   if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
 
-/** Chats for the list: all warm ones (soonest expiry first), plus the most recently expired. Max 10. */
+/**
+ * Chats for the list: all warm ones (soonest expiry first), plus the most recently expired and any
+ * expired one with a handoff summary to start a new chat from. Max 10.
+ */
 function listChats() {
   const list = all.filter(managed);
   const warm = list.filter(s => s.busy || live(s) > 0).sort((x, y) => live(x) - live(y));
-  const expired = list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom).slice(0, 1);
+  const expired = list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)
+    .filter((s, i) => i === 0 || stateFor(s.id).handoff);
   return [...warm, ...expired].slice(0, 10);
 }
 
@@ -573,7 +578,8 @@ function chatItem(s) {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
     description: `${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
-      (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : ""),
+      (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
+      (st.handoff ? " · handoff summary ready" : ""),
     s,
   };
 }
@@ -600,14 +606,21 @@ async function pickChat(context) {
   clearInterval(timer);
   qp.dispose();
   if (!chat) return;
+  const st = stateFor(chat.s.id);
+  // the expiry notice can slide into the notification center unseen: the same action lives here too
+  const handoff = st.handoff && await exists(st.handoff) ? [{ label: NEW_FROM_HANDOFF,
+    detail: `Open a new chat with ${path.posix.basename(st.handoff.path)} attached` +
+      (chat.s.cost ? ` (first message ≈ ${core.fmt(chat.s.cost.restart)} cr)` : "") }] : [];
   const pick = await vscode.window.showQuickPick([
+    ...handoff,
     { label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
     { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent, then summary` },
     { label: "Summarize", detail: "Write the handoff summary now" },
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
   ], { placeHolder: `${describe(chat.s)}: what should happen before its cache expires?` });
-  if (pick) await choose(context, chat.s, pick.label);
+  if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff);
+  else if (pick) await choose(context, chat.s, pick.label);
 }
 
 function modeLabel(m) {
@@ -709,7 +722,7 @@ async function decide(context) {
       if (fresh && fresh.cacheFrom !== s.cacheFrom) { all = all.map(x => x.id === fresh.id ? fresh : x); continue; }
       st.expiredFor = s.cacheFrom;
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
-      const actions = st.handoff && await exists(st.handoff) ? ["New chat from handoff"] : [];
+      const actions = st.handoff && await exists(st.handoff) ? [NEW_FROM_HANDOFF] : [];
       vscode.window.showInformationMessage(
         `Copilot cache expired (${describe(s)}). Your next message there re-sends the context` +
           (s.cost ? `: ~${core.fmt(s.cost.missExtra)} extra credits.` : "."),
@@ -764,7 +777,8 @@ function updateStatus(context) {
     md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
       (s.cost ? ` (**+${core.fmt(s.cost.missExtra)} cr**)` : "") + ".", "");
     md.push(st.handoff
-      ? `Handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}.`
+      ? `Handoff summary ready: a new chat from it ≈ ${s.cost ? core.fmt(s.cost.restart) + " cr" : "a fraction of that"}. ` +
+        "Click here, pick this chat, then *New chat from handoff*."
       : "Consider starting a new chat from a handoff summary instead.", "");
   }
   if (s.cost) {
