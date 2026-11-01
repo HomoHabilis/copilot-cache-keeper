@@ -50,7 +50,10 @@ full price.
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
     150 per compaction + 10 per edited file, between 150 and 1500. A one-question chat gets
-    about 200 words; a long session with compactions gets up to 1500. The cost estimate uses
+    about 200 words; a long session with compactions gets up to 1500. Since the summary is
+    output (the priciest tokens) and is then read back uncached, the length is also capped so
+    the summary costs at most a third of what an expiry would add (it matters only for a small
+    context with a long history, for example after several compactions). The cost estimate uses
     the same length.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.

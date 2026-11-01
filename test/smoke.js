@@ -199,6 +199,21 @@ const never = () => new Promise(() => {});
     assert.ok(s.summaryWords >= 150 && s.summaryWords <= 1500);
   });
 
+  await check("summary length: capped so it costs at most a third of an expiry", () => {
+    assert.strictEqual(core.summaryWords({ ctx: 100000, turns: 10, compactions: 0, files: 0 }), 600);
+    assert.strictEqual(core.summaryWords({ ctx: 20000, turns: 60, compactions: 5, files: 0 }), 1500);
+    assert.strictEqual(core.summaryWords({ ctx: 20000, turns: 60, compactions: 5, files: 0 }, 720), 700);
+    assert.strictEqual(core.summaryWords({ ctx: 20000, turns: 60, compactions: 5, files: 0 }, 20), 150, "never below 150");
+    // a small context after many compactions, with a long history: uncapped, 1500 words would
+    // cost about as much as the expiry itself
+    const t0 = now - 60000;
+    const history = Array.from({ length: 60 }, (_, i) => JSON.stringify(
+      { type: "user_message", ts: t0 - 100000 + i * 1000, attrs: { content: `step ${i}` } })).join("\n") + "\n";
+    const s = core.analyze("/logs/small", history + chatLog(t0, { ctx: 25000 }), MODELS, now);
+    assert.ok(s.summaryWords < 1500, `words ${s.summaryWords}`);
+    assert.ok(s.cost.summary <= s.cost.missExtra / 3 + 1e-9, `summary ${s.cost.summary} vs expiry ${s.cost.missExtra}`);
+  });
+
   await check("analyze: keep-alive estimate learned from an earlier keep-alive", () => {
     const s = core.analyze("/logs/k", chatLog(now - 60000, { keepAlive: true }), MODELS, now);
     // fixed part 900 - 300 (previous reply) = 600, plus the last reply (4 tokens)
