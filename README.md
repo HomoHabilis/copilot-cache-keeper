@@ -71,6 +71,9 @@ full price.
     the same length.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
+- **Status-bar list order:** the chat where you last typed first (marked "where you last
+  typed"), then the other warm or working chats by soonest expiry, then the latest expired chat
+  and any with a handoff summary ready.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
   Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat

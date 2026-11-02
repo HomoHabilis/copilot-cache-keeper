@@ -443,6 +443,15 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("status-bar list: the chat you last typed in first, then soonest expiry, then expired", () => {
+    const c = (id, left, cacheFrom = 0, busy = false) => ({ id, left, cacheFrom, busy });
+    const list = [c("old", 40), c("cur", 250), c("soon", 10), c("gone1", -5, 1), c("gone2", -50, 2), c("work", -1, 0, true)];
+    const ids = l => l.map(x => x.id).join(",");
+    assert.strictEqual(ids(core.orderChats(list, "cur", x => x.left)), "cur,work,soon,old,gone2,gone1");
+    assert.strictEqual(ids(core.orderChats(list, "gone1", x => x.left)), "gone1,work,soon,old,cur,gone2", "even when expired");
+    assert.strictEqual(ids(core.orderChats(list, null, x => x.left)), "work,soon,old,cur,gone2,gone1");
+  });
+
   await check("analyze: an untagged keep-alive is not counted as your message", () => {
     const t0 = Date.now() - 60000;
     const ev = chatLog(t0, { ctx: 150000 }).trim().split("\n").map(l => JSON.parse(l));

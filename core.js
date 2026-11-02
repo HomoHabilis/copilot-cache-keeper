@@ -480,12 +480,26 @@ function summaryPays(session) {
   return !!c && c.summary + c.restart <= SUMMARY_PAYS_SHARE * c.missExtra;
 }
 
+/**
+ * Order of the status-bar list: the chat you last typed in first (the one you are most likely
+ * thinking about), then the other warm or working chats by soonest expiry (the next one to need a
+ * decision; this order holds still while the countdowns run), then expired ones, newest first.
+ * `left(s)`: seconds until s expires.
+ */
+function orderChats(list, currentId, left) {
+  const cur = list.filter(s => s.id === currentId);
+  const rest = list.filter(s => s.id !== currentId);
+  const warm = rest.filter(s => s.busy || left(s) > 0).sort((x, y) => left(x) - left(y));
+  const expired = rest.filter(s => !s.busy && left(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom);
+  return [...cur, ...warm, ...expired];
+}
+
 function fmt(credits) {
   return credits >= 10 ? credits.toFixed(0) : credits.toFixed(1);
 }
 
 module.exports = {
   summaryPays,
-  MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
+  orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

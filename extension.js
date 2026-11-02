@@ -577,13 +577,14 @@ async function offerAtCap(context, s) {
  */
 function listChats() {
   const list = all.filter(managed);
-  const warm = list.filter(s => s.busy || live(s) > 0).sort((x, y) => live(x) - live(y));
-  const expired = list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)
-    .filter((s, i) => i === 0 || stateFor(s.id).handoff);
-  return [...warm, ...expired].slice(0, 10);
+  // expired chats: only the latest one, plus any with a handoff summary ready
+  const latestExpired = list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)[0];
+  const cur = currentChat();
+  const shown = list.filter(s => s.busy || live(s) > 0 || s === latestExpired || s === cur || stateFor(s.id).handoff);
+  return core.orderChats(shown, cur && cur.id, live).slice(0, 10);
 }
 
-function chatItem(s) {
+function chatItem(s, cur = currentChat()) {
   const r = live(s), st = stateFor(s.id);
   const clock = r > 0 ? mmss(r) : "expired";
   // while the agent works (a long tool run makes no model call), the cache can still run out
@@ -593,7 +594,8 @@ function chatItem(s) {
     description: `${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
-      (st.handoff ? " · handoff summary ready" : ""),
+      (st.handoff ? " · handoff summary ready" : "") +
+      (cur && cur.id === s.id ? " · where you last typed" : ""),
     s,
   };
 }
@@ -606,7 +608,7 @@ async function pickChat(context) {
   qp.matchOnDescription = true;
   const refresh = () => {
     const active = qp.activeItems[0] && qp.activeItems[0].s.id;
-    qp.items = listChats().map(chatItem);
+    qp.items = listChats().map(s => chatItem(s));
     const keep = qp.items.find(i => i.s.id === active);
     if (keep) qp.activeItems = [keep];
   };
