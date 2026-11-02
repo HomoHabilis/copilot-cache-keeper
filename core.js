@@ -98,6 +98,12 @@ function detectLanguage(texts) {
   return n >= 2 && n >= 1.5 * second ? best : "en";
 }
 
+/** The text of one of Copilot's answers in the log (whichever text fields it carries). */
+function replyText(e) {
+  const a = e.attrs || {};
+  return Object.values(a).filter(v => typeof v === "string" && v.length > 1).join(" ").slice(0, 4000);
+}
+
 /** A keep-alive wording in `lang` (English if not covered), never the same as `previous`. */
 function keepAliveText(previous, rand = Math.random, lang = "en") {
   const pool = (KEEPALIVES_BY_LANG[lang] || KEEPALIVES).filter(t => t !== previous);
@@ -374,8 +380,11 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     };
   }
   const firstReal = userMessages.find(u => !isOurs(u));
-  // your last few messages decide the keep-alive language
-  const lang = detectLanguage(userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || "")));
+  // The language for Cache Keeper's own messages: Copilot's recent answers (it already answers in
+  // your language, and says more than a short question does), plus your last few messages.
+  const replies = events.filter(e => e.type === "agent_response").slice(-5).map(replyText);
+  const lang = detectLanguage([...replies,
+    ...userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || ""))]);
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, lastEnd, busy, credits,

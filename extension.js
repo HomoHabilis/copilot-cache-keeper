@@ -202,7 +202,7 @@ async function diagnose(context) {
     const s = st && await core.readSession(io, dir, now, cfg("ttlSeconds") || {});
     const text = st && !s ? await io.readText(io.join(dir, "main.jsonl")) : null;
     logx(`${n.slice(0, 8)} (log changed ${age}): ` + (s
-      ? `${describe(s)}, ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, ` +
+      ? `${describe(s)}, ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, language ${s.lang}, ` +
         (unmanagedWhy(s) ? `not listed: ${unmanagedWhy(s)}` : "listed")
       : st ? `not tracked: ${core.describeLog(text)}` : "not tracked"));
   }

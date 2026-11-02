@@ -411,6 +411,13 @@ const never = () => new Promise(() => {});
     ev[0].attrs.content = "Puoi sistemare il parser? Non funziona come dovrebbe, grazie";
     const it = core.analyze("/x", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, Date.now());
     assert.strictEqual(it.lang, "it");
+    // a short English-looking question, but Copilot answered in Italian: its answers count too
+    const ev2 = chatLog(t0).trim().split("\n").map(l => JSON.parse(l));
+    ev2[0].attrs.content = "news on this repo?";
+    ev2.splice(4, 0, { type: "agent_response", ts: t0 + 6000, attrs: { content:
+      "Le novità recenti riguardano soprattutto CMake e Conan. La directory di lavoro è pulita e il branch è allineato." } });
+    const it2 = core.analyze("/x", ev2.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, Date.now());
+    assert.strictEqual(it2.lang, "it");
   });
 
   await check("summary request: no [cache-keeper] tag, own tag per language, recognised as ours", () => {
