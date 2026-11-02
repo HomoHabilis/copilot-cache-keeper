@@ -49,18 +49,27 @@ full price.
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.
+  - **Automatic summaries only when they pay off:** all three cases above (no click, after Keep
+    warm once, at the auto cap) write a summary only if the summary plus the first message of a new
+    chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
+    chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
+    expires instead. **Summarize** (clicked) always writes one.
   - **Summarize:** asks the agent to write `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
     150 per compaction + 10 per edited file, between 150 and 1500. A one-question chat gets
-    about 200 words; a long session with compactions gets up to 1500. The cost estimate uses
+    about 200 words; a long session with compactions gets up to 1500. Since the summary is
+    output (the priciest tokens) and is then read back uncached, the length is also capped so
+    the summary costs at most a third of what an expiry would add (it matters only for a small
+    context with a long history, for example after several compactions). The cost estimate uses
     the same length.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
-  Auto keep warm).
+  Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
-  from the handoff file.
+  from the handoff file. That notice can slide into the notification center while you are away;
+  the same action stays in the status-bar list.
 - **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
   since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log

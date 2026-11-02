@@ -21,6 +21,12 @@ const BUSY_CAP_MS = 6 * 3600 * 1000; // an open turn this quiet is taken as one 
 const HEARTBEAT_OUT = 30;      // "OK"
 const SUMMARY_CALLS = 2;       // write the file, then confirm
 const TOKENS_PER_WORD = 1.4;
+// A summary is written (output price) and read back (uncached); on a small context with a long
+// history that could cost more than the expiry it is meant to avoid. Keep it to this share.
+const SUMMARY_MAX_SHARE = 1 / 3;
+// Only write one automatically when it, plus starting a new chat from it, costs at most this share
+// of continuing the chat cold: the margin pays for the cases where you continue the old chat anyway.
+const SUMMARY_PAYS_SHARE = 0.75;
 const EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edit_file|write_file|edit_notebook/i;
 
 /** Local disk access, for tests and command-line use. */
@@ -36,11 +42,12 @@ const nodeIo = (() => {
 
 /**
  * Handoff summary length in words, from what the chat contains: context size, your messages,
- * compactions (VS Code summarized the history) and files edited. Between 150 and 1500.
+ * compactions (VS Code summarized the history) and files edited. Between 150 and 1500, and at
+ * most `max` (what keeps its cost within SUMMARY_MAX_SHARE of an expiry), but never below 150.
  */
-function summaryWords(stats) {
+function summaryWords(stats, max = Infinity) {
   const w = 120 + 2 * stats.ctx / 1000 + 30 * stats.turns + 150 * stats.compactions + 10 * stats.files;
-  return Math.round(Math.min(1500, Math.max(150, w)) / 50) * 50;
+  return Math.max(150, Math.min(Math.round(Math.min(1500, w) / 50) * 50, Math.floor(max / 50) * 50));
 }
 
 let learnedTtls = {};          // model id -> seconds, from Copilot CLI logs
@@ -171,7 +178,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     for (const m of args.matchAll(/\*\*\* (?:Update|Add|Delete) File: ([^\\\n]+)/g)) files.add(m[1].trim());
   }
   const stats = { ctx, turns: realTurns, compactions, files: files.size, calls: calls.length };
-  const words = summaryWords(stats);
+  let words = summaryWords(stats);
   // Tokens a keep-alive adds uncached: measured on this chat's earlier keep-alives when there are
   // any (exact); otherwise VS Code's context block + our message + the agent's last reply, which is
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
@@ -204,10 +211,13 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     const r = scale(rates(sheet, ctx));              // tier that applies at the current context size
     const fresh = scale(rates(sheet, firstCtx));
     const hit = ctx * r.read;
+    const missExtra = ctx * r.write - hit;
+    const perWord = TOKENS_PER_WORD * (r.out + r.write);
+    if (perWord > 0) words = summaryWords(stats, (SUMMARY_MAX_SHARE * missExtra - SUMMARY_CALLS * hit) / perWord);
     cost = {
       heartbeat: hit + heartbeatNew * r.write + HEARTBEAT_OUT * r.out,
-      missExtra: ctx * r.write - hit,                // what letting the cache expire adds to the next message
-      summary: SUMMARY_CALLS * hit + words * TOKENS_PER_WORD * (r.out + r.write),
+      missExtra,                                     // what letting the cache expire adds to the next message
+      summary: SUMMARY_CALLS * hit + words * perWord,
       restart: (firstCtx + words * TOKENS_PER_WORD) * fresh.write, // first message of a new chat built from the summary
     };
   }
@@ -297,11 +307,22 @@ function keepAliveJitter(ttl, percent, rand = Math.random) {
   return 2 * p * ttl * Math.min(1, Math.max(0, rand()));
 }
 
+/**
+ * Whether a handoff summary is worth writing automatically: writing it and the first message of a
+ * new chat built from it cost clearly less than continuing this chat after its cache expired. Not
+ * so on a small context, where a new chat's own setup (system prompt, tools) costs about as much.
+ */
+function summaryPays(session) {
+  const c = session.cost;
+  return !!c && c.summary + c.restart <= SUMMARY_PAYS_SHARE * c.missExtra;
+}
+
 function fmt(credits) {
   return credits >= 10 ? credits.toFixed(0) : credits.toFixed(1);
 }
 
 module.exports = {
+  summaryPays,
   MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

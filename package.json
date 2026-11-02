@@ -72,7 +72,7 @@
         "cacheKeeper.autoSummary": {
           "type": "boolean",
           "default": true,
-          "description": "Above the threshold, write a handoff summary if nobody answers the warning."
+          "description": "Above the threshold, write a handoff summary if nobody answers the warning (only when it and a new chat from it cost clearly less than continuing this chat cold)."
         },
         "cacheKeeper.autoKeepWarmCapPercent": {
           "type": "number",
@@ -94,7 +94,7 @@
         "cacheKeeper.summaryAfterKeepWarm": {
           "type": "boolean",
           "default": true,
-          "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap. Off: the cache just expires."
+          "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap, if it and a new chat from it cost clearly less than continuing this chat cold. Off: the cache just expires."
         },
         "cacheKeeper.minCredits": {
           "type": "number",
