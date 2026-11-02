@@ -82,7 +82,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
   const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
-                     keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab", noResponseAction: "nothing",
+                     keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
   const append = evs => fs.appendFileSync(path.join(chat, "main.jsonl"), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
@@ -434,8 +434,8 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("closing the warning acts as Ignore: nothing sent, not even the summary or noResponseAction", async () => {
-    const h = await harness({ answer: () => undefined, settings: { noResponseAction: "keepWarmOnce", thresholdTokens: 0 } });
+  await check("closing the warning acts as Ignore: nothing sent, not even the summary", async () => {
+    const h = await harness({ answer: () => undefined, settings: { thresholdTokens: 0 } });
     try {
       await h.run(310);
       assert.strictEqual(h.sent.length, 0);
@@ -453,18 +453,20 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("noResponseAction keepWarmOnce: one keep-alive, then quiet", async () => {
-    const h = await harness({ answer: never, settings: { noResponseAction: "keepWarmOnce" } });
-    try {
-      await h.run(700);
-      assert.strictEqual(h.sent.length, 2, "one keep-alive, then the closing summary");
-      assert.ok(h.sent[1].text.includes("handoff summary"));
-      assert.strictEqual(h.warnings.length, 1, "no warning after it was ignored");
-    } finally { h.close(); }
+  await check("no click never keeps warm, even with an old noResponseAction setting left over", async () => {
+    for (const old of ["keepWarmOnce", "autoKeepWarm"]) {
+      const h = await harness({ answer: never, settings: { noResponseAction: old } });
+      try {
+        await h.run(700);
+        assert.strictEqual(h.sent.filter(x => x.text.includes("Keep-alive")).length, 0, `${old}: no keep-alive`);
+        assert.strictEqual(h.warnings.length, 1, "no warning after it was ignored");
+        assert.ok(!h.warnings[0].msg.includes("kept warm") && !h.warnings[0].msg.includes("keep-alive is sent"), h.warnings[0].msg);
+      } finally { h.close(); }
+    }
   });
 
-  await check("noResponseAction autoKeepWarm: keeps warm up to 50% of the expiry cost, then summary", async () => {
-    const h = await harness({ answer: never, settings: { noResponseAction: "autoKeepWarm" } });
+  await check("auto keep warm: keeps warm up to 50% of the expiry cost, then summary", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never() });
     try {
       const start = core.analyze("/x", fs.readFileSync(h.logFile, "utf8"), MODELS, h.clock);
       const cap = start.cost.missExtra / 2;

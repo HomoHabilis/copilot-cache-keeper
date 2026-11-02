@@ -492,8 +492,9 @@ async function keepWarmNow(context, s) {
 
 // ---------------------------------------------------------------- choices
 
-// No click = cacheKeeper.noResponseAction (default: nothing, so the cache expires, after a handoff
-// summary if the summary rule applies), and warnings for that chat stop until you write in it again.
+// No click = nothing kept warm: the cache expires (after a handoff summary if the summary rule
+// applies), and warnings for that chat stop until you write in it again. Keeping warm, once or
+// auto, always takes a click: it is never on by default.
 const CHOICES = {
   "Keep warm": "once", "Auto keep warm": "auto", "Summarize": "summarize", "Ignore": "ignore",
 };
@@ -526,12 +527,6 @@ function capText(st, s) {
  */
 function closingSummary(s) { return cfg("summaryAfterKeepWarm") !== false && core.summaryPays(s); }
 
-/** What happens to a chat when its warning gets no answer (cacheKeeper.noResponseAction). */
-function fallbackFor(s) {
-  const f = cfg("noResponseAction");
-  return s.cost && seenLive(s) && (f === "keepWarmOnce" || f === "autoKeepWarm") ? f : "nothing";
-}
-
 async function offer(context, s) {
   const st = stateFor(s.id);
   // One warning per cache window. An older one still open counts as not answered (VS Code cannot
@@ -539,16 +534,11 @@ async function offer(context, s) {
   const o = st.offer = { for: s.cacheFrom, answered: false, timedOut: false };
   const c = s.cost;
   const autoSum = aboveThreshold(s) && cfg("autoSummary") && seenLive(s) && core.summaryPays(s);
-  const fallback = fallbackFor(s);
   const head = `Copilot cache expires in ${Math.max(0, Math.round(live(s)))}s (${describe(s)}). `;
-  const later = " No more warnings for this chat until you write in it again.";
   const msg = !c
     ? head + "No price for this model in Copilot's price sheet: nothing happens automatically."
     : head + `Keep warm: ~${core.fmt(c.heartbeat)} cr. Letting it expire adds ~${core.fmt(c.missExtra)} cr to your next message. ` +
-      (fallback === "keepWarmOnce" ? "If you don't click, one keep-alive is sent." + later
-       : fallback === "autoKeepWarm" ? `If you don't click, it is kept warm until about ` +
-         `${core.fmt(core.autoCap(s, capPercent()))} cr is spent.` + later
-       : autoSum ? `If you don't click, it expires and a handoff summary (~${core.fmt(c.summary)} cr) is written first.`
+      (autoSum ? `If you don't click, it expires and a handoff summary (~${core.fmt(c.summary)} cr) is written first.`
        : !seenLive(s) ? "If you don't click, it just expires (last active before VS Code restarted, so nothing automatic)."
        : aboveThreshold(s) && cfg("autoSummary") ? "If you don't click, it just expires (a new chat from a handoff summary would cost about as much as continuing this one)."
        : "If you don't click, it just expires (below your summary threshold).");
@@ -557,7 +547,7 @@ async function offer(context, s) {
   o.answered = true;
   // Closed (X): a deliberate "not now", so the same as Ignore: nothing automatic, nothing spent,
   // no more warnings until you write in the chat again. (A warning that just slides into the
-  // notification center is not closed: it stays unanswered and noResponseAction applies.)
+  // notification center is not closed: it stays unanswered, see decide().)
   if (!pick) { goQuiet(st, s, "warning closed"); setMode(st, s, "ignore"); return; }
   st.quietFor = undefined;
   await choose(context, s, pick);
@@ -691,16 +681,11 @@ async function decide(context) {
         `already acted ${!actOnce}, sending lock ${sending}`);
     }
     // This window's warning still unanswered when something automatic is about to happen: that
-    // counts as ignored. Warnings go quiet and cacheKeeper.noResponseAction applies.
+    // counts as ignored. Warnings go quiet; nothing is kept warm without a click.
     if (st.mode === "ask" && st.offer && st.offer.for === s.cacheFrom && !st.offer.answered && !st.offer.timedOut &&
         r > 0 && r <= Math.max(due, SUMMARY_LEAD)) {
       st.offer.timedOut = true;
       goQuiet(st, s, "warning not answered");
-      const fallback = fallbackFor(s);
-      if (fallback !== "nothing") {
-        setMode(st, s, fallback === "keepWarmOnce" ? "once" : "auto");
-        logx(`no answer for ${s.id.slice(0, 8)}: ${modeLabel(st.mode)}` + (st.mode === "auto" ? `, ${capText(st, s)}` : ""));
-      }
     }
     if (st.mode === "auto" && seenLive(s) && r > 0 && r <= cfg("warnSeconds") && st.capWarnFor !== s.cacheFrom &&
         s.cost && !core.canAffordHeartbeat(s, st.spent, st.cap, closingSummary(s))) {

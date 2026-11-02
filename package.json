@@ -49,21 +49,6 @@
           "default": 60,
           "description": "Warn this many seconds before the cache expires."
         },
-        "cacheKeeper.noResponseAction": {
-          "type": "string",
-          "default": "nothing",
-          "enum": [
-            "nothing",
-            "keepWarmOnce",
-            "autoKeepWarm"
-          ],
-          "enumDescriptions": [
-            "Do nothing: the cache expires (after a handoff summary if it is above your summary threshold).",
-            "Keep warm once: send one keep-alive before it expires.",
-            "Auto keep warm: keep it warm before each expiry, up to the auto keep warm cap."
-          ],
-          "description": "What to do when a warning gets no answer before the cache expires. Either way, warnings for that chat then stop until you write in it again. Applies only to chats active since VS Code started and whose price is known."
-        },
         "cacheKeeper.thresholdTokens": {
           "type": "number",
           "default": 100000,

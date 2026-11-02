@@ -27,10 +27,10 @@ full price.
     something you type would land there.
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
-  - **No click:** what `cacheKeeper.noResponseAction` says. By default (`nothing`) the cache
-    expires. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
+  - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
+    takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
     tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
-    first. Below that, or when the model's price is unknown, it just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
+    first. Below that, or when the model's price is unknown, it just expires. An
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
   - **Keep warm:** sends one tiny keep-alive
@@ -205,7 +205,6 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | Setting | Default | |
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
-| `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
 | `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
