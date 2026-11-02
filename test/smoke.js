@@ -82,7 +82,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
   const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
-                     keepAliveLeadSeconds: 5, afterSend: "closeTab", noResponseAction: "nothing",
+                     keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab", noResponseAction: "nothing",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
   const append = evs => fs.appendFileSync(path.join(chat, "main.jsonl"), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
@@ -304,6 +304,49 @@ const never = () => new Promise(() => {});
       // 5 s lead + 3 s margin until the clock offset is measured, decided once per second
       assert.ok(leftAtSend > 1.5 && leftAtSend <= 9, `sent with ${leftAtSend.toFixed(1)} s left`);
     } finally { h.close(); }
+  });
+
+  await check("core: keep-alive jitter stays between 0 and 2 x percent of the lifetime, clamped", () => {
+    assert.strictEqual(core.keepAliveJitter(300, 10, () => 0), 0);
+    assert.strictEqual(core.keepAliveJitter(300, 10, () => 1), 60);
+    assert.strictEqual(core.keepAliveJitter(300, 10, () => 0.5), 30);
+    assert.strictEqual(core.keepAliveJitter(300, 0, () => 1), 0);
+    assert.strictEqual(core.keepAliveJitter(300, -5, () => 1), 0);
+    assert.strictEqual(core.keepAliveJitter(300, 90, () => 1), 120);     // clamped to 20%
+    for (let i = 0; i < 1000; i++) {
+      const j = core.keepAliveJitter(1800, 10);
+      assert.ok(j >= 0 && j <= 360, String(j));
+    }
+  });
+
+  await check("jitter: auto keep warm varies the send time, never later than the lead", async () => {
+    const h = await harness({ answer: () => "Auto keep warm", settings: { keepAliveJitterPercent: 10, autoKeepWarmCapPercent: 100 } });
+    try {
+      const left = [];
+      for (let k = 0; k < 6; k++) {
+        const from = h.cacheFrom, n = h.sent.length;
+        await h.run(300, () => h.sent.length > n);
+        if (h.sent.length === n || !h.sent[n].text.includes("Keep-alive")) break;
+        left.push(300 - (h.sent[n].at - from) / 1000);
+      }
+      assert.ok(left.length >= 3, `${left.length} keep-alives`);
+      // 5 s lead + 3 s unmeasured margin (8 s at most, decided once per second), plus up to 60 s
+      for (const l of left) assert.ok(l > 4 && l <= 8 + 60 + 1, `sent with ${l.toFixed(1)} s left`);
+      assert.ok(Math.max(...left) - Math.min(...left) > 1, `not on a fixed beat: ${left.map(x => x.toFixed(0))}`);
+    } finally { h.close(); }
+  });
+
+  await check("jitter: Keep warm once is never later than the lead either", async () => {
+    for (let k = 0; k < 5; k++) {
+      const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), settings: { keepAliveJitterPercent: 10 } });
+      try {
+        const from = h.cacheFrom;
+        await h.run(300, () => h.sent.length > 0);
+        assert.strictEqual(h.sent.length, 1);
+        const l = 300 - (h.sent[0].at - from) / 1000;
+        assert.ok(l > 4 && l <= 69, `sent with ${l.toFixed(1)} s left`);
+      } finally { h.close(); }
+    }
   });
 
   await check("send: not submitted if the agent starts working while the chat tab opens", async () => {

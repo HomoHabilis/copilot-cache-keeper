@@ -286,11 +286,22 @@ function canAffordHeartbeat(session, spentSoFar, cap, withSummary = false) {
   return spentSoFar + c.heartbeat + (withSummary ? c.summary : 0) <= cap;
 }
 
+/**
+ * Extra seconds of lead for one keep-alive, so they don't go out on a fixed beat. Picture a send
+ * point `percent` of the cache lifetime ahead of the safety lead, varied by +/- `percent`: the
+ * result is spread over [0, 2 x percent x ttl] and never negative, so a keep-alive is never sent
+ * later than the configured lead (closer to expiry). `percent` is clamped to 0..20.
+ */
+function keepAliveJitter(ttl, percent, rand = Math.random) {
+  const p = Math.min(20, Math.max(0, Number(percent) || 0)) / 100;
+  return 2 * p * ttl * Math.min(1, Math.max(0, rand()));
+}
+
 function fmt(credits) {
   return credits >= 10 ? credits.toFixed(0) : credits.toFixed(1);
 }
 
 module.exports = {
   MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
-  rates, priceSheetFrom, fmt, summaryWords, describeLog,
+  rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

@@ -31,6 +31,24 @@ function stateFor(id) {
   return sessions.get(id);
 }
 
+/** cacheKeeper.keepAliveJitterPercent (default 10, 0 = off). */
+function jitterPercent() {
+  const p = cfg("keepAliveJitterPercent");
+  return p === undefined || p === null ? 10 : Number(p);
+}
+
+/**
+ * Lead for this chat's keep-alive in this cache window: the safety lead plus a random extra, drawn
+ * once per window, so keep-alives are never later than the lead but never on a fixed beat either.
+ */
+function keepAliveLead(st, s) {
+  if (st.jitterFor !== s.cacheFrom) {
+    st.jitterFor = s.cacheFrom;
+    st.jitter = core.keepAliveJitter(s.ttl, jitterPercent());
+  }
+  return lead() + st.jitter;
+}
+
 /** Auto keep warm's cap, as a percentage of what an expiry would add (setting, default 50). */
 function capPercent() {
   const p = Number(cfg("autoKeepWarmCapPercent"));
@@ -486,7 +504,9 @@ async function choose(context, s, pick) {
   if (!pick) return;
   setMode(st, s, CHOICES[pick] || "ask");      // DEFAULT_CHOICE -> "ask"
   if (st.mode === "once" || st.mode === "auto") {
-    vscode.window.showInformationMessage(`Cache Keeper: will send a keep-alive ${lead()}s before the cache expires` +
+    const extra = Math.round(core.keepAliveJitter(s.ttl, jitterPercent(), () => 1));
+    vscode.window.showInformationMessage(`Cache Keeper: will send a keep-alive ` +
+      (extra > 0 ? `${lead()} to ${lead() + extra}s (random)` : `${lead()}s`) + ` before the cache expires` +
       (st.mode === "auto" ? `, each time, ${capText(st)}.`
        : summaryAfter() ? ", then a handoff summary before the next expiry." : "."));
   }
@@ -645,9 +665,11 @@ async function decide(context) {
     const crowd = all.filter(x => x.id !== s.id && ["auto", "once"].includes(stateFor(x.id).mode) &&
       live(x) > r && live(x) - r < 10).length;
     const due = lead() + 8 * crowd;
-    if ((st.mode === "auto" || st.mode === "once") && r > 0 && r <= due && st.diagFor !== s.cacheFrom) {
+    // keep-alives (once and auto) go out a random bit earlier than that, never later
+    const dueAlive = (st.mode === "auto" || st.mode === "once") ? Math.max(due, keepAliveLead(st, s) + 8 * crowd) : due;
+    if ((st.mode === "auto" || st.mode === "once") && r > 0 && r <= dueAlive && st.diagFor !== s.cacheFrom) {
       st.diagFor = s.cacheFrom;
-      logx(`keep-alive due for ${s.id.slice(0, 8)}: ${Math.round(r)}s left, mode ${st.mode}, ` +
+      logx(`keep-alive due for ${s.id.slice(0, 8)}: ${Math.round(r)}s left (lead ${lead()}s + ${Math.round(st.jitter || 0)}s random), mode ${st.mode}, ` +
         `seen since start ${seenLive(s)}, within cap ${core.canAffordHeartbeat(s, st.spent, st.cap)}, ` +
         `already acted ${!actOnce}, sending lock ${sending}`);
     }
@@ -673,13 +695,13 @@ async function decide(context) {
 
     if (st.mode === "summarize" && r > 0) {
       if (await summary(context, s, "on request")) st.actedFor = s.cacheFrom;
-    } else if (st.mode === "once" && r > 0 && r <= due && actOnce) {
+    } else if (st.mode === "once" && r > 0 && r <= dueAlive && actOnce) {
       if (await keepAlive(context, s)) {
         st.actedFor = s.cacheFrom; st.mode = "ask";
         // the summary follows before the next expiry, unless you write in the chat or keep it warm again
         if (summaryAfter()) st.summaryDueFor = s.lastRealUserTs;
       }
-    } else if (st.mode === "auto" && r > 0 && r <= due && actOnce && seenLive(s)) {
+    } else if (st.mode === "auto" && r > 0 && r <= dueAlive && actOnce && seenLive(s)) {
       if (core.canAffordHeartbeat(s, st.spent, st.cap, summaryAfter())) {
         if (await keepAlive(context, s)) st.actedFor = s.cacheFrom;
       } else if (!summaryAfter()) {

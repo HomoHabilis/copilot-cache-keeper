@@ -115,6 +115,13 @@
           "minimum": 2,
           "description": "Send keep-alives this many seconds before the cache expires (all models). A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper; too late risks missing it."
         },
+        "cacheKeeper.keepAliveJitterPercent": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 20,
+          "description": "Vary when keep-alives go out (Keep warm and Auto keep warm), so they don't arrive on a fixed beat: each one is sent at a random point within +/- this share of the cache lifetime around a point that far ahead of cacheKeeper.keepAliveLeadSeconds. Never later than that lead, so the safety margin before expiry is kept. 10 with a 5 min cache: between 5 s and 65 s before expiry. 0 turns it off."
+        },
         "cacheKeeper.afterSend": {
           "type": "string",
           "default": "restoreLastTyped",
