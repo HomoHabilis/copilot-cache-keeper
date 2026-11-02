@@ -67,14 +67,19 @@ const KEEPALIVES_BY_LANG = {
 const KEEPALIVES = KEEPALIVES_BY_LANG.en;
 const KEEPALIVE_SET = new Set(Object.values(KEEPALIVES_BY_LANG).flat());
 
-// Common short words per language, to guess which one you write in. Words shared by several of
-// these languages (e.g. "a", "on", "die" in English) are left out of the smaller lists' overlap.
+// Common short words per language, to guess which one you write in, including the ones short chat
+// messages are made of (greetings, "what", "now", "new"). A word in two lists counts for both.
 const LANG_WORDS = {
-  en: "the and is are you this that with for not what can please should would it's i'm don't of to in",
-  it: "il lo gli che non per una della delle sono questo questa come anche più perché grazie puoi fare devi è ho",
-  fr: "le les des est une pour pas que qui dans avec sur je tu nous vous cette sont mais fais peux merci c'est",
-  es: "el los las una para por que del con como pero está esto esta puedes hacer gracias también más es",
-  de: "der die das und ist nicht ein eine mit für auf ich du wir sie bitte kannst auch noch dass sich",
+  en: "the and is are you this that with for not what can please should would it's i'm don't of to in " +
+      "hi hello thanks yes how why where my me we there here now new",
+  it: "il lo gli che non per una della delle sono questo questa come anche più perché grazie puoi fare devi è ho " +
+      "ciao di su cosa c'è sì ancora adesso ora nuovo fammi dimmi nel nella del sul mi ti ci va bene allora",
+  fr: "le les des est une pour pas que qui dans avec sur je tu nous vous cette sont mais fais peux merci c'est " +
+      "bonjour salut oui du au aux ce ça quoi moi mon ton il y nouveau maintenant encore où",
+  es: "el los las una para por que del con como pero está esto esta puedes hacer gracias también más es " +
+      "hola sí qué cómo dónde muy ya hay lo nuevo ahora todavía aquí",
+  de: "der die das und ist nicht ein eine mit für auf ich du wir sie bitte kannst auch noch dass sich " +
+      "hallo ja nein was wie wo den dem im zu mir mal gibt neu jetzt hier",
 };
 const LANG_SETS = Object.fromEntries(Object.entries(LANG_WORDS).map(([k, v]) => [k, new Set(v.split(" "))]));
 
@@ -89,7 +94,8 @@ function detectLanguage(texts) {
   for (const w of words) for (const k in LANG_SETS) if (LANG_SETS[k].has(w)) score[k]++;
   const ranked = Object.entries(score).sort((x, y) => y[1] - x[1]);
   const [best, n] = ranked[0], second = ranked[1][1];
-  return n >= 3 && n >= 1.5 * second ? best : "en";
+  // short chats ("Ciao", "che c'è di nuovo?") give few hits, so 2 is enough when clearly ahead
+  return n >= 2 && n >= 1.5 * second ? best : "en";
 }
 
 /** A keep-alive wording in `lang` (English if not covered), never the same as `previous`. */

@@ -391,9 +391,15 @@ const never = () => new Promise(() => {});
       ["es", "¿Puedes arreglar el parser? No funciona con los archivos vacíos, gracias"],
       ["de", "Kannst du bitte den Parser reparieren? Er geht nicht mit leeren Dateien"],
       ["en", "fix bug"],
+      ["fr", "Salut, quoi de neuf ?"],
+      ["es", "Hola, ¿qué hay de nuevo?"],
+      ["de", "Hallo, was gibt es Neues?"],
+      ["en", "run the tests"],
       ["en", "`il lo gli che non per` https://example.com/il/che/non"],     // code and links don't count
     ];
     for (const [lang, text] of cases) assert.strictEqual(core.detectLanguage([text]), lang, text);
+    // a short Italian chat (seen live): only a few words, still Italian
+    assert.strictEqual(core.detectLanguage(["Ciao", "che c'è di nuovo ?", "su questo repo ?"]), "it");
     for (const [lang, list] of Object.entries(core.KEEPALIVES_BY_LANG)) {
       assert.ok(list.length >= 6, lang);
       for (const t of list) assert.ok(/\bOK\b/.test(t) && t.length <= 80 && core.isOwnMessage(t), t);
