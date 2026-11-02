@@ -474,7 +474,7 @@ async function summary(context, s, why) {
 async function keepAlive(context, s, opts = {}) {
   const cold = live(s) <= 0;     // only possible from the command: the whole context is re-sent
   const st = stateFor(s.id);
-  const text = core.keepAliveText(st.lastKeepAlive);
+  const text = core.keepAliveText(st.lastKeepAlive, Math.random, s.lang);
   const ok = await trySend(context, s, text, "keep-alive", opts);
   if (ok) st.lastKeepAlive = text;
   if (ok) st.spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;

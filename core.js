@@ -10,29 +10,90 @@
 const path = require("path");
 
 const MARKER = "[cache-keeper]";
-// Keep-alive wordings, one picked at random each time so they don't all read the same. All short
-// (about the same tokens as before) and all ask for a bare "OK" with no tools. Cache Keeper knows
-// its own keep-alives by exact match against this list, so it still tells them apart from what
-// you type, even after a restart. Only add to the list: removing one would make its past uses
-// in old logs look like your own messages.
-const KEEPALIVES = [
-  "Stepping away for a few minutes. Just reply OK, no tools needed.",
-  "Back shortly. Please reply with only OK and don't run any tools.",
-  "Taking a short break. Reply OK only, no tools.",
-  "Away for a moment. Answer with just OK, without using tools.",
-  "Pausing here for a bit. Only reply OK, no tool calls.",
-  "Be right back. Reply with OK and nothing else, no tools.",
-  "Quick break, I'll continue soon. Just say OK, don't use tools.",
-  "Hold on, I'm away for a few minutes. Reply only OK, no tools.",
-  "Give me a moment. Please answer just OK, no tools.",
-  "I'll be back in a bit. Reply OK, nothing more, no tools.",
-  "Short pause on my side. Just OK please, no tools.",
-  "One moment, I'm stepping out. Reply only with OK, no tools.",
-];
-const KEEPALIVE_SET = new Set(KEEPALIVES);
-/** A keep-alive wording, never the same as `previous` (when given). */
-function keepAliveText(previous, rand = Math.random) {
-  const pool = KEEPALIVES.filter(t => t !== previous);
+// Keep-alive wordings, one picked at random each time so they don't all read the same, in the
+// language you write in that chat. All short (about the same tokens as before) and all ask for a
+// bare "OK" with no tools. Cache Keeper knows its own keep-alives by exact match against these
+// lists, so it still tells them apart from what you type, even after a restart. Only add to the
+// lists: removing a wording would make its past uses in old logs look like your own messages.
+const KEEPALIVES_BY_LANG = {
+  en: [
+    "Stepping away for a few minutes. Just reply OK, no tools needed.",
+    "Back shortly. Please reply with only OK and don't run any tools.",
+    "Taking a short break. Reply OK only, no tools.",
+    "Away for a moment. Answer with just OK, without using tools.",
+    "Pausing here for a bit. Only reply OK, no tool calls.",
+    "Be right back. Reply with OK and nothing else, no tools.",
+    "Quick break, I'll continue soon. Just say OK, don't use tools.",
+    "Hold on, I'm away for a few minutes. Reply only OK, no tools.",
+    "Give me a moment. Please answer just OK, no tools.",
+    "I'll be back in a bit. Reply OK, nothing more, no tools.",
+    "Short pause on my side. Just OK please, no tools.",
+    "One moment, I'm stepping out. Reply only with OK, no tools.",
+  ],
+  it: [
+    "Mi allontano qualche minuto. Rispondi solo OK, senza usare strumenti.",
+    "Torno subito. Rispondi soltanto OK e non usare strumenti.",
+    "Faccio una breve pausa. Rispondi solo OK, niente strumenti.",
+    "Un attimo, sono via per poco. Scrivi solo OK, senza strumenti.",
+    "Pausa veloce, poi riprendo. Rispondi OK e basta, niente strumenti.",
+    "Arrivo tra poco. Solo OK per favore, senza usare strumenti.",
+  ],
+  fr: [
+    "Je m'absente quelques minutes. Réponds juste OK, sans outils.",
+    "Je reviens vite. Réponds seulement OK et n'utilise aucun outil.",
+    "Petite pause. Réponds uniquement OK, pas d'outils.",
+    "Un instant, je m'éloigne. Écris juste OK, sans outils.",
+    "Courte pause, je reprends bientôt. Juste OK, sans outils.",
+    "Je reviens dans un moment. Réponds OK, rien d'autre, sans outils.",
+  ],
+  es: [
+    "Me ausento unos minutos. Responde solo OK, sin usar herramientas.",
+    "Vuelvo enseguida. Responde únicamente OK y no uses herramientas.",
+    "Hago una pausa corta. Solo OK, sin herramientas.",
+    "Un momento, me alejo un poco. Escribe solo OK, sin herramientas.",
+    "Pausa rápida, sigo pronto. Responde OK y nada más, sin herramientas.",
+    "Vuelvo en un rato. Solo OK por favor, sin herramientas.",
+  ],
+  de: [
+    "Ich bin ein paar Minuten weg. Antworte nur mit OK, ohne Tools.",
+    "Bin gleich zurück. Bitte nur OK antworten und keine Tools nutzen.",
+    "Kurze Pause. Antworte nur OK, keine Tools.",
+    "Einen Moment, ich bin kurz weg. Schreib nur OK, ohne Tools.",
+    "Kurze Unterbrechung, gleich geht es weiter. Nur OK, keine Tools.",
+    "Ich melde mich gleich wieder. Antworte OK, sonst nichts, ohne Tools.",
+  ],
+};
+const KEEPALIVES = KEEPALIVES_BY_LANG.en;
+const KEEPALIVE_SET = new Set(Object.values(KEEPALIVES_BY_LANG).flat());
+
+// Common short words per language, to guess which one you write in. Words shared by several of
+// these languages (e.g. "a", "on", "die" in English) are left out of the smaller lists' overlap.
+const LANG_WORDS = {
+  en: "the and is are you this that with for not what can please should would it's i'm don't of to in",
+  it: "il lo gli che non per una della delle sono questo questa come anche più perché grazie puoi fare devi è ho",
+  fr: "le les des est une pour pas que qui dans avec sur je tu nous vous cette sont mais fais peux merci c'est",
+  es: "el los las una para por que del con como pero está esto esta puedes hacer gracias también más es",
+  de: "der die das und ist nicht ein eine mit für auf ich du wir sie bitte kannst auch noch dass sich",
+};
+const LANG_SETS = Object.fromEntries(Object.entries(LANG_WORDS).map(([k, v]) => [k, new Set(v.split(" "))]));
+
+/**
+ * The language of your messages, from common words: one of the keep-alive languages, English when
+ * unsure (too few hits, or no clear winner).
+ */
+function detectLanguage(texts) {
+  const words = texts.join(" ").toLowerCase().replace(/```[\s\S]*?```|`[^`]*`|https?:\S+/g, " ")
+    .match(/[a-zà-öø-ÿ']+/g) || [];
+  const score = Object.fromEntries(Object.keys(LANG_SETS).map(k => [k, 0]));
+  for (const w of words) for (const k in LANG_SETS) if (LANG_SETS[k].has(w)) score[k]++;
+  const ranked = Object.entries(score).sort((x, y) => y[1] - x[1]);
+  const [best, n] = ranked[0], second = ranked[1][1];
+  return n >= 3 && n >= 1.5 * second ? best : "en";
+}
+
+/** A keep-alive wording in `lang` (English if not covered), never the same as `previous`. */
+function keepAliveText(previous, rand = Math.random, lang = "en") {
+  const pool = (KEEPALIVES_BY_LANG[lang] || KEEPALIVES).filter(t => t !== previous);
   return pool[Math.min(pool.length - 1, Math.floor(rand() * pool.length))];
 }
 function isKeepAlive(text) { return KEEPALIVE_SET.has(String(text || "").trim()); }
@@ -250,10 +311,12 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     };
   }
   const firstReal = userMessages.find(u => !isOurs(u));
+  // your last few messages decide the keep-alive language
+  const lang = detectLanguage(userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || "")));
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, lastEnd, busy, credits,
-    cost, stats, summaryWords: words, billedWrite,
+    cost, stats, summaryWords: words, billedWrite, lang,
     // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
     cacheFrom: last.ts,
     remaining: ttl - (now - last.ts) / 1000,
@@ -351,6 +414,6 @@ function fmt(credits) {
 
 module.exports = {
   summaryPays,
-  MARKER, KEEPALIVES, keepAliveText, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
+  MARKER, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

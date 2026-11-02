@@ -383,6 +383,30 @@ const never = () => new Promise(() => {});
     assert.ok(!core.isOwnMessage("OK, stepping away. Just reply OK, no tools needed. Then fix the parser"));
   });
 
+  await check("keep-alive language: guessed from your messages, English when unsure", () => {
+    const cases = [
+      ["en", "Refactor the parser please, and add tests for the edge cases"],
+      ["it", "Puoi sistemare il parser? Non funziona come dovrebbe, grazie"],
+      ["fr", "Peux-tu corriger le parser ? Il ne marche pas avec les fichiers vides, merci"],
+      ["es", "¿Puedes arreglar el parser? No funciona con los archivos vacíos, gracias"],
+      ["de", "Kannst du bitte den Parser reparieren? Er geht nicht mit leeren Dateien"],
+      ["en", "fix bug"],
+      ["en", "`il lo gli che non per` https://example.com/il/che/non"],     // code and links don't count
+    ];
+    for (const [lang, text] of cases) assert.strictEqual(core.detectLanguage([text]), lang, text);
+    for (const [lang, list] of Object.entries(core.KEEPALIVES_BY_LANG)) {
+      assert.ok(list.length >= 6, lang);
+      for (const t of list) assert.ok(/\bOK\b/.test(t) && t.length <= 80 && core.isOwnMessage(t), t);
+      assert.ok(list.includes(core.keepAliveText(undefined, Math.random, lang)), lang);
+    }
+    assert.ok(core.KEEPALIVES.includes(core.keepAliveText(undefined, Math.random, "pt")), "unknown language: English");
+    const t0 = Date.now() - 60000;
+    const ev = chatLog(t0).trim().split("\n").map(l => JSON.parse(l));
+    ev[0].attrs.content = "Puoi sistemare il parser? Non funziona come dovrebbe, grazie";
+    const it = core.analyze("/x", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, Date.now());
+    assert.strictEqual(it.lang, "it");
+  });
+
   await check("analyze: an untagged keep-alive is not counted as your message", () => {
     const t0 = Date.now() - 60000;
     const ev = chatLog(t0, { ctx: 150000 }).trim().split("\n").map(l => JSON.parse(l));

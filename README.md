@@ -35,8 +35,9 @@ full price.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
   - **Keep warm:** sends one tiny keep-alive **5 s before expiry**, for every model. Its wording
     is picked at random from a short list of plain messages (for example "Stepping away for a few
-    minutes. Just reply OK, no tools needed."), never the same twice in a row and with no tag.
-    Cache Keeper recognises them by that list, and its output log shows each one it sent.
+    minutes. Just reply OK, no tools needed."), never the same twice in a row and with no tag. It is written in
+    the language you use in that chat (English, Italian, French, Spanish or German, guessed
+    from common words in your last messages; English when unsure). Cache Keeper recognises them by that list, and its output log shows each one it sent.
     A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. To avoid a
     fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 2 x
     `cacheKeeper.keepAliveJitterPercent` (default 5%) of the cache lifetime ahead of that, so
