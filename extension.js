@@ -31,10 +31,10 @@ function stateFor(id) {
   return sessions.get(id);
 }
 
-/** cacheKeeper.keepAliveJitterPercent (default 10, 0 = off). */
+/** cacheKeeper.keepAliveJitterPercent (default 5, 0 = off). */
 function jitterPercent() {
   const p = cfg("keepAliveJitterPercent");
-  return p === undefined || p === null ? 10 : Number(p);
+  return p === undefined || p === null ? 5 : Number(p);
 }
 
 /**

@@ -37,8 +37,8 @@ full price.
     (`[cache-keeper] Keep-alive … Reply with only: OK`) **5 s before expiry**, for every model.
     A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. To avoid a
     fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 2 x
-    `cacheKeeper.keepAliveJitterPercent` (default 10%) of the cache lifetime ahead of that, so
-    5 to 65 s before expiry for a 5 min cache. Never later than the 5 s lead. The next
+    `cacheKeeper.keepAliveJitterPercent` (default 5%) of the cache lifetime ahead of that, so
+    5 to 35 s before expiry for a 5 min cache. Never later than the 5 s lead. The next
     timeout warns you again. If you don't keep it warm again, a handoff summary is written before
     that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
   - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
@@ -203,7 +203,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
-| `cacheKeeper.keepAliveJitterPercent` | 10 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
+| `cacheKeeper.keepAliveJitterPercent` | 5 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
 
