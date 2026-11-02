@@ -407,6 +407,29 @@ const never = () => new Promise(() => {});
     assert.strictEqual(it.lang, "it");
   });
 
+  await check("summary request: no [cache-keeper] tag, own tag per language, recognised as ours", () => {
+    const x = { rel: ".copilot-handoff/a.md", turns: 3, compactions: 0, files: 2, ctxK: 150, words: 400 };
+    for (const lang of ["en", "it", "fr", "es", "de", "pt"]) {
+      const t = core.summaryPrompt(lang, x);
+      assert.ok(!t.includes(core.MARKER), t);
+      assert.ok(t.startsWith(core.SUMMARY_TAGS[lang] || core.SUMMARY_TAGS.en), t);
+      assert.ok(t.includes(x.rel) && t.includes("400") && t.includes("DONE"), t);
+      assert.ok(core.isOwnMessage(t), t);
+    }
+    assert.ok(core.summaryPrompt("it", x).includes("riepilogo"));
+    assert.ok(core.handoffStart("fr").startsWith("Reprends") && core.handoffStart("xx").startsWith("Continue"));
+  });
+
+  await check("extension: nothing sent carries the old [cache-keeper] tag", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
+    try {
+      await h.run(700);
+      assert.strictEqual(h.sent.length, 2, "keep-alive, then the closing summary");
+      for (const x of h.sent) assert.ok(!x.text.includes(core.MARKER), x.text);
+      assert.ok(h.sent[1].text.startsWith("[summary]"), h.sent[1].text);
+    } finally { h.close(); }
+  });
+
   await check("analyze: an untagged keep-alive is not counted as your message", () => {
     const t0 = Date.now() - 60000;
     const ev = chatLog(t0, { ctx: 150000 }).trim().split("\n").map(l => JSON.parse(l));

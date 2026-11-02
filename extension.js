@@ -457,15 +457,12 @@ async function summary(context, s, why) {
   if (!file) return false;
   await excludeFromGit();
   const rel = path.posix.relative(vscode.workspace.workspaceFolders[0].uri.path, file.path);
-  const prompt = `${core.MARKER} I'm pausing and this chat's cache is about to expire. ` +
-    `Create the file \`${rel}\` with a handoff summary so a fresh chat can continue: goal, what is done, ` +
-    "current state, decisions and why, files changed, open problems, exact next steps, useful commands. " +
-    `This chat has ${s.stats.turns} message(s) from me, ${s.stats.compactions} compaction(s), ${s.stats.files} file(s) edited ` +
-    `and ${Math.round(s.ctx / 1000)}k tokens of context: aim for about ${s.summaryWords} words. ` +
-    "Create only that file, change nothing else, then reply DONE.";
+  const prompt = core.summaryPrompt(s.lang, { rel, turns: s.stats.turns, compactions: s.stats.compactions,
+    files: s.stats.files, ctxK: Math.round(s.ctx / 1000), words: s.summaryWords });
   if (!(await trySend(context, s, prompt, "summary request"))) return false;
   st.mode = "done";
   st.handoff = file;
+  st.handoffLang = s.lang;
   st.handoffCovers = s.lastRealUserTs;
   vscode.window.showInformationMessage(`Cache Keeper: writing handoff summary (${why}) to ${rel}.`);
   return true;
@@ -636,7 +633,7 @@ async function pickChat(context) {
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
   ], { placeHolder: `${describe(chat.s)}: what should happen before its cache expires?` });
-  if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff);
+  if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff, st.handoffLang);
   else if (pick) await choose(context, chat.s, pick.label);
 }
 
@@ -740,16 +737,16 @@ async function decide(context) {
       vscode.window.showInformationMessage(
         `Copilot cache expired (${describe(s)}). Your next message there re-sends the context` +
           (s.cost ? `: ~${core.fmt(s.cost.missExtra)} extra credits.` : "."),
-        ...actions).then(a => { if (a) newChatFromHandoff(st.handoff); });
+        ...actions).then(a => { if (a) newChatFromHandoff(st.handoff, st.handoffLang); });
     }
   }
   updateStatus(context);
 }
 
-async function newChatFromHandoff(uri) {
+async function newChatFromHandoff(uri, lang) {
   await vscode.commands.executeCommand("workbench.action.chat.newChat");
   await vscode.commands.executeCommand("workbench.action.chat.open", {
-    query: "Continue from the attached handoff summary. ", isPartialQuery: true, attachFiles: [uri],
+    query: core.handoffStart(lang), isPartialQuery: true, attachFiles: [uri],
   });
 }
 

@@ -57,7 +57,9 @@ full price.
     chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
     chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
     expires instead. **Summarize** (clicked) always writes one.
-  - **Summarize:** asks the agent to write `.copilot-handoff/<time>-<session>.md` now
+  - **Summarize:** asks the agent, in the chat's language and starting with `[summary]` (or
+    `[riepilogo]`, `[résumé]`, `[resumen]`, `[Zusammenfassung]`), to write
+    `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
     150 per compaction + 10 per edited file, between 150 and 1500. A one-question chat gets

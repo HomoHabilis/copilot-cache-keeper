@@ -9,6 +9,7 @@
 
 const path = require("path");
 
+// Older versions started every message they sent with this tag; still recognised in old logs.
 const MARKER = "[cache-keeper]";
 // Keep-alive wordings, one picked at random each time so they don't all read the same, in the
 // language you write in that chat. All short (about the same tokens as before) and all ask for a
@@ -97,8 +98,64 @@ function keepAliveText(previous, rand = Math.random, lang = "en") {
   return pool[Math.min(pool.length - 1, Math.floor(rand() * pool.length))];
 }
 function isKeepAlive(text) { return KEEPALIVE_SET.has(String(text || "").trim()); }
-/** Sent by Cache Keeper, not typed by you: a keep-alive, or a tagged message (summary, old keep-alives). */
-function isOwnMessage(text) { const t = String(text || "").trim(); return t.startsWith(MARKER) || KEEPALIVE_SET.has(t); }
+// The handoff summary request varies (file name, sizes), so it can't be matched exactly: it starts
+// with a short tag in the chat's language instead. Only add tags, for the same reason as above.
+const SUMMARY_TAGS = { en: "[summary]", it: "[riepilogo]", fr: "[résumé]", es: "[resumen]", de: "[Zusammenfassung]" };
+const OWN_PREFIXES = [MARKER, ...Object.values(SUMMARY_TAGS)];
+
+/**
+ * The handoff summary request, in `lang` (English if not covered). `x`: { rel, turns, compactions,
+ * files, ctxK, words }. Each asks for that one file only and a reply of DONE.
+ */
+function summaryPrompt(lang, x) {
+  const t = {
+    en: `${SUMMARY_TAGS.en} I'm pausing and this chat's cache is about to expire. ` +
+      `Create the file \`${x.rel}\` with a handoff summary so a fresh chat can continue: goal, what is done, ` +
+      "current state, decisions and why, files changed, open problems, exact next steps, useful commands. " +
+      `This chat has ${x.turns} message(s) from me, ${x.compactions} compaction(s), ${x.files} file(s) edited ` +
+      `and ${x.ctxK}k tokens of context: aim for about ${x.words} words. ` +
+      "Create only that file, change nothing else, then reply DONE.",
+    it: `${SUMMARY_TAGS.it} Faccio una pausa e la cache di questa chat sta per scadere. ` +
+      `Crea il file \`${x.rel}\` con un riepilogo di passaggio, così una nuova chat può continuare: obiettivo, cosa è fatto, ` +
+      "stato attuale, decisioni e motivi, file modificati, problemi aperti, prossimi passi precisi, comandi utili. " +
+      `Questa chat ha ${x.turns} messaggi miei, ${x.compactions} compattazioni, ${x.files} file modificati ` +
+      `e ${x.ctxK}k token di contesto: punta a circa ${x.words} parole. ` +
+      "Crea solo quel file, non modificare nient'altro, poi rispondi DONE.",
+    fr: `${SUMMARY_TAGS.fr} Je fais une pause et le cache de cette conversation va expirer. ` +
+      `Crée le fichier \`${x.rel}\` avec un résumé de passation pour qu'une nouvelle conversation puisse reprendre : objectif, ce qui est fait, ` +
+      "état actuel, décisions et pourquoi, fichiers modifiés, problèmes ouverts, prochaines étapes précises, commandes utiles. " +
+      `Cette conversation contient ${x.turns} message(s) de ma part, ${x.compactions} compaction(s), ${x.files} fichier(s) modifié(s) ` +
+      `et ${x.ctxK}k tokens de contexte : vise environ ${x.words} mots. ` +
+      "Crée uniquement ce fichier, ne modifie rien d'autre, puis réponds DONE.",
+    es: `${SUMMARY_TAGS.es} Hago una pausa y la caché de este chat está a punto de caducar. ` +
+      `Crea el archivo \`${x.rel}\` con un resumen de traspaso para que un chat nuevo pueda continuar: objetivo, qué está hecho, ` +
+      "estado actual, decisiones y por qué, archivos cambiados, problemas abiertos, próximos pasos exactos, comandos útiles. " +
+      `Este chat tiene ${x.turns} mensaje(s) míos, ${x.compactions} compactación(es), ${x.files} archivo(s) editado(s) ` +
+      `y ${x.ctxK}k tokens de contexto: apunta a unas ${x.words} palabras. ` +
+      "Crea solo ese archivo, no cambies nada más y luego responde DONE.",
+    de: `${SUMMARY_TAGS.de} Ich mache eine Pause und der Cache dieses Chats läuft gleich ab. ` +
+      `Erstelle die Datei \`${x.rel}\` mit einer Übergabe-Zusammenfassung, damit ein neuer Chat weitermachen kann: Ziel, was erledigt ist, ` +
+      "aktueller Stand, Entscheidungen und Gründe, geänderte Dateien, offene Probleme, genaue nächste Schritte, nützliche Befehle. " +
+      `Dieser Chat hat ${x.turns} Nachricht(en) von mir, ${x.compactions} Komprimierung(en), ${x.files} bearbeitete Datei(en) ` +
+      `und ${x.ctxK}k Tokens Kontext: ziele auf etwa ${x.words} Wörter. ` +
+      "Erstelle nur diese Datei, ändere sonst nichts und antworte dann DONE.",
+  };
+  return t[lang] || t.en;
+}
+
+/** The first message of a new chat from a handoff file (you finish and send it), in `lang`. */
+function handoffStart(lang) {
+  return { en: "Continue from the attached handoff summary. ", it: "Continua dal riepilogo di passaggio allegato. ",
+           fr: "Reprends à partir du résumé de passation joint. ", es: "Continúa desde el resumen de traspaso adjunto. ",
+           de: "Mach mit der angehängten Übergabe-Zusammenfassung weiter. " }[lang] ||
+    "Continue from the attached handoff summary. ";
+}
+
+/** Sent by Cache Keeper, not typed by you: a keep-alive, a summary request, or an old tagged message. */
+function isOwnMessage(text) {
+  const t = String(text || "").trim();
+  return KEEPALIVE_SET.has(t) || OWN_PREFIXES.some(p => t.startsWith(p));
+}
 // Cache lifetimes are not in Copilot's price sheet. Copilot CLI logs them (cacheTtlSeconds);
 // these defaults are what it reported, used when nothing better is known.
 const DEFAULT_TTLS = [["claude", 300], ["gpt-6.1-sol", 1800]];
@@ -414,6 +471,6 @@ function fmt(credits) {
 
 module.exports = {
   summaryPays,
-  MARKER, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
+  MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };
