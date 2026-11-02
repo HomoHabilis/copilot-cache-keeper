@@ -27,15 +27,22 @@ full price.
     something you type would land there.
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
-  - **No click:** what `cacheKeeper.noResponseAction` says. By default (`nothing`) the cache
-    expires. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
+  - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
+    takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
     tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
-    first. Below that, or when the model's price is unknown, it just expires. It can also be set to `keepWarmOnce` or `autoKeepWarm`. Either way, an
+    first. Below that, or when the model's price is unknown, it just expires. An
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
-  - **Keep warm:** sends one tiny keep-alive
-    (`[cache-keeper] Keep-alive … Reply with only: OK`) **5 s before expiry**, for every model.
-    A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. The next
+  - **Keep warm:** sends one tiny keep-alive **5 s before expiry**, for every model. Its wording
+    is picked at random from a short list of plain messages (for example "Stepping away for a few
+    minutes. Just reply OK, no tools needed."), never the same twice in a row and with no tag. It is written in
+    the language you use in that chat (English, Italian, French, Spanish or German, guessed
+    from common words in Copilot's recent answers and your last messages; English when
+    unsure). Cache Keeper recognises them by that list, and its output log shows each one it sent.
+    A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. To avoid a
+    fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 2 x
+    `cacheKeeper.keepAliveJitterPercent` (default 5%) of the cache lifetime ahead of that, so
+    5 to 35 s before expiry for a 5 min cache. Never later than the 5 s lead. The next
     timeout warns you again. If you don't keep it warm again, a handoff summary is written before
     that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
   - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
@@ -46,18 +53,32 @@ full price.
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.
-  - **Summarize:** asks the agent to write `.copilot-handoff/<time>-<session>.md` now
+  - **Automatic summaries only when they pay off:** all three cases above (no click, after Keep
+    warm once, at the auto cap) write a summary only if the summary plus the first message of a new
+    chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
+    chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
+    expires instead. **Summarize** (clicked) always writes one.
+  - **Summarize:** asks the agent, in the chat's language and starting with `[summary]` (or
+    `[riepilogo]`, `[résumé]`, `[resumen]`, `[Zusammenfassung]`), to write
+    `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
     150 per compaction + 10 per edited file, between 150 and 1500. A one-question chat gets
-    about 200 words; a long session with compactions gets up to 1500. The cost estimate uses
+    about 200 words; a long session with compactions gets up to 1500. Since the summary is
+    output (the priciest tokens) and is then read back uncached, the length is also capped so
+    the summary costs at most a third of what an expiry would add (it matters only for a small
+    context with a long history, for example after several compactions). The cost estimate uses
     the same length.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
+- **Status-bar list order:** the chat where you last typed first (marked "where you last
+  typed"), then the other warm or working chats by soonest expiry, then the latest expired chat
+  and any with a handoff summary ready.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
-  Auto keep warm).
+  Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
-  from the handoff file.
+  from the handoff file. That notice can slide into the notification center while you are away;
+  the same action stays in the status-bar list.
 - **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
   since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
@@ -193,13 +214,13 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | Setting | Default | |
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
-| `cacheKeeper.noResponseAction` | nothing | When a warning gets no answer: `nothing`, `keepWarmOnce` or `autoKeepWarm` |
 | `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
+| `cacheKeeper.keepAliveJitterPercent` | 5 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
 
