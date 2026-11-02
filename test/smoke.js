@@ -66,7 +66,7 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20
  * undefined (closed with X) or a promise that never settles (not answered). Messages Cache Keeper
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
-async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined }) {
+async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1 }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -90,7 +90,11 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const vscode = {
     env: { remoteName: undefined },
     workspace: { getConfiguration: () => ({ get: k => settings[k] }), fs: fakeFs,
-                 workspaceFolders: [{ uri: { scheme: "file", fsPath: tmp, path: tmp } }] },
+                 // more folders = a multi-root workspace: tmp, tmp/repo2, ...
+                 workspaceFolders: Array.from({ length: folders }, (_, i) => {
+                   const f = i ? path.join(tmp, `repo${i + 1}`) : tmp;
+                   return { uri: { scheme: "file", fsPath: f, path: f } };
+                 }) },
     window: {
       createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
@@ -655,12 +659,30 @@ const never = () => new Promise(() => {});
       await h.run(900);
       const m = h.sent.map(x => x.text.match(/`([^`]+\.md)`/)).find(Boolean);
       assert.ok(m, "summary asks for a file");
-      fs.mkdirSync(path.dirname(path.join(h.dir, m[1])), { recursive: true });
-      fs.writeFileSync(path.join(h.dir, m[1]), "# handoff");     // the agent wrote it
+      const file = path.isAbsolute(m[1]) ? m[1] : path.join(h.dir, m[1]);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, "# handoff");     // the agent wrote it
       await h.commands["cacheKeeper.options"]();
       assert.strictEqual(offered[0], "New chat from handoff", offered.join(", "));
       const open = h.ran.find(x => x.id === "workbench.action.chat.open");
-      assert.ok(open && open.a.attachFiles[0].fsPath.endsWith(m[1]), "new chat opened with the handoff attached");
+      assert.ok(open && open.a.attachFiles[0].fsPath.endsWith(path.basename(m[1])), "new chat opened with the handoff attached");
+    } finally { h.close(); }
+  });
+
+  await check("multi-root workspace: summary asked at a full path, found in another folder too", async () => {
+    let offered;
+    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 }, folders: 2,
+      menu: items => { offered = items.map(i => i.label); return undefined; } });
+    try {
+      await h.run(900);
+      const m = h.sent.map(x => x.text.match(/`([^`]+\.md)`/)).find(Boolean);
+      assert.ok(m && path.isAbsolute(m[1]), "full path in the request: " + (m && m[1]));
+      // the agent wrote it in the second repository's .copilot-handoff/ anyway
+      const other = path.join(h.dir, "repo2", ".copilot-handoff", path.basename(m[1]));
+      fs.mkdirSync(path.dirname(other), { recursive: true });
+      fs.writeFileSync(other, "# handoff");
+      await h.commands["cacheKeeper.options"]();
+      assert.strictEqual(offered[0], "New chat from handoff", offered.join(", "));
     } finally { h.close(); }
   });
 

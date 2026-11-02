@@ -432,6 +432,22 @@ async function exists(uri) {
   try { await vscode.workspace.fs.stat(uri); return true; } catch { return false; }
 }
 
+/**
+ * Is this chat's handoff file there? In a multi-root workspace the agent may have written it in
+ * another folder's .copilot-handoff/ than the first one: look in every workspace folder, and
+ * remember where it was found.
+ */
+async function findHandoff(st) {
+  if (!st.handoff) return false;
+  if (await exists(st.handoff)) return true;
+  const name = path.posix.basename(st.handoff.path);
+  for (const f of vscode.workspace.workspaceFolders || []) {
+    const u = vscode.Uri.joinPath(f.uri, ".copilot-handoff", name);
+    if (await exists(u)) { st.handoff = u; return true; }
+  }
+  return false;
+}
+
 /** Keep handoff files out of git without touching the repo's .gitignore. */
 async function excludeFromGit() {
   const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
@@ -448,7 +464,7 @@ async function excludeFromGit() {
 
 async function summary(context, s, why) {
   const st = stateFor(s.id);
-  if (st.handoff && await exists(st.handoff) && st.handoffCovers === s.lastRealUserTs) {
+  if (await findHandoff(st) && st.handoffCovers === s.lastRealUserTs) {
     st.mode = "done";            // a handoff written since your last message still covers this chat
     vscode.window.showInformationMessage(`Cache Keeper: ${path.posix.basename(st.handoff.path)} is still up to date; no new summary.`);
     return true;
@@ -457,7 +473,10 @@ async function summary(context, s, why) {
   if (!file) return false;
   await excludeFromGit();
   const rel = path.posix.relative(vscode.workspace.workspaceFolders[0].uri.path, file.path);
-  const prompt = core.summaryPrompt(s.lang, { rel, turns: s.stats.turns, compactions: s.stats.compactions,
+  // the full path, so the agent writes it where Cache Keeper looks, also in a multi-root workspace
+  // (a relative path made it pick whichever repository it was working in)
+  const full = file.scheme === "file" ? file.fsPath : file.path;
+  const prompt = core.summaryPrompt(s.lang, { rel: full, turns: s.stats.turns, compactions: s.stats.compactions,
     files: s.stats.files, ctxK: Math.round(s.ctx / 1000), words: s.summaryWords });
   if (!(await trySend(context, s, prompt, "summary request"))) return false;
   st.mode = "done";
@@ -624,7 +643,7 @@ async function pickChat(context) {
   if (!chat) return;
   const st = stateFor(chat.s.id);
   // the expiry notice can slide into the notification center unseen: the same action lives here too
-  const handoff = st.handoff && await exists(st.handoff) ? [{ label: NEW_FROM_HANDOFF,
+  const handoff = await findHandoff(st) ? [{ label: NEW_FROM_HANDOFF,
     detail: `Open a new chat with ${path.posix.basename(st.handoff.path)} attached` +
       (chat.s.cost ? ` (first message ≈ ${core.fmt(chat.s.cost.restart)} cr)` : "") }] : [];
   const pick = await vscode.window.showQuickPick([
@@ -735,7 +754,7 @@ async function decide(context) {
       if (fresh && fresh.cacheFrom !== s.cacheFrom) { all = all.map(x => x.id === fresh.id ? fresh : x); continue; }
       st.expiredFor = s.cacheFrom;
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
-      const actions = st.handoff && await exists(st.handoff) ? [NEW_FROM_HANDOFF] : [];
+      const actions = await findHandoff(st) ? [NEW_FROM_HANDOFF] : [];
       vscode.window.showInformationMessage(
         `Copilot cache expired (${describe(s)}). Your next message there re-sends the context` +
           (s.cost ? `: ~${core.fmt(s.cost.missExtra)} extra credits.` : "."),
