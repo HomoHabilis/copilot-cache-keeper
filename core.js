@@ -24,6 +24,9 @@ const TOKENS_PER_WORD = 1.4;
 // A summary is written (output price) and read back (uncached); on a small context with a long
 // history that could cost more than the expiry it is meant to avoid. Keep it to this share.
 const SUMMARY_MAX_SHARE = 1 / 3;
+// Only write one automatically when it, plus starting a new chat from it, costs at most this share
+// of continuing the chat cold: the margin pays for the cases where you continue the old chat anyway.
+const SUMMARY_PAYS_SHARE = 0.75;
 const EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edit_file|write_file|edit_notebook/i;
 
 /** Local disk access, for tests and command-line use. */
@@ -293,11 +296,22 @@ function canAffordHeartbeat(session, spentSoFar, cap, withSummary = false) {
   return spentSoFar + c.heartbeat + (withSummary ? c.summary : 0) <= cap;
 }
 
+/**
+ * Whether a handoff summary is worth writing automatically: writing it and the first message of a
+ * new chat built from it cost clearly less than continuing this chat after its cache expired. Not
+ * so on a small context, where a new chat's own setup (system prompt, tools) costs about as much.
+ */
+function summaryPays(session) {
+  const c = session.cost;
+  return !!c && c.summary + c.restart <= SUMMARY_PAYS_SHARE * c.missExtra;
+}
+
 function fmt(credits) {
   return credits >= 10 ? credits.toFixed(0) : credits.toFixed(1);
 }
 
 module.exports = {
+  summaryPays,
   MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, summaryWords, describeLog,
 };

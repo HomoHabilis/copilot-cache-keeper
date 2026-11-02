@@ -31,13 +31,13 @@ const MODELS = JSON.stringify([{
     long_context: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 1500, max_prompt_tokens: 922000 } } },
 }]);
 
-function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = false, writePrice = 500, coldKeepAlive = false } = {}) {
+function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20000, keepAlive = false, writePrice = 500, coldKeepAlive = false } = {}) {
   const ev = [
     { type: "user_message", ts: t0, attrs: { content: "Refactor the parser" } },
     { type: "turn_start", ts: t0 + 10 },
-    { type: "llm_request", ts: t0 + 50, dur: 3000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx - 20000,
+    { type: "llm_request", ts: t0 + 50, dur: 3000, attrs: { debugName: "panel/editAgent", model, inputTokens: first,
       // billed: uncached at writePrice per 1M, output at 2000 per 1M (as Copilot's log reports it)
-      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: ((ctx - 20000) * writePrice + 800 * 2000) * 1e3 } },
+      cachedTokens: 0, outputTokens: 800, copilotUsageNanoAiu: (first * writePrice + 800 * 2000) * 1e3 } },
     { type: "llm_request", ts: t0 + 4000, dur: 2000, attrs: { debugName: "panel/editAgent", model, inputTokens: ctx,
       cachedTokens: ctx - 1000, outputTokens: 300, copilotUsageNanoAiu: 5e9 } },
     { type: "turn_end", ts: t0 + 6500 },
@@ -66,7 +66,7 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, keepAlive = fals
  * undefined (closed with X) or a promise that never settles (not answered). Messages Cache Keeper
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
-async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen = false, menu = () => undefined }) {
+async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -145,7 +145,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, busyOnOpen =
   clock += 2000;
   fs.mkdirSync(chat);
   fs.writeFileSync(path.join(chat, "models.json"), MODELS);
-  fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx }));
+  fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, "main.jsonl"), cacheFrom: clock - 7000 + 4000,
@@ -341,6 +341,33 @@ const never = () => new Promise(() => {});
       assert.strictEqual(h.warnings.length, 2, "warned again after Keep warm once");
       assert.strictEqual(h.sent.length, 2, "keep-alive, then the closing summary");
       assert.ok(h.sent[0].text.includes("Keep-alive") && h.sent[1].text.includes("handoff summary"));
+    } finally { h.close(); }
+  });
+
+  await check("summaryPays: a summary only when it and a new chat cost clearly less than continuing", () => {
+    // 30k of context, a new chat's own setup already 25k of it: a new chat would cost about as much
+    const small = core.analyze("/logs/a", chatLog(now - 60000, { ctx: 30000, first: 25000 }), MODELS, now);
+    assert.strictEqual(core.summaryPays(small), false, JSON.stringify(small.cost));
+    const grown = core.analyze("/logs/b", chatLog(now - 60000, { ctx: 40000 }), MODELS, now);   // 20k first, 40k now
+    assert.strictEqual(core.summaryPays(grown), true, JSON.stringify(grown.cost));
+    assert.strictEqual(core.summaryPays({ cost: null }), false);
+  });
+
+  await check("Keep warm once on a chat where a summary would not pay: keep-alive only", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), ctx: 30000, first: 25000 });
+    try {
+      await h.run(700);
+      assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text.slice(0, 40)).join(" | "));
+      assert.ok(h.sent[0].text.includes("Keep-alive"));
+    } finally { h.close(); }
+  });
+
+  await check("Auto keep warm on a chat where a summary would not pay: stops at the cap, no summary", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(), ctx: 30000, first: 25000 });
+    try {
+      await h.run(3000);
+      assert.ok(h.sent.length >= 1, "kept warm");
+      assert.ok(!h.sent.some(x => x.text.includes("handoff summary")), "no summary");
     } finally { h.close(); }
   });
 

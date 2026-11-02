@@ -46,6 +46,11 @@ full price.
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.
+  - **Automatic summaries only when they pay off:** all three cases above (no click, after Keep
+    warm once, at the auto cap) write a summary only if the summary plus the first message of a new
+    chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
+    chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
+    expires instead. **Summarize** (clicked) always writes one.
   - **Summarize:** asks the agent to write `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
