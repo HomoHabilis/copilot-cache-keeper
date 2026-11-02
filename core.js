@@ -210,17 +210,37 @@ function summaryWords(stats, max = Infinity) {
 
 let learnedTtls = {};          // model id -> seconds, from Copilot CLI logs
 
-/** Read cacheTtlSeconds per model from Copilot CLI session logs under `home`, if any. */
+/**
+ * Read cacheTtlSeconds per model from the newest `maxFiles` Copilot CLI sessions under `home`.
+ * A newer session wins for the same model. Values learned earlier stay until a session says
+ * otherwise, so a model doesn't fall back to the default when its session gets old.
+ * Returns { ttls, dir, files }: what is known now, where it looked, and how many logs it read.
+ */
 async function learnTtls(io = nodeIo, home = require("os").homedir(), maxFiles = 30) {
   const dir = io.join(home, ".copilot", "session-state");
-  const found = {};
   const re = /"modelId":"([^"]+)","cacheExpiresAt":"[^"]*","cacheTtlSeconds":(\d+)/g;
-  for (const n of (await io.list(dir)).slice(-maxFiles)) {
-    const text = await io.readText(io.join(dir, n, "events.jsonl"));
+  const logs = [];
+  for (const n of await io.list(dir)) {
+    const f = io.join(dir, n, "events.jsonl");
+    const st = await io.stat(f);
+    if (st) logs.push({ f, mtime: st.mtime });
+  }
+  logs.sort((a, b) => a.mtime - b.mtime);     // oldest first: newer sessions overwrite older ones
+  const found = {};
+  for (const { f } of logs.slice(-maxFiles)) {
+    const text = await io.readText(f);
     if (text) for (const m of text.matchAll(re)) found[m[1]] = Number(m[2]);
   }
-  if (Object.keys(found).length) learnedTtls = found;
-  return learnedTtls;
+  learnedTtls = { ...learnedTtls, ...found };
+  return { ttls: { ...learnedTtls }, dir, files: Math.min(logs.length, maxFiles) };
+}
+
+/** Where a model's cache lifetime comes from: "setting", "Copilot CLI log" or "default". */
+function ttlSource(model, overrides = {}) {
+  model = model || "";
+  if (overrides[model]) return "setting";
+  if (learnedTtls[model]) return "Copilot CLI log";
+  return "default";
 }
 
 function ttlFor(model, overrides = {}) {
@@ -323,7 +343,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   // A long tool run (tests, a push) logs nothing until it ends, so no short cap: only a turn quiet
   // for hours is taken as one that never logged its end.
   const busy = (depth > 0 || pendingMsg) && now - lastActivity < BUSY_CAP_MS;
-  const ttl = ttlFor(model, ttlOverrides);
+  const ttl = ttlFor(model, ttlOverrides), ttlFrom = ttlSource(model, ttlOverrides);
   // What the chat contains, for sizing a handoff summary.
   const realTurns = userMessages.filter(u => !isOurs(u)).length;
   const compactions = events.filter(e => e.type === "llm_request" &&
@@ -387,7 +407,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     ...userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || ""))]);
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
-    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, lastEnd, busy, credits,
+    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, ttlFrom, lastEnd, busy, credits,
     cost, stats, summaryWords: words, billedWrite, lang,
     // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
     cacheFrom: last.ts,
@@ -500,6 +520,6 @@ function fmt(credits) {
 
 module.exports = {
   summaryPays,
-  orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
+  orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

@@ -129,8 +129,13 @@ full price.
 - **Unknown prices:** if a model isn't in the sheet, Cache Keeper shows no costs and never acts on
   its own.
 - **Cache lifetimes** vary by model and aren't in the price sheet. They're learned from Copilot
-  CLI logs (`cacheTtlSeconds`). Otherwise the defaults are 300 s for Claude models, 1800 s for
-  Sol 6.1 and 300 s for anything else, and `cacheKeeper.ttlSeconds` overrides them per model id. The countdown starts when the last
+  CLI logs (`cacheTtlSeconds` in `~/.copilot/session-state/*/events.jsonl` on the machine where
+  Copilot runs, newest 30 sessions, newest wins, rechecked every 30 min), so a lifetime Copilot
+  changes server side is picked up once you have used that model in Copilot CLI. Otherwise the
+  defaults are 300 s for Claude models, 1800 s for Sol 6.1 and 300 s for anything else, and
+  `cacheKeeper.ttlSeconds` overrides them per model id. The Output panel logs the learned values
+  when they change, and the status-bar tooltip and diagnostics show each chat's lifetime and where
+  it came from (setting, Copilot CLI log or default). The countdown starts when the last
   model call started, since that is when the cache was refreshed. (Your message comes earlier, but
   every call of an agent turn refreshes the cache, so counting from the message would send
   keep-alives far too early on long turns.)

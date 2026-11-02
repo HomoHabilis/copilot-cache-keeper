@@ -304,6 +304,33 @@ const never = () => new Promise(() => {});
     assert.strictEqual(core.ttlFor("gpt-6.1-sol"), 1800);
   });
 
+  await check("learnTtls: newest Copilot CLI sessions win, source is reported", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+    try {
+      const dir = path.join(tmp, ".copilot", "session-state");
+      const write = (name, model, ttl, ageMin) => {
+        fs.mkdirSync(path.join(dir, name), { recursive: true });
+        const f = path.join(dir, name, "events.jsonl");
+        fs.writeFileSync(f, JSON.stringify({ modelId: model, cacheExpiresAt: "x", cacheTtlSeconds: ttl }) + "\n");
+        const t = (Date.now() - ageMin * 60000) / 1000;
+        fs.utimesSync(f, t, t);
+      };
+      // names sort the other way round from age: the newest session must win, not the last name
+      write("a-new", "claude-haiku-test", 90, 1);
+      write("z-old", "claude-haiku-test", 300, 60);
+      assert.strictEqual(core.ttlSource("claude-haiku-test"), "default");
+      const r = await core.learnTtls(core.nodeIo, tmp);
+      assert.strictEqual(r.files, 2);
+      assert.strictEqual(r.ttls["claude-haiku-test"], 90);
+      assert.strictEqual(core.ttlFor("claude-haiku-test"), 90);
+      assert.strictEqual(core.ttlSource("claude-haiku-test"), "Copilot CLI log");
+      assert.strictEqual(core.ttlSource("claude-haiku-test", { "claude-haiku-test": 60 }), "setting");
+      // a later look that only reads the old session's window keeps nothing worse than what it reads
+      await core.learnTtls(core.nodeIo, tmp, 1);
+      assert.strictEqual(core.ttlFor("claude-haiku-test"), 90);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
   await check("autoCap / canAffordHeartbeat: keep-alives stop at a share of the expiry cost", () => {
     const s = { cost: { heartbeat: 3, missExtra: 72, summary: 9, restart: 14 } };
     const cap = core.autoCap(s, 50);
