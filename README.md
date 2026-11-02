@@ -33,8 +33,10 @@ full price.
     first. Below that, or when the model's price is unknown, it just expires. An
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
-  - **Keep warm:** sends one tiny keep-alive
-    (`[cache-keeper] Keep-alive … Reply with only: OK`) **5 s before expiry**, for every model.
+  - **Keep warm:** sends one tiny keep-alive **5 s before expiry**, for every model. Its wording
+    is picked at random from a short list of plain messages (for example "Stepping away for a few
+    minutes. Just reply OK, no tools needed."), never the same twice in a row and with no tag.
+    Cache Keeper recognises them by that list, and its output log shows each one it sent.
     A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. To avoid a
     fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 2 x
     `cacheKeeper.keepAliveJitterPercent` (default 5%) of the cache lifetime ahead of that, so

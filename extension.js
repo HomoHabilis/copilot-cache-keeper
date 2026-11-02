@@ -7,7 +7,6 @@ const vscode = require("vscode");
 const path = require("path");
 const core = require("./core");
 
-const HEARTBEAT = `${core.MARKER} Keep-alive while I'm away. Reply with only: OK. Do not use any tools.`;
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
 const SUMMARY_LEAD = 15;       // seconds before expiry for an automatic summary
@@ -345,7 +344,8 @@ async function sendNow(context, s, text, label, opts = {}) {
                    miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
     await vscode.commands.executeCommand("workbench.action.chat.submit", { inputValue: text });
-    logx(`${label} sent to ${s.id.slice(0, 8)} (${describe(s)})${opened ? ", in a tab opened for it" : ""}`);
+    logx(`${label} sent to ${s.id.slice(0, 8)} (${describe(s)})${opened ? ", in a tab opened for it" : ""}` +
+      (label === "keep-alive" ? `: "${text}"` : ""));
     return true;
   } catch (e) {
     logx(`${label} for ${s.id.slice(0, 8)} failed: ${e.message}`);
@@ -391,7 +391,7 @@ async function verifyPending() {
     const pool = freshTarget ? [freshTarget, ...all.filter(x => x.id !== p.expectId)] : all;
     if (freshTarget) all = all.map(x => x.id === freshTarget.id ? freshTarget : x);   // don't wait for the next full read
     // landed = a new Cache Keeper message in some chat since we sent (no clock comparison needed)
-    const landed = pool.find(x => x.lastUserTs > (p.before.get(x.id) || 0) && x.lastUserText.startsWith(core.MARKER));
+    const landed = pool.find(x => x.lastUserTs > (p.before.get(x.id) || 0) && core.isOwnMessage(x.lastUserText));
     if (landed && !p.landed) {
       p.landed = landed.id;
       noteOffset(landed.lastUserTs - p.sentAt);
@@ -473,8 +473,11 @@ async function summary(context, s, why) {
 
 async function keepAlive(context, s, opts = {}) {
   const cold = live(s) <= 0;     // only possible from the command: the whole context is re-sent
-  const ok = await trySend(context, s, HEARTBEAT, "keep-alive", opts);
-  if (ok) stateFor(s.id).spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;
+  const st = stateFor(s.id);
+  const text = core.keepAliveText(st.lastKeepAlive);
+  const ok = await trySend(context, s, text, "keep-alive", opts);
+  if (ok) st.lastKeepAlive = text;
+  if (ok) st.spent += s.cost ? s.cost.heartbeat + (cold ? s.cost.missExtra : 0) : 0;
   return ok;
 }
 
@@ -660,7 +663,7 @@ async function decide(context) {
     // real message from you (not one of ours) brings the default behaviour back.
     if (st.windowFor !== s.cacheFrom) {
       st.windowFor = s.cacheFrom;
-      if (!s.lastUserText.startsWith(core.MARKER) && ["ignore", "done"].includes(st.mode)) {
+      if (!core.isOwnMessage(s.lastUserText) && ["ignore", "done"].includes(st.mode)) {
         st.mode = "ask"; st.spent = 0;
       }
     }

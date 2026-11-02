@@ -10,6 +10,34 @@
 const path = require("path");
 
 const MARKER = "[cache-keeper]";
+// Keep-alive wordings, one picked at random each time so they don't all read the same. All short
+// (about the same tokens as before) and all ask for a bare "OK" with no tools. Cache Keeper knows
+// its own keep-alives by exact match against this list, so it still tells them apart from what
+// you type, even after a restart. Only add to the list: removing one would make its past uses
+// in old logs look like your own messages.
+const KEEPALIVES = [
+  "Stepping away for a few minutes. Just reply OK, no tools needed.",
+  "Back shortly. Please reply with only OK and don't run any tools.",
+  "Taking a short break. Reply OK only, no tools.",
+  "Away for a moment. Answer with just OK, without using tools.",
+  "Pausing here for a bit. Only reply OK, no tool calls.",
+  "Be right back. Reply with OK and nothing else, no tools.",
+  "Quick break, I'll continue soon. Just say OK, don't use tools.",
+  "Hold on, I'm away for a few minutes. Reply only OK, no tools.",
+  "Give me a moment. Please answer just OK, no tools.",
+  "I'll be back in a bit. Reply OK, nothing more, no tools.",
+  "Short pause on my side. Just OK please, no tools.",
+  "One moment, I'm stepping out. Reply only with OK, no tools.",
+];
+const KEEPALIVE_SET = new Set(KEEPALIVES);
+/** A keep-alive wording, never the same as `previous` (when given). */
+function keepAliveText(previous, rand = Math.random) {
+  const pool = KEEPALIVES.filter(t => t !== previous);
+  return pool[Math.min(pool.length - 1, Math.floor(rand() * pool.length))];
+}
+function isKeepAlive(text) { return KEEPALIVE_SET.has(String(text || "").trim()); }
+/** Sent by Cache Keeper, not typed by you: a keep-alive, or a tagged message (summary, old keep-alives). */
+function isOwnMessage(text) { const t = String(text || "").trim(); return t.startsWith(MARKER) || KEEPALIVE_SET.has(t); }
 // Cache lifetimes are not in Copilot's price sheet. Copilot CLI logs them (cacheTtlSeconds);
 // these defaults are what it reported, used when nothing better is known.
 const DEFAULT_TTLS = [["claude", 300], ["gpt-6.1-sol", 1800]];
@@ -148,7 +176,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   const credits = calls.reduce((s, c) => s + (c.attrs.copilotUsageNanoAiu || 0), 0) / 1e9;
   const userMessages = events.filter(e => e.type === "user_message");
   const lastUser = userMessages[userMessages.length - 1];
-  const isOurs = u => String((u.attrs && u.attrs.content) || "").startsWith(MARKER);
+  const isOurs = u => isOwnMessage(u.attrs && u.attrs.content);
   // Busy: a turn is still open. Turns nest (a subagent logs its own turn_start/turn_end inside the
   // agent's turn), so count depth rather than comparing the last start with the last end; a message
   // sent after everything closed also counts (its turn_start may not be logged yet). (Not "the log
@@ -323,6 +351,6 @@ function fmt(credits) {
 
 module.exports = {
   summaryPays,
-  MARKER, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
+  MARKER, KEEPALIVES, keepAliveText, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
 };

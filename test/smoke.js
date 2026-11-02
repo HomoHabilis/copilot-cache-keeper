@@ -319,7 +319,7 @@ const never = () => new Promise(() => {});
       const startedCall = h.cacheFrom;
       await h.run(300, () => h.sent.length > 0);
       assert.strictEqual(h.sent.length, 1, "one keep-alive sent");
-      assert.ok(h.sent[0].text.startsWith("[cache-keeper] Keep-alive"), h.sent[0].text);
+      assert.ok(core.isKeepAlive(h.sent[0].text), h.sent[0].text);
       const leftAtSend = 300 - (h.sent[0].at - startedCall) / 1000;
       // 5 s lead + 3 s margin until the clock offset is measured, decided once per second
       assert.ok(leftAtSend > 1.5 && leftAtSend <= 9, `sent with ${leftAtSend.toFixed(1)} s left`);
@@ -346,7 +346,7 @@ const never = () => new Promise(() => {});
       for (let k = 0; k < 6; k++) {
         const from = h.cacheFrom, n = h.sent.length;
         await h.run(300, () => h.sent.length > n);
-        if (h.sent.length === n || !h.sent[n].text.includes("Keep-alive")) break;
+        if (h.sent.length === n || !core.isKeepAlive(h.sent[n].text)) break;
         left.push(300 - (h.sent[n].at - from) / 1000);
       }
       assert.ok(left.length >= 3, `${left.length} keep-alives`);
@@ -369,6 +369,32 @@ const never = () => new Promise(() => {});
     }
   });
 
+  await check("keep-alive wording: varies, never twice in a row, short, recognised as ours", () => {
+    assert.ok(core.KEEPALIVES.length >= 10);
+    for (const t of core.KEEPALIVES) {
+      assert.ok(t.length <= 80 && /\bOK\b/.test(t) && /no tool|without using tools|don't (run|use) any tools|don't use tools/i.test(t), t);
+      assert.ok(!t.includes(core.MARKER), t);
+      assert.ok(core.isKeepAlive(t) && core.isOwnMessage(t) && core.isOwnMessage(` ${t}\n`));
+    }
+    let prev;
+    for (let i = 0; i < 200; i++) { const t = core.keepAliveText(prev); assert.notStrictEqual(t, prev); prev = t; }
+    assert.strictEqual(core.keepAliveText(undefined, () => 0.9999), core.KEEPALIVES[core.KEEPALIVES.length - 1]);
+    assert.ok(core.isOwnMessage("[cache-keeper] Keep-alive while I'm away."), "old tagged keep-alives still ours");
+    assert.ok(!core.isOwnMessage("OK, stepping away. Just reply OK, no tools needed. Then fix the parser"));
+  });
+
+  await check("analyze: an untagged keep-alive is not counted as your message", () => {
+    const t0 = Date.now() - 60000;
+    const ev = chatLog(t0, { ctx: 150000 }).trim().split("\n").map(l => JSON.parse(l));
+    ev.push({ type: "user_message", ts: t0 + 9000, attrs: { content: core.KEEPALIVES[3] } },
+            { type: "turn_start", ts: t0 + 9010 },
+            { type: "llm_request", ts: t0 + 9050, dur: 800, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+              inputTokens: 150900, cachedTokens: 150000, outputTokens: 4, copilotUsageNanoAiu: 3.5e9 } },
+            { type: "turn_end", ts: t0 + 10000 });
+    const s = core.analyze("/x", ev.map(e => JSON.stringify(e)).join("\n") + "\n", MODELS, Date.now());
+    assert.strictEqual(s.lastRealUserTs, t0, "your last message is still the real one");
+  });
+
   await check("send: not submitted if the agent starts working while the chat tab opens", async () => {
     const h = await harness({ answer: () => "Auto keep warm", busyOnOpen: true });
     try {
@@ -383,7 +409,7 @@ const never = () => new Promise(() => {});
       await h.run(700);
       assert.strictEqual(h.warnings.length, 2, "warned again after Keep warm once");
       assert.strictEqual(h.sent.length, 2, "keep-alive, then the closing summary");
-      assert.ok(h.sent[0].text.includes("Keep-alive") && h.sent[1].text.includes("handoff summary"));
+      assert.ok(core.isKeepAlive(h.sent[0].text) && h.sent[1].text.includes("handoff summary"));
     } finally { h.close(); }
   });
 
@@ -401,7 +427,7 @@ const never = () => new Promise(() => {});
     try {
       await h.run(700);
       assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text.slice(0, 40)).join(" | "));
-      assert.ok(h.sent[0].text.includes("Keep-alive"));
+      assert.ok(core.isKeepAlive(h.sent[0].text));
     } finally { h.close(); }
   });
 
@@ -458,7 +484,7 @@ const never = () => new Promise(() => {});
       const h = await harness({ answer: never, settings: { noResponseAction: old } });
       try {
         await h.run(700);
-        assert.strictEqual(h.sent.filter(x => x.text.includes("Keep-alive")).length, 0, `${old}: no keep-alive`);
+        assert.strictEqual(h.sent.filter(x => core.isKeepAlive(x.text)).length, 0, `${old}: no keep-alive`);
         assert.strictEqual(h.warnings.length, 1, "no warning after it was ignored");
         assert.ok(!h.warnings[0].msg.includes("kept warm") && !h.warnings[0].msg.includes("keep-alive is sent"), h.warnings[0].msg);
       } finally { h.close(); }
@@ -473,10 +499,10 @@ const never = () => new Promise(() => {});
       let red = false;
       await h.run(300 * 30, () => {
         red = red || (h.status.backgroundColor || {}).id === "statusBarItem.errorBackground";
-        return h.sent.some(x => !x.text.includes("Keep-alive"));
+        return h.sent.some(x => !core.isKeepAlive(x.text));
       });
       assert.ok(red, "status bar turns red while auto keep warm runs");
-      const alives = h.sent.filter(x => x.text.includes("Keep-alive"));
+      const alives = h.sent.filter(x => core.isKeepAlive(x.text));
       assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "ends with a summary");
       assert.ok(alives.length >= 3, `${alives.length} keep-alives`);
       // estimate at each send, as the extension counted it: under the cap, and one more would not fit
@@ -491,10 +517,10 @@ const never = () => new Promise(() => {});
   await check("auto keep warm at its cap: choosing Auto keep warm again starts a new cap", async () => {
     const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : n === 2 ? "Auto keep warm" : never() });
     try {
-      await h.run(300 * 60, () => h.sent.some(x => !x.text.includes("Keep-alive")));
+      await h.run(300 * 60, () => h.sent.some(x => !core.isKeepAlive(x.text)));
       const capAt = h.warnings[1].at;
       assert.ok(h.warnings[2] && h.warnings[2].msg.includes("cap"), "warned again at the new cap");
-      assert.ok(h.sent.filter(x => x.at > capAt && x.text.includes("Keep-alive")).length >= 3, "kept going after the cap");
+      assert.ok(h.sent.filter(x => x.at > capAt && core.isKeepAlive(x.text)).length >= 3, "kept going after the cap");
       assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "summary at the second cap");
     } finally { h.close(); }
   });
