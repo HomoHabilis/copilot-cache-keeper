@@ -6,11 +6,16 @@ call, and how long depends on the model: for example, **Opus 5.5 has a 5-minute 
 while **Sol 6.1 has 30 minutes**. After that, your next message re-sends the whole context at
 full price.
 
+It works with both kinds of Copilot chat in VS Code, also when you mix them in one window:
+**Local** (VS Code's own agent) and **Copilot** (the Copilot SDK harness, run by the Agent Host).
+See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
+
 ## What it does
 
 - **Status bar:** the countdown for the chat where you last typed, for example `cache 3:12 +1`
   (`+1` = one more chat managed in this window). Click it to see the chats in the window (all
-  warm ones plus the most recently expired, at most 10), each with its live countdown, model,
+  warm ones plus the most recently expired, `cacheKeeper.expiredChats`, default 1), each marked
+  Local or Copilot SDK, with its live countdown, model,
   context, cost if it expires and spend so far. Pick one to choose what happens to it.
   - **While the agent works** (including subagents and long terminal commands), it shows
     `agent working · cache 2:41` and never sends anything into that chat: a message would be
@@ -72,8 +77,9 @@ full price.
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
 - **Status-bar list order:** the chat where you last typed first (marked "where you last
-  typed"), then the other warm or working chats by soonest expiry, then the latest expired chat
-  and any with a handoff summary ready.
+  typed"), then the other warm or working chats by soonest expiry, then the latest expired chats
+  (`cacheKeeper.expiredChats`, default 1) and any with a handoff summary ready. Only chats active
+  within `cacheKeeper.lookbackHours` (default 3) are read at all, so older ones are never listed.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
   Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
@@ -82,7 +88,8 @@ full price.
 - **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
   since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
-  it found and why each one is or isn't in the list. Start there when a chat gets no warning.
+  it found, Local and Copilot SDK (last 7 days), and why each one is or isn't in the list. For an
+  SDK chat it also shows the URI it would be opened by. Start there when a chat gets no warning.
 - **Every new cache window** (each time you or the agent sends something) brings the warning back,
   as long as you answered the last one. After Ignore, a summary, or a warning you closed or left
   unanswered, it comes back only once you send a real message yourself.
@@ -128,14 +135,24 @@ full price.
   Nothing in the code is model-specific.
 - **Unknown prices:** if a model isn't in the sheet, Cache Keeper shows no costs and never acts on
   its own.
-- **Cache lifetimes** vary by model and aren't in the price sheet. They're learned from Copilot
-  CLI logs (`cacheTtlSeconds` in `~/.copilot/session-state/*/events.jsonl` on the machine where
-  Copilot runs, newest 30 sessions, newest wins, rechecked every 30 min), so a lifetime Copilot
-  changes server side is picked up once you have used that model in Copilot CLI. Otherwise the
-  defaults are 300 s for Claude models, 1800 s for Sol 6.1 and 300 s for anything else, and
-  `cacheKeeper.ttlSeconds` overrides them per model id. The Output panel logs the learned values
-  when they change, and the status-bar tooltip and diagnostics show each chat's lifetime and where
-  it came from (setting, Copilot CLI log or default). The countdown starts when the last
+- **Cache lifetimes** vary by model and aren't in the price sheet. In order:
+  1. `cacheKeeper.ttlSeconds`, per model id, if you set it.
+  2. **Copilot SDK chats:** the chat's own log, which states each call's cache expiry exactly.
+  3. **Copilot CLI and Copilot SDK logs:** `cacheTtlSeconds` in `~/.copilot/session-state/*/events.jsonl`,
+     on Windows and on the window's remote side (newest 30 sessions, newest wins, rechecked every
+     30 min). Using a model once in a Copilot SDK chat (or Copilot CLI) teaches it to Local chats too.
+  4. **Measured in your Local chats:** Local chat logs don't state lifetimes, but a call that still
+     hit the cache after a pause of N seconds proves it lasts at least N. Only proofs where the
+     cache covered the chat's own conversation count (not just the shared system prompt, which
+     another chat may keep warm), timed from the previous call of that model of any kind (title and
+     summary calls also refresh it). The longest proof per model is kept for 30 days across windows.
+     It only ever lengthens the default (rounded down to the minute, and only when more than 60 s
+     longer): a cache miss can have other causes, so it never shortens it. On real logs this gives
+     for example `kimi-k2.7-code` 1080 s, while Claude models stay at 300 s.
+  5. Defaults: 300 s for Claude models, 1800 s for Sol 6.1, 300 s for anything else.
+
+  The Output panel logs the learned values when they change, and the status-bar tooltip and
+  diagnostics show each chat's lifetime and where it came from. The countdown starts when the last
   model call started, since that is when the cache was refreshed. (Your message comes earlier, but
   every call of an agent turn refreshes the cache, so counting from the message would send
   keep-alives far too early on long turns.)
@@ -164,6 +181,53 @@ full price.
   It applies only to chats that already pass `minCredits`. Costs are still shown in credits.
 - **No settings changes:** it never changes mode or model, since either would invalidate the
   cache.
+
+## Local and Copilot SDK chats
+
+VS Code offers several harnesses in the Chat view. Cache Keeper handles two of them:
+
+- **Local**: VS Code's own agent. Its chats are logged per workspace in the Agent Debug Log
+  (`workspaceStorage/<id>/GitHub.copilot-chat/debug-logs/<chat>/`).
+- **Copilot** (Copilot SDK, "runs in the Agent Host"): these chats don't write the Agent Debug Log.
+  Each one has a folder `~/.copilot/session-state/<id>/` (`events.jsonl`, `workspace.yaml` with
+  `client_name: vscode-agent-host`) on the machine the window runs on: the WSL distro, SSH host or
+  container for a remote window, Windows for a local one. Copilot CLI sessions share that folder
+  and are left out.
+
+Claude and Codex harness chats are not tracked (they don't run through Copilot's billing).
+
+| Feature | Local | Copilot SDK |
+|---|---|---|
+| Found and listed | Agent Debug Log of this workspace | `~/.copilot/session-state` on the window's side, chats whose folder is open in this window (see below) |
+| Countdown | last call's start + lifetime | the chat's own log gives the exact expiry |
+| Cache lifetime | setting, else Copilot CLI/SDK logs, else measured, else default | setting, else the chat's own log |
+| Costs (keep-alive, expiry, summary, new chat) | price sheet (`models.json`), write price calibrated from billed calls | per-token prices Copilot billed this chat (`tokenDetails`), exact |
+| Credits spent so far | `copilotUsageNanoAiu` per call | `totalNanoAiu` per call |
+| "Agent working" (never sends then) | open turns in the log | open assistant turns, a waiting message, or the few ms between two turns |
+| Warnings, Keep warm, Auto keep warm, Summarize, Ignore | yes | yes |
+| Sending into the right chat | `vscode-chat-session://local/<id>` | `agent-host-copilotcli:/<VS Code id>`, looked up in `agent-host.db` |
+| Checking the message landed, tab cleanup | yes | yes |
+| Handoff summary, New chat from handoff | yes | yes (the new chat opens in the harness the Chat view is set to) |
+| Language of keep-alives and summaries | yes | yes |
+| Lifetime evidence for other chats | measured lower bound | exact value, also used for Local chats of the same model |
+
+**Which window acts on an SDK chat.** Local chats are stored per workspace, so only their window
+sees them. SDK chats are stored per machine, so every window on that machine reads all of them:
+
+- A chat started in a folder belongs to the window that has that folder open (its working folder
+  or git root is the folder or inside it). Other windows leave it alone.
+- A chat started without a folder (`~/.copilot/chats/<id>`) can be opened from any window on that
+  machine. The first window to see it takes it, with a small claim file in Cache Keeper's global
+  storage that it refreshes every 5 s. If that window closes, another takes over 20 s later.
+
+**How an SDK chat is opened.** Its log folder id is not the id VS Code opens it by. The link is in
+VS Code's `agent-host.db` (`chats_v2`: `owner_session_uri` `copilotcli:/<VS Code id>`,
+`provider_data.sdkSessionId` = the log folder id), next to the window's side `globalStorage`
+(`%APPDATA%\Code\User\globalStorage` locally, `~/.vscode-server/data/User/globalStorage` in WSL
+or SSH). Cache Keeper reads it with a small built-in SQLite reader (read-only, including the
+`-wal` file) only when it needs to send. If the chat isn't there yet, nothing is sent and the
+output log says why. Tested live with VS Code 1.142: the opened tab is the right chat, the message
+lands in its log, and the cache is hit (33,461 of 33,531 tokens).
 
 ## Install
 
@@ -228,6 +292,8 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.keepAliveJitterPercent` | 5 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
+| `cacheKeeper.expiredChats` | 1 | How many expired chats the status-bar list keeps (most recent first) |
+| `cacheKeeper.lookbackHours` | 3 | Read chats whose log changed within this many hours; older ones are never listed |
 
 ## Build from source
 

@@ -208,38 +208,67 @@ function summaryWords(stats, max = Infinity) {
   return Math.max(150, Math.min(Math.round(Math.min(1500, w) / 50) * 50, Math.floor(max / 50) * 50));
 }
 
-let learnedTtls = {};          // model id -> seconds, from Copilot CLI logs
+let learnedTtls = {};          // model id -> seconds, from Copilot CLI / Copilot SDK logs
+let measuredTtls = {};         // model id -> seconds the cache was seen to last, from Local chat logs
 
 /**
- * Read cacheTtlSeconds per model from the newest `maxFiles` Copilot CLI sessions under `home`.
+ * Read cacheTtlSeconds per model from the newest `maxFiles` sessions under ~/.copilot/session-state
+ * of each source ({ io, home }): Copilot CLI sessions and VS Code's Copilot SDK chats both log it.
  * A newer session wins for the same model. Values learned earlier stay until a session says
  * otherwise, so a model doesn't fall back to the default when its session gets old.
- * Returns { ttls, dir, files }: what is known now, where it looked, and how many logs it read.
+ * Returns { ttls, dirs, files }: what is known now, where it looked, and how many logs it read.
+ * (Older signature learnTtls(io, home, maxFiles) still works.)
  */
-async function learnTtls(io = nodeIo, home = require("os").homedir(), maxFiles = 30) {
-  const dir = io.join(home, ".copilot", "session-state");
+async function learnTtls(sources = nodeIo, home = require("os").homedir(), maxFiles = 30) {
+  if (!Array.isArray(sources)) sources = [{ io: sources, home }];
   const re = /"modelId":"([^"]+)","cacheExpiresAt":"[^"]*","cacheTtlSeconds":(\d+)/g;
-  const logs = [];
-  for (const n of await io.list(dir)) {
-    const f = io.join(dir, n, "events.jsonl");
-    const st = await io.stat(f);
-    if (st) logs.push({ f, mtime: st.mtime });
+  const logs = [], dirs = [];
+  for (const { io, home: h } of sources) {
+    const dir = io.join(h, ".copilot", "session-state");
+    dirs.push(dir);
+    for (const n of await io.list(dir)) {
+      const f = io.join(dir, n, "events.jsonl");
+      const st = await io.stat(f);
+      if (st) logs.push({ io, f, mtime: st.mtime });
+    }
   }
   logs.sort((a, b) => a.mtime - b.mtime);     // oldest first: newer sessions overwrite older ones
   const found = {};
-  for (const { f } of logs.slice(-maxFiles)) {
+  for (const { io, f } of logs.slice(-maxFiles)) {
     const text = await io.readText(f);
     if (text) for (const m of text.matchAll(re)) found[m[1]] = Number(m[2]);
   }
   learnedTtls = { ...learnedTtls, ...found };
-  return { ttls: { ...learnedTtls }, dir, files: Math.min(logs.length, maxFiles) };
+  return { ttls: { ...learnedTtls }, dir: dirs.join(", "), dirs, files: Math.min(logs.length, maxFiles) };
 }
 
-/** Where a model's cache lifetime comes from: "setting", "Copilot CLI log" or "default". */
+/**
+ * Lifetimes measured in Local chats: model -> longest gap (s) after which the cache was still hit.
+ * Local chat logs don't say how long the cache lasts, but a hit after N seconds proves it lasts at
+ * least N. Used only when no setting or Copilot log gives the exact value, and only to lengthen the
+ * built-in default (rounded down to the minute): a miss proves nothing (compaction, a tool list
+ * change, a different prefix), so it never shortens it.
+ */
+const MEASURED_MARGIN = 60;    // a hit must beat the default by this much (call latency adds a few s)
+function setMeasuredTtls(gaps) {
+  measuredTtls = {};
+  for (const [model, gap] of Object.entries(gaps || {})) {
+    if (gap > defaultTtl(model) + MEASURED_MARGIN) measuredTtls[model] = Math.floor(gap / 60) * 60;
+  }
+  return { ...measuredTtls };
+}
+
+function defaultTtl(model) {
+  const hit = DEFAULT_TTLS.find(([prefix]) => (model || "").startsWith(prefix));
+  return hit ? hit[1] : UNKNOWN_TTL;
+}
+
+/** Where a model's cache lifetime comes from. */
 function ttlSource(model, overrides = {}) {
   model = model || "";
   if (overrides[model]) return "setting";
-  if (learnedTtls[model]) return "Copilot CLI log";
+  if (learnedTtls[model]) return "Copilot CLI/SDK log";
+  if (measuredTtls[model]) return "measured in your chats";
   return "default";
 }
 
@@ -247,8 +276,35 @@ function ttlFor(model, overrides = {}) {
   model = model || "";
   if (overrides[model]) return overrides[model];
   if (learnedTtls[model]) return learnedTtls[model];
-  const hit = DEFAULT_TTLS.find(([prefix]) => model.startsWith(prefix));
-  return hit ? hit[1] : UNKNOWN_TTL;
+  if (measuredTtls[model]) return measuredTtls[model];
+  return defaultTtl(model);
+}
+
+/**
+ * Longest proven cache lifetime per model in one Local chat: the gap between a model call and the
+ * previous call of the same model (any kind: title or summary calls also refresh the cache), when
+ * the cache still covered this chat's own conversation, not just the shared system prompt and tools
+ * another chat may have kept warm: at least 5k tokens of its own, and at least 80% of them cached.
+ */
+function provenGaps(events, calls) {
+  const out = {};
+  if (calls.length < 2) return out;
+  const base = calls[0].attrs.inputTokens || 0;
+  const all = events.filter(e => e.type === "llm_request" && e.ts).sort((a, b) => a.ts - b.ts);
+  for (let i = 1; i < calls.length; i++) {
+    const a0 = calls[i - 1].attrs, a1 = calls[i].attrs, model = a1.model;
+    if (!model || a0.model !== model) continue;
+    const prev = a0.inputTokens || 0, cached = a1.cachedTokens || 0, own = prev - base;
+    if (own < 5000 || cached < base + 0.8 * own || cached < 0.9 * prev) continue;
+    let last = calls[i - 1].ts;
+    for (const e of all) {
+      if (e.ts >= calls[i].ts) break;
+      if (e.attrs && e.attrs.model === model) last = Math.max(last, e.ts);
+    }
+    const gap = Math.round((calls[i].ts - last) / 1000);
+    if (gap > (out[model] || 0)) out[model] = gap;
+  }
+  return out;
 }
 
 function parseJsonl(text) {
@@ -308,6 +364,44 @@ function billedWriteRate(calls, sheet) {
   return recent.length ? recent[Math.floor((recent.length - 1) / 2)] : null;
 }
 
+/**
+ * The cost of each option for a chat, from its per-token rates (`r` at the current context size,
+ * `fresh` for a new chat's first prompt). Also returns the handoff summary length it priced.
+ */
+function priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats) {
+  let words = summaryWords(stats);
+  const hit = ctx * r.read;
+  const missExtra = ctx * r.write - hit;
+  const perWord = TOKENS_PER_WORD * (r.out + r.write);
+  if (perWord > 0) words = summaryWords(stats, (SUMMARY_MAX_SHARE * missExtra - SUMMARY_CALLS * hit) / perWord);
+  return {
+    words,
+    cost: {
+      heartbeat: hit + heartbeatNew * r.write + HEARTBEAT_OUT * r.out,
+      missExtra,                                     // what letting the cache expire adds to the next message
+      summary: SUMMARY_CALLS * hit + words * perWord,
+      restart: (firstCtx + words * TOKENS_PER_WORD) * fresh.write, // first message of a new chat built from the summary
+    },
+  };
+}
+
+/**
+ * Tokens a keep-alive adds uncached besides the agent's last reply, learned from this chat's
+ * earlier keep-alives (`pairs`: [{ input, cached, prevOut }] for the call right after each one).
+ */
+function keepAliveFixedPart(pairs) {
+  const fixedParts = [];
+  for (const p of pairs) {
+    // a keep-alive sent after the cache expired re-sent everything: says nothing about a warm one
+    if (p.cached < p.input / 2) continue;
+    fixedParts.push(Math.max(0, p.input - p.cached - p.prevOut));
+  }
+  const recent = fixedParts.slice(-5).sort((x, y) => x - y);
+  // floor: the previous "reply" can include reasoning tokens that never enter the context, which
+  // would make the learned fixed part look smaller than it is
+  return recent.length ? Math.max(KEEPALIVE_MIN_NEW, recent[Math.floor(recent.length / 2)]) : KEEPALIVE_NEW;
+}
+
 /** State of one chat from its log text, or null if it has no agent call yet. Pure. */
 function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
   const events = parseJsonl(mainText);
@@ -362,21 +456,14 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
   // Learn only the fixed part (what a keep-alive added minus the agent's reply just before it), then
   // add the current last reply: a keep-alive after a long answer adds more than one after "OK".
-  const fixedParts = [];
+  const pairs = [];
   for (const u of userMessages.filter(isOurs)) {
     const i = calls.findIndex(c => c.ts >= u.ts);
     if (i <= 0) continue;
-    const input = calls[i].attrs.inputTokens || 0, cached = calls[i].attrs.cachedTokens || 0;
-    // a keep-alive sent after the cache expired re-sent everything: says nothing about a warm one
-    if (cached < input / 2) continue;
-    const uncached = input - cached;
-    fixedParts.push(Math.max(0, uncached - (calls[i - 1].attrs.outputTokens || 0)));
+    pairs.push({ input: calls[i].attrs.inputTokens || 0, cached: calls[i].attrs.cachedTokens || 0,
+                 prevOut: calls[i - 1].attrs.outputTokens || 0 });
   }
-  const recent = fixedParts.slice(-5).sort((x, y) => x - y);
-  // floor: the previous "reply" can include reasoning tokens that never enter the context, which
-  // would make the learned fixed part look smaller than it is
-  const fixedNew = recent.length ? Math.max(KEEPALIVE_MIN_NEW, recent[Math.floor(recent.length / 2)]) : KEEPALIVE_NEW;
-  const heartbeatNew = fixedNew + (a.outputTokens || 0);
+  const heartbeatNew = keepAliveFixedPart(pairs) + (a.outputTokens || 0);
   const sheet = modelsText ? priceSheetFrom(modelsText, model) : null;
   let cost = null;                                   // null = price unknown for this model
   let billedWrite = null;
@@ -388,16 +475,7 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     const scale = r0 => billedWrite === null ? r0 : { ...r0, write: billedWrite };
     const r = scale(rates(sheet, ctx));              // tier that applies at the current context size
     const fresh = scale(rates(sheet, firstCtx));
-    const hit = ctx * r.read;
-    const missExtra = ctx * r.write - hit;
-    const perWord = TOKENS_PER_WORD * (r.out + r.write);
-    if (perWord > 0) words = summaryWords(stats, (SUMMARY_MAX_SHARE * missExtra - SUMMARY_CALLS * hit) / perWord);
-    cost = {
-      heartbeat: hit + heartbeatNew * r.write + HEARTBEAT_OUT * r.out,
-      missExtra,                                     // what letting the cache expire adds to the next message
-      summary: SUMMARY_CALLS * hit + words * perWord,
-      restart: (firstCtx + words * TOKENS_PER_WORD) * fresh.write, // first message of a new chat built from the summary
-    };
+    ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
   }
   const firstReal = userMessages.find(u => !isOurs(u));
   // The language for Cache Keeper's own messages: Copilot's recent answers (it already answers in
@@ -407,8 +485,8 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     ...userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || ""))]);
   const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
   return {
-    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), dir, model, ctx, ttl, ttlFrom, lastEnd, busy, credits,
-    cost, stats, summaryWords: words, billedWrite, lang,
+    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind: "local", dir, model, ctx, ttl, ttlFrom, lastEnd, busy, credits,
+    cost, stats, summaryWords: words, billedWrite, lang, hitGaps: provenGaps(events, calls),
     // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
     cacheFrom: last.ts,
     remaining: ttl - (now - last.ts) / 1000,
@@ -418,6 +496,14 @@ function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {})
     // Last message you typed yourself (not one of ours): tells whether a handoff is still current.
     lastRealUserTs: Math.max(0, ...userMessages.filter(u => !isOurs(u)).map(u => u.ts || 0)),
   };
+}
+
+/** provenGaps() of a whole Local chat log, without the rest of analyze(). */
+function gapsFromLog(mainText) {
+  const events = parseJsonl(mainText);
+  const calls = events.filter(e => e.type === "llm_request" && e.attrs &&
+    String(e.attrs.debugName || "").startsWith("panel/") && "inputTokens" in e.attrs).sort((a, b) => a.ts - b.ts);
+  return provenGaps(events, calls);
 }
 
 async function readSession(io, dir, now = Date.now(), ttlOverrides = {}) {
@@ -459,6 +545,167 @@ async function readSessions(io, root, now = Date.now(), maxAgeMs = 3 * 3600 * 10
     else if (skipped) skipped.push({ id: n, why: "no agent model call recognised: " + describeLog(await io.readText(io.join(dir, "main.jsonl"))) });
   }
   return out.sort((x, y) => y.lastEnd - x.lastEnd);
+}
+
+// ---------------------------------------------------------------- Copilot SDK chats
+// VS Code's "Copilot" harness (Copilot SDK, run by the Agent Host) does not write the Agent Debug
+// Log. Each chat has a folder ~/.copilot/session-state/<id>/ on the machine the window runs on
+// (WSL, SSH host, container, or Windows for a local window), with events.jsonl (Copilot CLI's
+// format) and workspace.yaml (client_name: vscode-agent-host). Copilot CLI sessions share the
+// folder; they are not VS Code chats and are left out.
+
+const SDK_EDIT_TOOLS = /^(apply_patch|create|edit|str_replace|str_replace_editor|write|write_file|create_file|insert)$/i;
+
+/** Simple `key: value` lines of workspace.yaml (enough for id, cwd, git_root, client_name, ...). */
+function parseYamlFlat(text) {
+  const out = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const m = /^([a-z_]+):\s?(.*)$/.exec(line);
+    if (m && !/^[|>]/.test(m[2])) out[m[1]] = m[2].replace(/^"(.*)"$/, "$1").trim();
+  }
+  return out;
+}
+
+/** Per-token credits from a usage record's tokenDetails, or null when it carries none. */
+function sdkRates(u) {
+  const d = u && u.copilotUsage && u.copilotUsage.tokenDetails;
+  if (!Array.isArray(d) || !d.length) return null;
+  const per = {};
+  for (const t of d) if (t.batchSize) per[t.tokenType] = t.costPerBatch / t.batchSize / 1e9;
+  return per;
+}
+
+/** A user message's text as typed: a message sent while the agent works gets a <reminder> appended. */
+function sdkUserText(e) {
+  return String((e.data && e.data.content) || "").replace(/\n*<reminder>[\s\S]*$/, "").trim();
+}
+
+/** State of one Copilot SDK chat from its events.jsonl, same shape as analyze(). Null without a call. */
+function analyzeSdk(dir, eventsText, yaml = {}, now = Date.now(), ttlOverrides = {}) {
+  const events = parseJsonl(eventsText).map(e => ({ ...e, ts: Date.parse(e.timestamp) || 0 }))
+    .sort((x, y) => x.ts - y.ts);
+  const calls = events.filter(e => e.type === "session.usage_record" && e.data && e.data.usage &&
+    typeof e.data.usage.inputTokens === "number");
+  if (!calls.length) return null;
+  const U = c => c.data.usage;
+  const last = calls[calls.length - 1], u = U(last);
+  const model = u.model || "?";
+  const ctx = u.inputTokens;
+  const firstCtx = Math.min(U(calls[0]).inputTokens, 40000);
+  const callStart = c => c.ts - (U(c).duration || 0);
+  // The log says exactly when this chat's cache expires and how long it lasts; a setting still wins.
+  const logTtl = Number(u.cacheTtlSeconds) || 0;
+  const exp = Date.parse(u.cacheExpiresAt || "");
+  const ttl = ttlOverrides[model] || logTtl || ttlFor(model, ttlOverrides);
+  const ttlFrom = ttlOverrides[model] ? "setting" : logTtl ? "this chat's log" : ttlSource(model, ttlOverrides);
+  const cacheFrom = logTtl && exp ? exp - logTtl * 1000 : callStart(last);
+  const credits = calls.reduce((s, c) => s + ((U(c).copilotUsage && U(c).copilotUsage.totalNanoAiu) || 0), 0) / 1e9;
+  const userMessages = events.filter(e => e.type === "user.message");
+  const isOurs = e => isOwnMessage(sdkUserText(e));
+  // Busy: an assistant turn is open (turn_start .. turn_end, several per request: one per model call
+  // and its tools), or a message is waiting for its turn. A stopped request logs "abort". Between
+  // two turns of the same request there are a few ms with none open: right after a turn_end with no
+  // idle checkpoint yet still counts as working.
+  let depth = 0, pendingMsg = false, lastActivity = 0, lastTurnEnd = 0, settled = true;
+  for (const e of events) {
+    const t = e.type;
+    if (t === "assistant.turn_start") { depth++; pendingMsg = false; settled = false; }
+    else if (t === "assistant.turn_end") { depth = Math.max(0, depth - 1); pendingMsg = false; lastTurnEnd = e.ts; }
+    else if (t === "user.message") { pendingMsg = true; settled = false; }
+    else if (t === "abort" || t === "session.shutdown") { depth = 0; pendingMsg = false; settled = true; }
+    else if (t === "session.usage_checkpoint" && !depth) settled = true;
+    if (/^(assistant\.turn_start|assistant\.turn_end|user\.message|session\.usage_record|tool\.execution_(start|complete))$/.test(t)) {
+      lastActivity = Math.max(lastActivity, e.ts);
+    }
+  }
+  const between = !depth && !settled && now - lastTurnEnd < 3000;
+  const busy = (depth > 0 || pendingMsg || between) && now - lastActivity < BUSY_CAP_MS;
+  const realTurns = userMessages.filter(e => !isOurs(e)).length;
+  const compactions = Math.max(Number(yaml.summary_count) || 0,
+    events.filter(e => /compaction_(complete|completed|end)$/.test(e.type)).length);
+  const files = new Set();
+  for (const e of events) {
+    if (e.type !== "tool.execution_start" || !SDK_EDIT_TOOLS.test((e.data && e.data.toolName) || "")) continue;
+    const args = JSON.stringify((e.data && e.data.arguments) || {});
+    for (const m of args.matchAll(/"(?:filePath|path|file)"\s*:\s*"([^"]+)"/g)) files.add(m[1]);
+    for (const m of args.matchAll(/\*\*\* (?:Update|Add|Delete) File: ([^\\\n]+)/g)) files.add(m[1].trim());
+  }
+  const stats = { ctx, turns: realTurns, compactions, files: files.size, calls: calls.length };
+  // Prices: what this chat was billed per token type, from the newest records that have each type.
+  const per = {};
+  for (const c of calls) Object.assign(per, sdkRates(U(c)) || {});
+  const firstPer = { ...per, ...(sdkRates(U(calls[0])) || {}) };
+  const toR = p => p.cache_read === undefined && p.input === undefined ? null
+    : { read: p.cache_read || 0, write: p.cache_write || p.input || 0, out: p.output || 0 };
+  const r = toR(per), fresh = toR(firstPer) || r;
+  const pairs = [];
+  for (const m of userMessages.filter(isOurs)) {
+    const i = calls.findIndex(c => callStart(c) >= m.ts - 1000);
+    if (i <= 0) continue;
+    pairs.push({ input: U(calls[i]).inputTokens || 0, cached: U(calls[i]).cacheReadTokens || 0,
+                 prevOut: U(calls[i - 1]).outputTokens || 0 });
+  }
+  const heartbeatNew = keepAliveFixedPart(pairs) + (u.outputTokens || 0);
+  let cost = null, words = summaryWords(stats);
+  if (r) ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
+  const firstReal = userMessages.find(e => !isOurs(e));
+  const replies = events.filter(e => e.type === "assistant.message").slice(-5)
+    .map(e => String((e.data && e.data.content) || "").slice(0, 4000));
+  const lang = detectLanguage([...replies, ...userMessages.filter(e => !isOurs(e)).slice(-10).map(sdkUserText)]);
+  const title = firstReal ? sdkUserText(firstReal).replace(/\s+/g, " ").trim() : "";
+  const lastUser = userMessages[userMessages.length - 1];
+  return {
+    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind: "sdk", dir, model, ctx, ttl, ttlFrom,
+    lastEnd: last.ts, busy, credits, cost, stats, summaryWords: words, billedWrite: r ? r.write : null, lang, hitGaps: {},
+    cacheFrom,
+    remaining: ttl - (now - cacheFrom) / 1000,
+    lastUserText: lastUser ? sdkUserText(lastUser) : "",
+    lastUserTs: lastUser ? lastUser.ts : 0,
+    title: title.length > 50 ? title.slice(0, 47) + "..." : title,
+    lastRealUserTs: Math.max(0, ...userMessages.filter(e => !isOurs(e)).map(e => e.ts || 0)),
+    cwd: yaml.cwd || "", gitRoot: yaml.git_root || "",
+  };
+}
+
+async function readSdkSession(io, dir, now = Date.now(), ttlOverrides = {}) {
+  const yaml = parseYamlFlat(await io.readText(io.join(dir, "workspace.yaml")));
+  if (yaml.client_name !== "vscode-agent-host") return null;
+  const ev = await io.readText(io.join(dir, "events.jsonl"));
+  return ev === null ? null : analyzeSdk(dir, ev, yaml, now, ttlOverrides);
+}
+
+/**
+ * VS Code Copilot SDK chats under `home`/.copilot/session-state whose log changed in the last
+ * `maxAgeMs`. Which of them belong to this window is decided by the caller (from their cwd).
+ */
+async function readSdkSessions(io, home, now = Date.now(), maxAgeMs = 3 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
+  const root = io.join(home, ".copilot", "session-state");
+  const out = [];
+  for (const n of await io.list(root)) {
+    const dir = io.join(root, n);
+    const st = await io.stat(io.join(dir, "events.jsonl"));
+    if (!st || now - st.mtime > maxAgeMs) continue;
+    const yaml = parseYamlFlat(await io.readText(io.join(dir, "workspace.yaml")));
+    if (yaml.client_name !== "vscode-agent-host") continue;      // a Copilot CLI session
+    const s = analyzeSdk(dir, await io.readText(io.join(dir, "events.jsonl")), yaml, now, ttlOverrides);
+    if (s) out.push(s);
+    else if (skipped) skipped.push({ id: n, why: "Copilot SDK chat with no model call yet" });
+  }
+  return out.sort((x, y) => y.lastEnd - x.lastEnd);
+}
+
+/**
+ * Does an SDK chat belong to this window? Its working folder (or git root) is one of the window's
+ * folders or inside one. Paths compared case-insensitively on Windows. Chats started without a
+ * folder (cwd ~/.copilot/chats/<id>) return "workspaceless": any window on that machine shows them.
+ */
+function sdkChatOwner(s, folders, windows = false) {
+  const norm = p => { let x = String(p || "").replace(/\\/g, "/").replace(/\/+$/, ""); return windows ? x.toLowerCase() : x; };
+  if (/\/\.copilot\/chats\/[^/]+$/.test(norm(s.cwd))) return "workspaceless";
+  for (const p of [s.cwd, s.gitRoot].map(norm).filter(Boolean)) {
+    for (const f of folders.map(norm)) if (p === f || p.startsWith(f + "/")) return "window";
+  }
+  return "";
 }
 
 /**
@@ -522,4 +769,5 @@ module.exports = {
   summaryPays,
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
+  analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
 };

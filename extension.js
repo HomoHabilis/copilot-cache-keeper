@@ -1,11 +1,12 @@
 // Copilot Cache Keeper: warns before a chat's prompt cache expires and offers to keep it warm
-// or to write a handoff summary. Reads Copilot's Agent Debug Logs; never acts on its own below
-// the configured threshold, and only ever sends into the chat shown in the Chat view.
+// or to write a handoff summary. Reads Copilot's Agent Debug Logs (Local chats) and Copilot SDK chat
+// logs; never acts on its own below the configured threshold, and always sends into the intended chat.
 "use strict";
 
 const vscode = require("vscode");
 const path = require("path");
 const core = require("./core");
+const sqlite = require("./sqlite");
 
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
@@ -76,33 +77,47 @@ function goQuiet(st, s, why) {
 
 let remote = null;             // { authority } for a remote window, null for a local one
 let logRootPath = null;        // debug-logs folder of this workspace (a path on the remote side)
-let remoteHome = null;         // home folder on the remote side (for Copilot CLI cache lifetimes)
-const fileCache = new Map();   // path -> { mtime, text }: re-read a log only when it changed
+let remoteHome = null;         // home folder on the remote side (Copilot SDK chats, cache lifetimes)
+let remoteServer = null;       // VS Code server folder on the remote side (agent-host.db)
+const fileCache = new Map();   // "side|path" -> { mtime, text }: re-read a log only when it changed
 
-function toUri(p) {
-  return remote ? vscode.Uri.from({ scheme: "vscode-remote", authority: remote.authority, path: p }) : vscode.Uri.file(p);
-}
-
-const io = {
-  join: (...parts) => remote ? path.posix.join(...parts) : path.join(...parts),
-  async stat(p) {
-    try { const st = await vscode.workspace.fs.stat(toUri(p)); return { mtime: st.mtime }; } catch { return null; }
-  },
-  async readText(p) {
-    const st = await io.stat(p);
-    if (!st) return null;
-    const hit = fileCache.get(p);
-    if (hit && hit.mtime === st.mtime) return hit.text;
-    try {
-      const text = Buffer.from(await vscode.workspace.fs.readFile(toUri(p))).toString("utf8");
-      fileCache.set(p, { mtime: st.mtime, text });
+/**
+ * File access on one side: `remoteSide` true reads where the window's workspace is (WSL, SSH,
+ * container) when the window is remote; false always reads the Windows (UI) side.
+ */
+function makeIo(remoteSide) {
+  const isRemote = () => remoteSide && !!remote;
+  const toUri = p => isRemote() ? vscode.Uri.from({ scheme: "vscode-remote", authority: remote.authority, path: p }) : vscode.Uri.file(p);
+  const self = {
+    toUri,
+    join: (...parts) => isRemote() ? path.posix.join(...parts) : path.join(...parts),
+    async stat(p) {
+      try { const st = await vscode.workspace.fs.stat(toUri(p)); return { mtime: st.mtime }; } catch { return null; }
+    },
+    async readBytes(p) {
+      try { return Buffer.from(await vscode.workspace.fs.readFile(toUri(p))); } catch { return null; }
+    },
+    async readText(p) {
+      const st = await self.stat(p);
+      if (!st) return null;
+      const key = `${isRemote() ? "r" : "l"}|${p}`;
+      const hit = fileCache.get(key);
+      if (hit && hit.mtime === st.mtime) return hit.text;
+      const b = await self.readBytes(p);
+      if (!b) return null;
+      const text = b.toString("utf8");
+      fileCache.set(key, { mtime: st.mtime, text });
       return text;
-    } catch { return null; }
-  },
-  async list(d) {
-    try { return (await vscode.workspace.fs.readDirectory(toUri(d))).map(([name]) => name); } catch { return []; }
-  },
-};
+    },
+    async list(d) {
+      try { return (await vscode.workspace.fs.readDirectory(toUri(d))).map(([name]) => name); } catch { return []; }
+    },
+  };
+  return self;
+}
+const io = makeIo(true);       // the window's side: Copilot's logs and the workspace
+const localIo = makeIo(false); // Windows side: Copilot CLI sessions there, our own lock files
+function toUri(p) { return io.toUri(p); }
 
 /**
  * Find this workspace's Copilot debug-logs folder. Local window: next to our own storage.
@@ -136,9 +151,39 @@ async function locateLogs(context) {
       if (!best || latest > best.latest) best = { dir, latest, server };
     }
   }
-  if (!best) return null;      // no Copilot chat in this workspace yet: try again later
-  remoteHome = best.server.startsWith("/vscode/") ? null : best.server.replace(/\/\.vscode-server(-insiders)?$/, "");
+  if (!best) return null;      // no Local Copilot chat in this workspace yet: try again later
+  remoteServer = best.server;
+  remoteHome = best.server.startsWith("/vscode/") ? remoteHome : best.server.replace(/\/\.vscode-server(-insiders)?$/, "");
   return best.dir;
+}
+
+/**
+ * Where Copilot SDK chats of this window are: ~/.copilot/session-state on the window's side (the
+ * Agent Host runs there: WSL, SSH host, container, or Windows for a local window), and that side's
+ * agent-host.db, which says how VS Code names each chat. Found even before any Local chat exists.
+ */
+async function locateSdk(context) {
+  if (!remote) {
+    return { home: require("os").homedir(),
+             db: context.globalStorageUri ? path.join(path.dirname(context.globalStorageUri.fsPath), "agent-host.db") : null };
+  }
+  let home = remoteHome, server = remoteServer;
+  if (!home) {
+    // the home folder whose Copilot state changed last (the server runs as that user)
+    let best = null;
+    for (const h of ["/root", ...(await io.list("/home")).map(n => `/home/${n}`)]) {
+      const st = await io.stat(`${h}/.copilot/session-state`);
+      if (st && (!best || st.mtime > best.mtime)) best = { h, mtime: st.mtime };
+    }
+    home = best && best.h;
+  }
+  if (!home) return null;
+  if (!server) {
+    for (const s of [`${home}/.vscode-server`, `${home}/.vscode-server-insiders`, "/vscode/vscode-server", "/vscode/vscode-server-insiders"]) {
+      if (await io.stat(`${s}/data/User/globalStorage`)) { server = s; break; }
+    }
+  }
+  return { home, db: server ? `${server}/data/User/globalStorage/agent-host.db` : null };
 }
 
 /** Newest chat log change in a debug-logs folder (0 if none). */
@@ -154,41 +199,134 @@ async function latestActivity(dir) {
 const RELOCATE_MS = 60000;     // look again for a newer sibling storage folder this often
 let locatedAt = 0;
 
+let sdkLoc = null;             // { home, db } for this window's Copilot SDK chats
+function lookbackMs() { return Math.max(1, Number(cfg("lookbackHours")) || 3) * 3600 * 1000; }
+
 async function readAll(context) {
-  if (!logRootPath || Date.now() - locatedAt > RELOCATE_MS) {
+  if (!logRootPath || !sdkLoc || Date.now() - locatedAt > RELOCATE_MS) {
     locatedAt = Date.now();
     const found = await locateLogs(context);
     if (found && found !== logRootPath) {
-      logx(`reading Copilot logs at ${remote ? remote.authority + ":" : ""}${found}`);
+      logx(`reading Copilot Local chat logs at ${remote ? remote.authority + ":" : ""}${found}`);
       logRootPath = found;
-      baseline = null;         // "seen active since start" is judged afresh in the new folder
+      baseline.local = null;   // "seen active since start" is judged afresh in the new folder
+      scanEvidence();
+    }
+    const loc = await locateSdk(context);
+    if (loc && (!sdkLoc || loc.home !== sdkLoc.home || loc.db !== sdkLoc.db)) {
+      sdkLoc = loc;
+      logx(`reading Copilot SDK chats at ${remote ? remote.authority + ":" : ""}${io.join(loc.home, ".copilot", "session-state")}` +
+        (loc.db ? `, chat names from ${loc.db}` : ", agent-host.db not found"));
       learnLifetimes();
     }
   }
-  if (!logRootPath) return [];
-  const skipped = [];
-  const r = await core.readSessions(io, logRootPath, Date.now(), 3 * 3600 * 1000, cfg("ttlSeconds") || {}, skipped);
+  const skipped = [], ttls = cfg("ttlSeconds") || {};
+  const local = logRootPath ? await core.readSessions(io, logRootPath, Date.now(), lookbackMs(), ttls, skipped) : [];
+  const sdkAll = sdkLoc ? await core.readSdkSessions(io, sdkLoc.home, Date.now(), lookbackMs(), ttls, skipped) : [];
+  const sdk = [];
+  for (const s of sdkAll) {
+    const why = await sdkNotMine(s);
+    if (why) noteWhy(s.id, why); else sdk.push(s);
+  }
+  noteEvidence(local);
   // Say once (and again when it changes) why a chat is not in the list.
   for (const k of skipped) noteWhy(k.id, k.why);
-  for (const s of r) noteWhy(s.id, unmanagedWhy(s));
-  return r;
+  for (const s of [...local, ...sdk]) noteWhy(s.id, unmanagedWhy(s));
+  return [...local, ...sdk].sort((x, y) => y.lastEnd - x.lastEnd);
 }
 
-// Cache lifetimes learned from Copilot CLI logs. Logged when they change, so the Output panel
-// says where each countdown's length comes from.
+// ---------------------------------------------------------------- which window acts on an SDK chat
+// Local chats are stored per workspace, so only the window that owns them sees them. Copilot SDK
+// chats are stored per machine: every window on that machine reads all of them. A chat started in a
+// folder belongs to the window that has the folder open. A chat started without a folder can be
+// opened from any of those windows, so exactly one of them takes it: the first to write a small
+// claim file next to our global storage (shared by all windows), refreshed on every read. A window
+// closed or reloaded stops refreshing it and another one takes over 20 s later.
+const windowId = Math.random().toString(36).slice(2, 10);
+const CLAIM_STALE_MS = 20000;
+let claimDir = null;
+
+function windowFolders() {
+  return (vscode.workspace.workspaceFolders || []).map(f => f.uri.scheme === "file" ? f.uri.fsPath : f.uri.path);
+}
+
+/** Why this window leaves an SDK chat alone ("" = it is ours). */
+async function sdkNotMine(s) {
+  const owner = core.sdkChatOwner(s, windowFolders(), !remote && process.platform === "win32");
+  if (owner === "window") return "";
+  if (owner === "") return `Copilot SDK chat in ${s.cwd || "another folder"}, not open in this window`;
+  if (!claimDir) return "";
+  const f = path.join(claimDir, s.id);
+  const now = Date.now();
+  const b = await localIo.readBytes(f);   // never from the cache: other windows rewrite it within the same second
+  const text = b && b.toString("utf8");
+  const [who, at] = String(text || "").split(" ");
+  if (who && who !== windowId && now - Number(at) < CLAIM_STALE_MS) return "Copilot SDK chat without a folder, handled by another window";
+  try { await vscode.workspace.fs.writeFile(vscode.Uri.file(f), Buffer.from(`${windowId} ${now}`)); } catch { return ""; }
+  return "";
+}
+
+// ---------------------------------------------------------------- cache lifetimes
+
+// Cache lifetimes learned from Copilot CLI and Copilot SDK logs, on both sides (the Windows side and
+// the window's remote side). Logged when they change, so the Output panel says where each
+// countdown's length comes from.
 let lifetimesShown = null;
 async function learnLifetimes() {
   try {
-    const r = await core.learnTtls(io, remoteHome || require("os").homedir());
+    const sources = [{ io: localIo, home: require("os").homedir() }];
+    if (remote && sdkLoc) sources.push({ io, home: sdkLoc.home });
+    const r = await core.learnTtls(sources);
     const line = lifetimesLine(r);
     if (line !== lifetimesShown) { lifetimesShown = line; logx(line); }
   } catch (e) { logx("cache lifetimes: " + e.message); }
 }
 function lifetimesLine(r) {
   const known = Object.entries(r.ttls).map(([m, t]) => `${m} ${t} s`).join(", ");
-  return `cache lifetimes from Copilot CLI logs (${r.files} sessions in ${r.dir}): ` +
-    (known || "none, using defaults (Claude 300 s, Sol 6.1 1800 s, other 300 s)") +
-    "; cacheKeeper.ttlSeconds overrides";
+  const measured = Object.entries(core.setMeasuredTtls(evidenceGaps())).map(([m, t]) => `${m} ≥${t} s`).join(", ");
+  return `cache lifetimes from Copilot CLI/SDK logs (${r.files} sessions in ${r.dir}): ` +
+    (known || "none") + (measured ? `; measured in your Local chats: ${measured}` : "") +
+    "; otherwise defaults (Claude 300 s, Sol 6.1 1800 s, other 300 s); cacheKeeper.ttlSeconds overrides";
+}
+
+// Local chat logs don't record cache lifetimes, but a cache hit after a long pause proves a minimum
+// (see core.provenGaps). The longest proof per model is kept across windows and restarts (global
+// state, 30 days) and lengthens the default for models no Copilot log or setting covers.
+const EVIDENCE_KEY = "measuredCacheGaps";
+const EVIDENCE_DAYS = 30;
+let globalState = null;
+function evidence() {
+  const all = (globalState && globalState.get(EVIDENCE_KEY)) || {};
+  const fresh = {};
+  for (const [m, v] of Object.entries(all)) if (v && Date.now() - v.at < EVIDENCE_DAYS * 86400000) fresh[m] = v;
+  return fresh;
+}
+function evidenceGaps() { return Object.fromEntries(Object.entries(evidence()).map(([m, v]) => [m, v.gap])); }
+function noteEvidence(list) {
+  const ev = evidence();
+  let changed = false;
+  for (const s of list) {
+    for (const [m, gap] of Object.entries(s.hitGaps || {})) {
+      // a longer proof replaces the old one; the same proof seen again keeps it from ageing out
+      if (!ev[m] || gap > ev[m].gap || (gap === ev[m].gap && Date.now() - ev[m].at > 86400000)) {
+        ev[m] = { gap, at: Date.now() }; changed = true;
+      }
+    }
+  }
+  if (!changed) return;
+  if (globalState) globalState.update(EVIDENCE_KEY, ev);
+  core.setMeasuredTtls(evidenceGaps());
+  learnLifetimes();            // logs the lifetimes line again if it changed
+}
+/** Once per log folder: look for that evidence in every Local chat of the workspace, not just recent ones. */
+async function scanEvidence() {
+  if (!logRootPath) return;
+  const list = [];
+  for (const n of (await io.list(logRootPath)).slice(-300)) {
+    const b = await io.readBytes(io.join(logRootPath, n, "main.jsonl"));   // not cached: read once
+    if (b) list.push({ hitGaps: core.gapsFromLog(b.toString("utf8")) });
+  }
+  noteEvidence(list);
 }
 
 const whyShown = new Map();    // chat id -> reason last logged for not listing it ("" = listed)
@@ -209,21 +347,45 @@ function unmanagedWhy(s) {
 /** Output panel: every chat folder of this workspace and whether it is tracked. */
 async function diagnose(context) {
   out.show(true);
-  logx(`--- diagnostics: Copilot logs at ${logRootPath ? (remote ? remote.authority + ":" : "") + logRootPath : "(not found yet)"}`);
-  if (!logRootPath) return;
+  const where = p => (remote ? remote.authority + ":" : "") + p;
   lifetimesShown = null;
   await learnLifetimes();
-  const now = Date.now();
-  for (const n of await io.list(logRootPath)) {
-    const dir = io.join(logRootPath, n);
-    const st = await io.stat(io.join(dir, "main.jsonl"));
-    const age = st ? `${Math.round((now - st.mtime) / 60000)} min ago` : "no main.jsonl";
-    const s = st && await core.readSession(io, dir, now, cfg("ttlSeconds") || {});
-    const text = st && !s ? await io.readText(io.join(dir, "main.jsonl")) : null;
-    logx(`${n.slice(0, 8)} (log changed ${age}): ` + (s
-      ? `${describe(s)}, cache lifetime ${s.ttl} s (${s.ttlFrom}), ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, language ${s.lang}, ` +
-        (unmanagedWhy(s) ? `not listed: ${unmanagedWhy(s)}` : "listed")
-      : st ? `not tracked: ${core.describeLog(text)}` : "not tracked"));
+  const now = Date.now(), ttls = cfg("ttlSeconds") || {};
+  const lookback = Math.round(lookbackMs() / 3600000);
+  const line = (s, age) => `${describe(s)}, cache lifetime ${s.ttl} s (${s.ttlFrom}), ` +
+    `${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, language ${s.lang}, ` +
+    (age > lookback * 60 ? `not listed: last active more than cacheKeeper.lookbackHours (${lookback} h) ago`
+      : unmanagedWhy(s) ? `not listed: ${unmanagedWhy(s)}` : "listed");
+  logx(`--- diagnostics: Local chats (Agent Debug Log) at ${logRootPath ? where(logRootPath) : "(none in this workspace yet)"}`);
+  if (logRootPath) {
+    for (const n of await io.list(logRootPath)) {
+      const dir = io.join(logRootPath, n);
+      const st = await io.stat(io.join(dir, "main.jsonl"));
+      const age = st ? Math.round((now - st.mtime) / 60000) : 0;
+      const s = st && await core.readSession(io, dir, now, ttls);
+      const text = st && !s ? await io.readText(io.join(dir, "main.jsonl")) : null;
+      logx(`${n.slice(0, 8)} Local (log changed ${st ? age + " min ago" : "never"}): ` + (s ? line(s, age)
+        : st ? `not tracked: ${core.describeLog(text)}` : "not tracked: no main.jsonl"));
+    }
+  }
+  const sdkRoot = sdkLoc && io.join(sdkLoc.home, ".copilot", "session-state");
+  logx(`--- Copilot SDK chats at ${sdkRoot ? where(sdkRoot) : "(not found)"}` +
+    (sdkLoc ? `, chat names from ${sdkLoc.db || "(agent-host.db not found)"}` : ""));
+  if (!sdkRoot) return;
+  const ids = await sdkIds(true);
+  for (const n of await io.list(sdkRoot)) {
+    const dir = io.join(sdkRoot, n);
+    const st = await io.stat(io.join(dir, "events.jsonl"));
+    if (!st) continue;
+    const yaml = core.parseYamlFlat(await io.readText(io.join(dir, "workspace.yaml")));
+    if (yaml.client_name !== "vscode-agent-host") continue;    // Copilot CLI session
+    const age = Math.round((now - st.mtime) / 60000);
+    if (age > 7 * 24 * 60) continue;                           // keep the list readable
+    const s = await core.readSdkSession(io, dir, now, ttls);
+    const mine = s ? await sdkNotMine(s) : "";
+    const name = s ? sdkVsCodeId(s, ids) : null;
+    logx(`${n.slice(0, 8)} SDK (log changed ${age} min ago, folder ${yaml.cwd || "?"}): ` + (!s ? "no model call yet"
+      : mine ? `not listed: ${mine}` : line(s, age) + (name ? `, opens as agent-host-copilotcli:/${name.slice(0, 8)}` : ", VS Code's name for it not found: can't send into it")));
   }
 }
 
@@ -257,14 +419,22 @@ function describe(s) {
 
 // "Seen active since this window started", without comparing clocks: the chat's last call changed
 // after our first read of the logs, or the chat appeared after it.
-let baseline = null;           // id -> cacheFrom at our first read
+// Kept per kind of chat: Local chats are judged afresh when their log folder moves, SDK chats not.
+let baseline = { local: null, sdk: null };   // kind -> (id -> cacheFrom at our first read)
 function seenLive(s) {
-  if (!baseline) return false;
-  return !baseline.has(s.id) || baseline.get(s.id) !== s.cacheFrom;
+  const b = baseline[s.kind || "local"];
+  if (!b) return false;
+  return !b.has(s.id) || b.get(s.id) !== s.cacheFrom;
 }
 function setAll(r) {
-  if (!baseline && logRootPath) baseline = new Map(r.map(x => [x.id, x.cacheFrom]));
+  if (!baseline.local && logRootPath) baseline.local = new Map(r.filter(x => x.kind !== "sdk").map(x => [x.id, x.cacheFrom]));
+  if (!baseline.sdk && sdkLoc) baseline.sdk = new Map(r.filter(x => x.kind === "sdk").map(x => [x.id, x.cacheFrom]));
   all = r;
+}
+/** This chat's state read again from its own log (Local or SDK). */
+async function reread(s) {
+  const ttls = cfg("ttlSeconds") || {};
+  return s.kind === "sdk" ? core.readSdkSession(io, s.dir, Date.now(), ttls) : core.readSession(io, s.dir, Date.now(), ttls);
 }
 // Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
 // fits cheap and expensive models. Acting on its own still needs a known price.
@@ -291,10 +461,42 @@ function managed(s) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let out;
-function logx(msg) { if (out) out.appendLine(`${new Date().toTimeString().slice(0, 8)} ${msg}`); }
+function logx(msg) {
+  const line = `${new Date().toTimeString().slice(0, 8)} ${msg}`;
+  if (out) out.appendLine(line);
+  // for live tests: a copy of the log in a local file (setting not shown in the Settings UI)
+  const f = cfg("debugLogFile");
+  if (f) try { require("fs").appendFileSync(f, line + "\n"); } catch { /* ignore */ }
+}
 
-function sessionUri(id) {
-  return vscode.Uri.from({ scheme: "vscode-chat-session", authority: "local", path: "/" + Buffer.from(id).toString("base64") });
+// A Local chat opens as vscode-chat-session://local/<base64 of its log id>. A Copilot SDK chat
+// opens as agent-host-copilotcli:/<id>, where <id> is VS Code's own id for it, not the id of its
+// log folder: the two are linked in agent-host.db (chats_v2.provider_data.sdkSessionId). A chat
+// started without a folder also carries VS Code's id in its working folder (~/.copilot/chats/<id>).
+// (Tested: VS Code 1.142, local and WSL windows; the scheme is the same for both, since the window's
+// own Agent Host is the "ambient" one.)
+let idCache = { key: "", map: new Map() };
+async function sdkIds(force = false) {
+  if (!sdkLoc || !sdkLoc.db) return idCache.map;
+  const [a, b] = [await io.stat(sdkLoc.db), await io.stat(sdkLoc.db + "-wal")];
+  const key = `${sdkLoc.db}|${a && a.mtime}|${b && b.mtime}`;
+  if (!force && key === idCache.key) return idCache.map;
+  const db = await io.readBytes(sdkLoc.db);
+  const map = db ? sqlite.sdkChatIds(db, b ? await io.readBytes(sdkLoc.db + "-wal") : null) : new Map();
+  idCache = { key, map };
+  return map;
+}
+function sdkVsCodeId(s, ids) {
+  if (ids.has(s.id)) return ids.get(s.id);
+  const m = /[\\/]\.copilot[\\/]chats[\\/]([^\\/]+)$/.exec(s.cwd || "");
+  return m ? m[1] : null;
+}
+/** The URI VS Code opens this chat by, or null when it can't be told (SDK chat not in agent-host.db). */
+async function chatUri(s) {
+  if (s.kind !== "sdk") return vscode.Uri.from({ scheme: "vscode-chat-session", authority: "local", path: "/" + Buffer.from(s.id).toString("base64") });
+  let id = sdkVsCodeId(s, await sdkIds());
+  if (!id) id = sdkVsCodeId(s, await sdkIds(true));
+  return id ? vscode.Uri.from({ scheme: "agent-host-copilotcli", path: "/" + id }) : null;
 }
 function tabKey(t, gi) { return `${gi}|${t.label}|${t.input && t.input.constructor ? t.input.constructor.name : ""}`; }
 function allTabKeys() {
@@ -324,7 +526,7 @@ const MIN_LEFT_S = 1.5;
 
 /** Is it still safe to send into this chat now? Returns why not, or "". */
 async function unsafeToSend(s, opts) {
-  const fresh = (await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {})) || s;
+  const fresh = (await reread(s)) || s;
   if (fresh.busy) return "agent working (it would be queued and could run after the cache expired)";
   if (fresh.cacheFrom !== s.cacheFrom) return "a newer call refreshed the cache";
   if (!opts.allowCold && live(s) < MIN_LEFT_S) return `only ${live(s).toFixed(1)} s left, too late to be sure it lands warm`;
@@ -338,9 +540,14 @@ async function sendNow(context, s, text, label, opts = {}) {
   const st = stateFor(s.id);
   const why = await unsafeToSend(s, opts);
   if (why) { logx(`${label} for ${s.id.slice(0, 8)} not sent: ${why}`); return false; }
+  const uri = await chatUri(s);
+  if (!uri) {
+    logx(`${label} for ${s.id.slice(0, 8)} not sent: VS Code's name for this Copilot SDK chat is not in agent-host.db yet`);
+    return false;
+  }
   try {
     const before = allTabKeys();
-    await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: sessionUri(s.id) });
+    await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: uri });
     await sleep(600);
     const g = vscode.window.tabGroups.activeTabGroup, tab = g.activeTab;
     const gi = vscode.window.tabGroups.all.indexOf(g);
@@ -356,10 +563,10 @@ async function sendNow(context, s, text, label, opts = {}) {
     const late = await unsafeToSend(s, opts);
     if (late) {
       logx(`${label} for ${s.id.slice(0, 8)} not sent: ${late}`);
-      if (opened) await finishTab({ tab: opened, restore, sessionId: s.id });
+      if (opened) await finishTab({ tab: opened, restore, sessionId: s.id, uri });
       return false;
     }
-    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, before: lastMsgs,
+    st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, uri, before: lastMsgs,
                    miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
     await vscode.commands.executeCommand("workbench.action.chat.submit", { inputValue: text });
@@ -386,7 +593,7 @@ async function finishTab(p) {
   try {
     if (p.restore && policy === "restoreLastTyped") {
       // focus its tab again, then "Move Chat into Side Bar" (back into the Chat view)
-      await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: sessionUri(p.sessionId) });
+      await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: p.uri });
       await sleep(400);
       await vscode.commands.executeCommand("workbench.action.chat.openInSidebar");
       await sleep(400);
@@ -406,7 +613,7 @@ async function verifyPending() {
     const p = st.pending;
     // read the target chat's log directly (every second), not the 5 s snapshot: faster cleanup
     const target = all.find(x => x.id === p.expectId);
-    const freshTarget = target && await core.readSession(io, target.dir, Date.now(), cfg("ttlSeconds") || {});
+    const freshTarget = target && await reread(target);
     const pool = freshTarget ? [freshTarget, ...all.filter(x => x.id !== p.expectId)] : all;
     if (freshTarget) all = all.map(x => x.id === freshTarget.id ? freshTarget : x);   // don't wait for the next full read
     // landed = a new Cache Keeper message in some chat since we sent (no clock comparison needed)
@@ -609,17 +816,24 @@ async function offerAtCap(context, s) {
   if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
 
+/** How many expired chats the list keeps (cacheKeeper.expiredChats, default 1). */
+function expiredShown() {
+  const n = Number(cfg("expiredChats"));
+  return Number.isFinite(n) && n >= 0 ? Math.min(50, Math.floor(n)) : 1;
+}
+
 /**
- * Chats for the list: all warm ones (soonest expiry first), plus the most recently expired and any
- * expired one with a handoff summary to start a new chat from. Max 10.
+ * Chats for the list: all warm ones (soonest expiry first), plus the cacheKeeper.expiredChats most
+ * recently expired, the chat where you last typed, and any expired one with a handoff summary to
+ * start a new chat from. Only chats active within cacheKeeper.lookbackHours are read at all.
  */
 function listChats() {
   const list = all.filter(managed);
-  // expired chats: only the latest one, plus any with a handoff summary ready
-  const latestExpired = list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)[0];
+  const expired = new Set(list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)
+    .slice(0, expiredShown()));
   const cur = currentChat();
-  const shown = list.filter(s => s.busy || live(s) > 0 || s === latestExpired || s === cur || stateFor(s.id).handoff);
-  return core.orderChats(shown, cur && cur.id, live).slice(0, 10);
+  const shown = list.filter(s => s.busy || live(s) > 0 || expired.has(s) || s === cur || stateFor(s.id).handoff);
+  return core.orderChats(shown, cur && cur.id, live).slice(0, 60);
 }
 
 function chatItem(s, cur = currentChat()) {
@@ -629,7 +843,7 @@ function chatItem(s, cur = currentChat()) {
   const when = s.busy ? `working · cache ${clock}` : clock;
   return {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
-    description: `${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
+    description: `${s.kind === "sdk" ? "Copilot SDK" : "Local"} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
       (st.handoff ? " · handoff summary ready" : "") +
@@ -769,7 +983,7 @@ async function decide(context) {
     }
     if (r <= 0 && r > -120 && st.expiredFor !== s.cacheFrom && st.mode !== "ignore") {
       // confirm with the chat's own log: a keep-alive may have refreshed it since the last full read
-      const fresh = await core.readSession(io, s.dir, Date.now(), cfg("ttlSeconds") || {});
+      const fresh = await reread(s);
       if (fresh && fresh.cacheFrom !== s.cacheFrom) { all = all.map(x => x.id === fresh.id ? fresh : x); continue; }
       st.expiredFor = s.cacheFrom;
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
@@ -797,7 +1011,7 @@ function updateStatus(context) {
   const s = currentChat();      // the chat where you last typed
   if (!s) { statusItem.hide(); return; }
   const st = stateFor(s.id), r = live(s);
-  const shownInList = listChats().length;            // warm chats + the latest expired, max 10
+  const shownInList = listChats().length;            // warm chats + the latest expired ones
   const others = shownInList > 1 ? ` +${shownInList - 1}` : "";
   // Auto keep warm spends credits on its own: say so on the status bar, louder than an expiry warning.
   const autoChats = list.filter(x => stateFor(x.id).mode === "auto");
@@ -859,7 +1073,13 @@ function activate(context) {
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusItem.command = "cacheKeeper.options";
   context.subscriptions.push(statusItem);
-  // cache lifetimes from Copilot CLI logs: learned once the logs are located, refreshed every 30 min
+  globalState = context.globalState;
+  core.setMeasuredTtls(evidenceGaps());     // lifetimes measured in earlier sessions, before the first read
+  if (context.globalStorageUri) {
+    claimDir = path.join(context.globalStorageUri.fsPath, "sdk-claims");
+    Promise.resolve(vscode.workspace.fs.createDirectory(vscode.Uri.file(claimDir))).catch(() => { claimDir = null; });
+  }
+  // cache lifetimes from Copilot CLI/SDK logs: learned once the logs are located, refreshed every 30 min
   const shownOrNewest = () => currentChat();
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
@@ -874,7 +1094,7 @@ function activate(context) {
   const timers = [
     setInterval(() => { readAll(context).then(setAll).catch(e => logx("read error: " + e.message)); }, READ_MS),
     setInterval(() => decide(context).catch(e => console.error("cache-keeper", e)), DECIDE_MS),
-    setInterval(() => { if (logRootPath) learnLifetimes(); }, 30 * 60 * 1000),
+    setInterval(() => { if (logRootPath || sdkLoc) learnLifetimes(); }, 30 * 60 * 1000),
   ];
   readAll(context).then(setAll).catch(e => logx("read error: " + e.message));
   context.subscriptions.push({ dispose: () => timers.forEach(clearInterval) });
