@@ -208,20 +208,33 @@ function summaryWords(stats, max = Infinity) {
   return Math.max(150, Math.min(Math.round(Math.min(1500, w) / 50) * 50, Math.floor(max / 50) * 50));
 }
 
-let learnedTtls = {};          // model id -> seconds, from Copilot CLI / Copilot SDK logs
+let learnedTtls = {};          // model id -> { ttl, at }: newest value from Copilot CLI / Copilot SDK logs
 let measuredTtls = {};         // model id -> seconds the cache was seen to last, from Local chat logs
+const DAY_MS = 86400000;
+const LIFETIME_MAX_AGE_DAYS = 30;
+
+/** Every (model, cacheTtlSeconds) a parsed log line carries, wherever it sits in the event. */
+function ttlsInEvent(e, out = []) {
+  if (!e || typeof e !== "object") return out;
+  const model = e.modelId || e.model;
+  if (typeof e.cacheTtlSeconds === "number" && typeof model === "string") out.push([model, e.cacheTtlSeconds]);
+  for (const v of Object.values(e)) if (v && typeof v === "object") ttlsInEvent(v, out);
+  return out;
+}
 
 /**
  * Read cacheTtlSeconds per model from the newest `maxFiles` sessions under ~/.copilot/session-state
- * of each source ({ io, home }): Copilot CLI sessions and VS Code's Copilot SDK chats both log it.
- * A newer session wins for the same model. Values learned earlier stay until a session says
- * otherwise, so a model doesn't fall back to the default when its session gets old.
- * Returns { ttls, dirs, files }: what is known now, where it looked, and how many logs it read.
+ * of each source ({ io, home }): Copilot CLI sessions and VS Code's Copilot SDK chats both log it,
+ * on every model call and at each idle checkpoint. These are exact values from Copilot's backend,
+ * the same one Local chats use, so they apply to Local chats too. The newest value per model wins
+ * (by the event's own time), shorter or longer. Values older than `maxAgeDays` are dropped, also
+ * ones learned earlier: Copilot can change a lifetime server side.
+ * Returns { ttls, ages, dirs, files }: model -> seconds, model -> age in ms, where it looked, logs read.
  * (Older signature learnTtls(io, home, maxFiles) still works.)
  */
-async function learnTtls(sources = nodeIo, home = require("os").homedir(), maxFiles = 30) {
+async function learnTtls(sources = nodeIo, home = require("os").homedir(), maxFiles = 30, maxAgeDays = LIFETIME_MAX_AGE_DAYS, now = Date.now()) {
   if (!Array.isArray(sources)) sources = [{ io: sources, home }];
-  const re = /"modelId":"([^"]+)","cacheExpiresAt":"[^"]*","cacheTtlSeconds":(\d+)/g;
+  const cutoff = now - Math.max(1, Number(maxAgeDays) || LIFETIME_MAX_AGE_DAYS) * DAY_MS;
   const logs = [], dirs = [];
   for (const { io, home: h } of sources) {
     const dir = io.join(h, ".copilot", "session-state");
@@ -229,17 +242,32 @@ async function learnTtls(sources = nodeIo, home = require("os").homedir(), maxFi
     for (const n of await io.list(dir)) {
       const f = io.join(dir, n, "events.jsonl");
       const st = await io.stat(f);
-      if (st) logs.push({ io, f, mtime: st.mtime });
+      if (st && st.mtime >= cutoff) logs.push({ io, f, mtime: st.mtime });
     }
   }
-  logs.sort((a, b) => a.mtime - b.mtime);     // oldest first: newer sessions overwrite older ones
-  const found = {};
-  for (const { io, f } of logs.slice(-maxFiles)) {
+  logs.sort((a, b) => a.mtime - b.mtime);
+  // keep what was learned before while it is recent enough; newer events replace it
+  const found = Object.fromEntries(Object.entries(learnedTtls).filter(([, v]) => v.at >= cutoff));
+  for (const { io, f, mtime } of logs.slice(-maxFiles)) {
     const text = await io.readText(f);
-    if (text) for (const m of text.matchAll(re)) found[m[1]] = Number(m[2]);
+    if (!text) continue;
+    for (const line of text.split("\n")) {
+      if (!line.includes("cacheTtlSeconds")) continue;
+      let e;
+      try { e = JSON.parse(line); } catch { continue; }
+      const at = Date.parse(e.timestamp || "") || mtime;    // a line without its own time: the file's
+      if (at < cutoff) continue;
+      for (const [model, ttl] of ttlsInEvent(e)) {
+        if (ttl > 0 && (!found[model] || at >= found[model].at)) found[model] = { ttl, at };
+      }
+    }
   }
-  learnedTtls = { ...learnedTtls, ...found };
-  return { ttls: { ...learnedTtls }, dir: dirs.join(", "), dirs, files: Math.min(logs.length, maxFiles) };
+  learnedTtls = found;
+  return {
+    ttls: Object.fromEntries(Object.entries(found).map(([m, v]) => [m, v.ttl])),
+    ages: Object.fromEntries(Object.entries(found).map(([m, v]) => [m, now - v.at])),
+    dir: dirs.join(", "), dirs, files: Math.min(logs.length, maxFiles),
+  };
 }
 
 /**
@@ -275,7 +303,7 @@ function ttlSource(model, overrides = {}) {
 function ttlFor(model, overrides = {}) {
   model = model || "";
   if (overrides[model]) return overrides[model];
-  if (learnedTtls[model]) return learnedTtls[model];
+  if (learnedTtls[model]) return learnedTtls[model].ttl;
   if (measuredTtls[model]) return measuredTtls[model];
   return defaultTtl(model);
 }
@@ -768,6 +796,6 @@ function fmt(credits) {
 module.exports = {
   summaryPays,
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
-  rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
+  LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
 };

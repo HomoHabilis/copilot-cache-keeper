@@ -276,29 +276,34 @@ async function learnLifetimes() {
   try {
     const sources = [{ io: localIo, home: require("os").homedir() }];
     if (remote && sdkLoc) sources.push({ io, home: sdkLoc.home });
-    const r = await core.learnTtls(sources);
+    const r = await core.learnTtls(sources, undefined, 30, maxAgeDays());
     const line = lifetimesLine(r);
     if (line !== lifetimesShown) { lifetimesShown = line; logx(line); }
   } catch (e) { logx("cache lifetimes: " + e.message); }
 }
+/** How old a lifetime value may be (Copilot logs and Local measurements), cacheKeeper.lifetimeMaxAgeDays. */
+function maxAgeDays() {
+  const d = Number(cfg("lifetimeMaxAgeDays"));
+  return d > 0 ? d : core.LIFETIME_MAX_AGE_DAYS;
+}
+function ago(ms) { return ms < 3600000 ? `${Math.max(1, Math.round(ms / 60000))} min` : ms < 2 * 86400000 ? `${Math.round(ms / 3600000)} h` : `${Math.round(ms / 86400000)} d`; }
 function lifetimesLine(r) {
-  const known = Object.entries(r.ttls).map(([m, t]) => `${m} ${t} s`).join(", ");
+  const known = Object.entries(r.ttls).map(([m, t]) => `${m} ${t} s (${ago(r.ages[m])} ago)`).join(", ");
   const measured = Object.entries(core.setMeasuredTtls(evidenceGaps())).map(([m, t]) => `${m} ≥${t} s`).join(", ");
-  return `cache lifetimes from Copilot CLI/SDK logs (${r.files} sessions in ${r.dir}): ` +
+  return `cache lifetimes from Copilot CLI/SDK logs of the last ${maxAgeDays()} days (${r.files} sessions in ${r.dir}): ` +
     (known || "none") + (measured ? `; measured in your Local chats: ${measured}` : "") +
     "; otherwise defaults (Claude 300 s, Sol 6.1 1800 s, other 300 s); cacheKeeper.ttlSeconds overrides";
 }
 
 // Local chat logs don't record cache lifetimes, but a cache hit after a long pause proves a minimum
 // (see core.provenGaps). The longest proof per model is kept across windows and restarts (global
-// state, 30 days) and lengthens the default for models no Copilot log or setting covers.
+// state, cacheKeeper.lifetimeMaxAgeDays) and lengthens the default for models no Copilot log or setting covers.
 const EVIDENCE_KEY = "measuredCacheGaps";
-const EVIDENCE_DAYS = 30;
 let globalState = null;
 function evidence() {
   const all = (globalState && globalState.get(EVIDENCE_KEY)) || {};
   const fresh = {};
-  for (const [m, v] of Object.entries(all)) if (v && Date.now() - v.at < EVIDENCE_DAYS * 86400000) fresh[m] = v;
+  for (const [m, v] of Object.entries(all)) if (v && Date.now() - v.at < maxAgeDays() * 86400000) fresh[m] = v;
   return fresh;
 }
 function evidenceGaps() { return Object.fromEntries(Object.entries(evidence()).map(([m, v]) => [m, v.gap])); }

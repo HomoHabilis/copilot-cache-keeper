@@ -906,6 +906,50 @@ const never = () => new Promise(() => {});
     } finally { [a, b].forEach(h => fs.rmSync(h, { recursive: true, force: true })); }
   });
 
+  await check("learnTtls: newest exact value wins (shorter too), per call or at checkpoints, and applies to Local chats", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+    const resetLearned = () => core.learnTtls([], undefined, 30, 30, Date.now() + 1000 * 86400000);
+    try {
+      const d = path.join(home, ".copilot", "session-state");
+      const put = (name, lines) => { fs.mkdirSync(path.join(d, name), { recursive: true });
+        fs.writeFileSync(path.join(d, name, "events.jsonl"), lines.map(l => JSON.stringify(l)).join("\n") + "\n"); };
+      // an SDK chat: a checkpoint said 300 s two days ago...
+      put("sdk", [{ type: "session.usage_checkpoint", timestamp: iso(now - 2 * 86400000),
+                    data: { modelCacheState: [{ modelId: "claude-opus-5.5", cacheExpiresAt: "x", cacheTtlSeconds: 300 }] } }]);
+      // ...then a Copilot CLI call an hour ago reported a shorter lifetime (in a usage record, not a checkpoint)
+      put("cli", [{ type: "session.usage_record", timestamp: iso(now - 3600000),
+                    data: { usage: { model: "claude-opus-5.5", inputTokens: 1000, cacheTtlSeconds: 240 } } }]);
+      const r = await core.learnTtls(core.nodeIo, home, 30, 30, now);
+      assert.strictEqual(r.ttls["claude-opus-5.5"], 240, "newest wins, even when shorter");
+      assert.ok(r.ages["claude-opus-5.5"] >= 3600000 - 1000);
+      // a Local chat of that model uses it: same backend
+      const s = core.analyze("/logs/x", chatLog(now - 60000), MODELS, now);
+      assert.strictEqual(s.ttl, 240);
+      assert.strictEqual(s.ttlFrom, "Copilot CLI/SDK log");
+      // an SDK chat still goes by its own log
+      assert.strictEqual(core.analyzeSdk("/x/s", sdkChatLog(now - 60000), {}, now).ttl, 300);
+    } finally { await resetLearned(); fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  await check("learnTtls: values older than the cutoff are not used, also ones learned earlier", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+    const resetLearned = () => core.learnTtls([], undefined, 30, 30, Date.now() + 1000 * 86400000);
+    try {
+      const d = path.join(home, ".copilot", "session-state", "s");
+      fs.mkdirSync(d, { recursive: true });
+      // the file changed recently, but the event inside is 40 days old
+      fs.writeFileSync(path.join(d, "events.jsonl"), JSON.stringify({ type: "session.usage_record", timestamp: iso(now - 40 * 86400000),
+        data: { usage: { model: "old-model-x", cacheTtlSeconds: 900 } } }) + "\n");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 30, now)).ttls["old-model-x"], undefined);
+      assert.strictEqual(core.ttlFor("old-model-x"), 300, "default");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 60, now)).ttls["old-model-x"], 900, "longer cutoff: used");
+      // learned earlier, then it ages past the cutoff: dropped, back to the default
+      fs.rmSync(d, { recursive: true });
+      await core.learnTtls(core.nodeIo, home, 30, 60, now + 25 * 86400000);
+      assert.strictEqual(core.ttlFor("old-model-x"), 300);
+    } finally { await resetLearned(); fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
   await check("extension: SDK chat in this folder gets its keep-alive, sent to agent-host-copilotcli:/<VS Code id>", async () => {
     const h = await harness({ kind: "sdk", answer: () => "Keep warm" });
     try {
