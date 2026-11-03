@@ -26,6 +26,7 @@ jobs:
         run: |
           node --check extension.js
           node --check core.js
+          node --check sqlite.js
           node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
 
       - name: Smoke test (core logic + extension with a stand-in VS Code)
@@ -48,7 +49,7 @@ jobs:
           z = zipfile.ZipFile(sys.argv[1])
           names = set(z.namelist())
           need = {"[Content_Types].xml", "extension.vsixmanifest", "extension/package.json",
-                  "extension/extension.js", "extension/core.js"}
+                  "extension/extension.js", "extension/core.js", "extension/sqlite.js"}
           missing = need - names
           assert not missing, f"missing in vsix: {missing}"
           pkg = json.loads(z.read("extension/package.json"))

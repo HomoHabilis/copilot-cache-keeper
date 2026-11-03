@@ -58,6 +58,34 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20
   return ev.map(e => JSON.stringify(e)).join("\n") + "\n";
 }
 
+// Copilot SDK chat log (~/.copilot/session-state/<id>/events.jsonl), same prices as Opus above.
+const SDK_PRICES = { input: 400, cache_read: 20, cache_write: 500, output: 2000 };   // credits per 1M tokens
+const iso = t => new Date(t).toISOString();
+function sdkUsage(start, dur, { model = "claude-opus-5.5", input, read, write = input - read, out = 300, ttl = 300 }) {
+  const counts = { input: input - read - write, cache_read: read, cache_write: write, output: out };
+  return { type: "session.usage_record", timestamp: iso(start + dur), data: { usage: {
+    model, inputTokens: input, cacheReadTokens: read, cacheWriteTokens: write, outputTokens: out, duration: dur,
+    cacheExpiresAt: iso(start + ttl * 1000), cacheTtlSeconds: ttl,
+    copilotUsage: { totalNanoAiu: Object.entries(counts).reduce((a, [k, n]) => a + n * SDK_PRICES[k] * 1e3, 0),
+      tokenDetails: Object.entries(counts).map(([k, n]) => ({ batchSize: 1e6, costPerBatch: SDK_PRICES[k] * 1e9, tokenCount: n, tokenType: k })) } } } };
+}
+const ev = (type, t, data = {}) => ({ type, timestamp: iso(t), data });
+function sdkTurn(t, text, { input, read, out = 300, dur = 2000, model } = {}) {
+  return [ev("user.message", t, { content: text }), ev("assistant.turn_start", t + 5, { turnId: "0" }),
+          sdkUsage(t + 10, dur, { input, read, out, model }), ev("assistant.turn_end", t + dur + 50, { turnId: "0" }),
+          ev("session.usage_checkpoint", t + dur + 60)];
+}
+function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model } = {}) {
+  return [ev("session.start", t0 - 100),
+          ev("user.message", t0, { content: "Refactor the parser" }), ev("assistant.turn_start", t0 + 10, { turnId: "0" }),
+          sdkUsage(t0 + 50, 3000, { input: first, read: 0, out: 800, model }), ev("assistant.turn_end", t0 + 3900, { turnId: "0" }),
+          ev("assistant.turn_start", t0 + 3950, { turnId: "1" }),
+          sdkUsage(t0 + 4000, 2000, { input: ctx, read: ctx - 1000, out: 300, model }),
+          ev("assistant.message", t0 + 6000, { content: "Done: the parser is split in three files." }),
+          ev("assistant.turn_end", t0 + 6500, { turnId: "1" }), ev("session.usage_checkpoint", t0 + 6510),
+         ].map(e => JSON.stringify(e)).join("\n") + "\n";
+}
+
 // ---------------------------------------------------------------- extension with a stand-in VS Code
 
 /**
@@ -66,26 +94,36 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20
  * undefined (closed with X) or a promise that never settles (not answered). Messages Cache Keeper
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
-async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1 }) {
+async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
+                         kind = "local", sdkCwd, sdkId = "sdk-0007" }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
   const logs = path.join(storage, "GitHub.copilot-chat", "debug-logs");
-  const chat = path.join(logs, "sess-1");
+  // Copilot SDK chats live under ~/.copilot: point the home folder at the temp dir
+  const realHome = process.env.HOME;
+  process.env.HOME = path.join(tmp, "home");
+  const sdkRoot = path.join(tmp, "home", ".copilot", "session-state");
+  const globalStorage = path.join(tmp, "globalStorage");
+  fs.mkdirSync(globalStorage, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "fixtures", "agent-host.db"), path.join(globalStorage, "agent-host.db"));
+  const chat = kind === "sdk" ? path.join(sdkRoot, sdkId) : path.join(logs, "sess-1");
+  const logName = kind === "sdk" ? "events.jsonl" : "main.jsonl";
   let clock = now;
-  const sent = [], warnings = [], commands = {}, ran = [];
+  const sent = [], warnings = [], commands = {}, ran = [], lists = [];
   let status;
   const fakeFs = {
     stat: async u => ({ mtime: fs.statSync(u.fsPath).mtimeMs }),
     readFile: async u => fs.readFileSync(u.fsPath),
     writeFile: async (u, b) => fs.writeFileSync(u.fsPath, b),
+    createDirectory: async u => fs.mkdirSync(u.fsPath, { recursive: true }),
     readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
   };
   const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
                      keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
-  const append = evs => fs.appendFileSync(path.join(chat, "main.jsonl"), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
+  const append = evs => fs.appendFileSync(path.join(chat, logName), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
   let lastCtx = ctx;
   const vscode = {
     env: { remoteName: undefined },
@@ -105,7 +143,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       // the status-bar list: picks the first chat
       createQuickPick: () => { const qp = { items: [], activeItems: [], selectedItems: [], dispose() {},
         onDidAccept: f => { qp.accept = f; }, onDidHide() {},
-        show() { qp.selectedItems = [qp.items[0]]; setImmediate(() => qp.accept()); } }; return qp; },
+        show() { lists.push(qp.items); qp.selectedItems = [qp.items[0]]; setImmediate(() => qp.accept()); } }; return qp; },
       tabGroups: { all: [{ tabs: [] }], get activeTabGroup() { return this.all[0]; }, close: async () => {} },
     },
     commands: {
@@ -115,12 +153,13 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
         if (id === "workbench.action.chat.openSessionInEditorGroup") {
           vscode.window.tabGroups.all[0].tabs = [tab]; vscode.window.tabGroups.all[0].activeTab = tab;
           // the agent starts working (e.g. a subagent) while the tab is being opened
-          if (busyOnOpen) append([{ type: "turn_start", ts: clock }]);
+          if (busyOnOpen) append([kind === "sdk" ? ev("assistant.turn_start", clock) : { type: "turn_start", ts: clock }]);
         }
         if (id === "workbench.action.chat.submit") {
           sent.push({ at: clock, text: a.inputValue });
           lastCtx += 700;
-          append([{ type: "user_message", ts: clock, attrs: { content: a.inputValue } },
+          if (kind === "sdk") append(sdkTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4, dur: 500 }));
+          else append([{ type: "user_message", ts: clock, attrs: { content: a.inputValue } },
                   { type: "turn_start", ts: clock + 5 },
                   { type: "llm_request", ts: clock + 10, dur: 500, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
                     inputTokens: lastCtx, cachedTokens: lastCtx - 700, outputTokens: 4, copilotUsageNanoAiu: 1e9 } },
@@ -144,19 +183,29 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   delete require.cache[require.resolve("../extension")];
   const ext = require("../extension");
   fs.mkdirSync(logs, { recursive: true });
-  ext.activate({ storageUri: { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [] });
+  const memento = new Map();
+  ext.activate({ storageUri: { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
+                 globalStorageUri: { fsPath: path.join(globalStorage, "local.copilot-cache-keeper") },
+                 globalState: { get: k => memento.get(k), update: async (k, v) => { memento.set(k, v); } } });
   await ext._read();                                  // first read: no chats yet
   clock += 2000;
-  fs.mkdirSync(chat);
-  fs.writeFileSync(path.join(chat, "models.json"), MODELS);
-  fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+  fs.mkdirSync(chat, { recursive: true });
+  if (kind === "sdk") {
+    fs.writeFileSync(path.join(chat, "workspace.yaml"), `id: ${sdkId}\ncwd: ${sdkCwd || tmp}\nclient_name: vscode-agent-host\nsummary_count: 0\n`);
+    fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+  } else {
+    fs.writeFileSync(path.join(chat, "models.json"), MODELS);
+    fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+  }
   await ext._read();
   const h = {
-    sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, "main.jsonl"), cacheFrom: clock - 7000 + 4000,
+    sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
+    memento, globalStorage, sdkRoot, lists, logs,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
       lastCtx += 2000;
+      if (kind === "sdk") { append(sdkTurn(clock, "Next step please", { input: lastCtx, read: lastCtx - 2000 })); h.cacheFrom = clock + 10; return; }
       append([{ type: "user_message", ts: clock, attrs: { content: "Next step please" } },
               { type: "turn_start", ts: clock + 5 },
               { type: "llm_request", ts: clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
@@ -177,6 +226,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       Module._load = load;
       Date.now = realNow;
       global.setInterval = realSetInterval;
+      process.env.HOME = realHome;
       fs.rmSync(tmp, { recursive: true, force: true });
     },
   };
@@ -323,7 +373,7 @@ const never = () => new Promise(() => {});
       assert.strictEqual(r.files, 2);
       assert.strictEqual(r.ttls["claude-haiku-test"], 90);
       assert.strictEqual(core.ttlFor("claude-haiku-test"), 90);
-      assert.strictEqual(core.ttlSource("claude-haiku-test"), "Copilot CLI log");
+      assert.strictEqual(core.ttlSource("claude-haiku-test"), "Copilot CLI/SDK log");
       assert.strictEqual(core.ttlSource("claude-haiku-test", { "claude-haiku-test": 60 }), "setting");
       // a later look that only reads the old session's window keeps nothing worse than what it reads
       await core.learnTtls(core.nodeIo, tmp, 1);
@@ -721,6 +771,286 @@ const never = () => new Promise(() => {});
       await h.commands["cacheKeeper.options"]();
       assert.ok(offered && !offered.includes("New chat from handoff"), String(offered));
     } finally { h.close(); }
+  });
+
+
+  // ---------------------------------------------------------------- Copilot SDK chats
+
+  await check("analyzeSdk: lifetime and countdown from the chat's own log, costs from what it was billed", () => {
+    const s = core.analyzeSdk("/h/.copilot/session-state/sdk-1", sdkChatLog(now - 60000), { cwd: "/w" }, now);
+    assert.ok(s);
+    assert.strictEqual(s.kind, "sdk");
+    assert.strictEqual(s.id, "sdk-1");
+    assert.strictEqual(s.ttl, 300);
+    assert.strictEqual(s.ttlFrom, "this chat's log");
+    assert.strictEqual(s.cacheFrom, now - 60000 + 4000, "cache refreshed when the last call started");
+    assert.strictEqual(s.busy, false);
+    assert.strictEqual(s.ctx, 150000);
+    // 150k * (500 - 20) / 1e6 = 72, like the Local chat with the same prices
+    assert.ok(Math.abs(s.cost.missExtra - 72) < 0.01, String(s.cost.missExtra));
+    assert.ok(s.cost.heartbeat > 3 && s.cost.heartbeat < 4.5, String(s.cost.heartbeat));
+    assert.strictEqual(s.title, "Refactor the parser");
+    assert.ok(s.lastRealUserTs > 0);
+    // a setting still wins over the log
+    assert.strictEqual(core.analyzeSdk("/x/sdk-1", sdkChatLog(now - 60000), {}, now, { "claude-opus-5.5": 120 }).ttl, 120);
+  });
+
+  await check("analyzeSdk: busy while a turn is open, a message waits, or between two turns", () => {
+    const base = sdkChatLog(now - 60000);
+    const at = (extra, t = now) => core.analyzeSdk("/x/s", base + extra.map(e => JSON.stringify(e)).join("\n") + "\n", {}, t).busy;
+    assert.strictEqual(at([ev("user.message", now - 1000, { content: "go" })]), true, "message waiting for its turn");
+    assert.strictEqual(at([ev("user.message", now - 2000, { content: "go" }), ev("assistant.turn_start", now - 1990)]), true, "turn open");
+    assert.strictEqual(at([ev("user.message", now - 9000, { content: "go" }), ev("assistant.turn_start", now - 8990),
+                           ev("assistant.turn_end", now - 1000)]), true, "between turns of one request");
+    assert.strictEqual(at([ev("user.message", now - 9000, { content: "go" }), ev("assistant.turn_start", now - 8990),
+                           ev("assistant.turn_end", now - 1000), ev("session.usage_checkpoint", now - 990)]), false, "idle checkpoint");
+    assert.strictEqual(at([ev("user.message", now - 9000, { content: "go" }), ev("assistant.turn_start", now - 8990),
+                           ev("assistant.turn_end", now - 5000)]), false, "turn ended a while ago");
+    assert.strictEqual(at([ev("user.message", now - 9000, { content: "go" }), ev("assistant.turn_start", now - 8990),
+                           ev("abort", now - 100)]), false, "stopped");
+    // a message sent while the agent works is part of that turn, not a new one waiting
+    assert.strictEqual(at([ev("user.message", now - 9000, { content: "go" }), ev("assistant.turn_start", now - 8990),
+                           ev("user.message", now - 8000, { content: "also check X\n\n<reminder>\nsteer\n</reminder>" }),
+                           ev("assistant.turn_end", now - 5000), ev("session.usage_checkpoint", now - 4990)]), false, "steering message");
+  });
+
+  await check("analyzeSdk: Cache Keeper's own messages are not yours (also with a <reminder> appended)", () => {
+    const ka = core.KEEPALIVES[0];
+    const log = sdkChatLog(now - 60000) + sdkTurn(now - 20000, ka, { input: 150700, read: 150000, out: 4, dur: 500 })
+      .map(e => JSON.stringify(e)).join("\n") + "\n";
+    const s = core.analyzeSdk("/x/s", log, {}, now);
+    assert.strictEqual(s.lastUserText, ka);
+    assert.ok(s.lastRealUserTs < now - 50000, "the keep-alive is not counted as your message");
+    assert.strictEqual(s.stats.turns, 1);
+  });
+
+  await check("readSdkSessions: only VS Code SDK chats, not Copilot CLI sessions", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-home-"));
+    try {
+      for (const [id, yaml] of [["a", "client_name: vscode-agent-host\ncwd: /w"], ["b", "cwd: /w"]]) {
+        const d = path.join(home, ".copilot", "session-state", id);
+        fs.mkdirSync(d, { recursive: true });
+        fs.writeFileSync(path.join(d, "workspace.yaml"), `id: ${id}\n${yaml}\n`);
+        fs.writeFileSync(path.join(d, "events.jsonl"), sdkChatLog(now - 60000));
+      }
+      const r = await core.readSdkSessions(core.nodeIo, home, now);
+      assert.deepStrictEqual(r.map(s => s.id), ["a"]);
+      assert.strictEqual(r[0].cwd, "/w");
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  await check("sdkChatOwner: this window's folders, other folders, chats without a folder", () => {
+    const o = (cwd, folders, win) => core.sdkChatOwner({ cwd }, folders, win);
+    assert.strictEqual(o("/home/u/proj", ["/home/u/proj"]), "window");
+    assert.strictEqual(o("/home/u/proj/sub", ["/home/u/proj"]), "window");
+    assert.strictEqual(o("/home/u/project2", ["/home/u/proj"]), "", "a sibling folder with a longer name is not inside");
+    assert.strictEqual(o("/home/u/other", ["/home/u/proj"]), "");
+    assert.strictEqual(o("/home/u/.copilot/chats/83082f29", ["/home/u/proj"]), "workspaceless");
+    assert.strictEqual(o("c:\\Users\\Me\\.copilot\\chats\\f8cb3cb8", [], true), "workspaceless");
+    assert.strictEqual(o("C:\\Work\\Proj", ["c:\\work\\proj"], true), "window", "Windows paths: case-insensitive");
+    assert.strictEqual(core.sdkChatOwner({ cwd: "/tmp/wt", gitRoot: "/home/u/proj" }, ["/home/u/proj"]), "window", "git root counts");
+  });
+
+  await check("sqlite: agent-host.db names SDK chats (b-tree, overflow pages, write-ahead log)", () => {
+    const sqlite = require("../sqlite");
+    const fx = f => fs.readFileSync(path.join(__dirname, "fixtures", f));
+    const m = sqlite.sdkChatIds(fx("agent-host.db"), null);
+    assert.strictEqual(m.size, 60);
+    assert.strictEqual(m.get("sdk-0007"), "vsc-0007", "row larger than a page");
+    assert.strictEqual(m.get("sdk-0059"), "vsc-0059");
+    assert.ok(!m.has("claude-sdk"), "only Copilot (copilotcli) chats");
+    const w = sqlite.sdkChatIds(fx("agent-host-wal.db"), fx("agent-host-wal.db-wal"));
+    assert.strictEqual(w.get("sdk-new"), "vsc-new", "row still in the -wal file");
+    assert.strictEqual(w.get("sdk-old"), "vsc-old");
+    assert.ok(!sqlite.sdkChatIds(fx("agent-host-wal.db"), null).has("sdk-new"));
+    assert.strictEqual(sqlite.sdkChatIds(Buffer.from("not a database"), null).size, 0);
+  });
+
+  await check("measured lifetimes: a cache hit after a long pause in a Local chat proves a minimum", () => {
+    const t0 = now - 7200000;
+    const call = (ts, model, input, cached, debugName = "panel/editAgent") =>
+      ({ type: "llm_request", ts, dur: 1000, attrs: { debugName, model, inputTokens: input, cachedTokens: cached, outputTokens: 10 } });
+    const log = evs => evs.map(e => JSON.stringify(e)).join("\n");
+    // own part of the chat (70k - 30k) cached after 1100 s: proof of >= 1100 s
+    assert.deepStrictEqual(core.gapsFromLog(log([call(t0, "kimi-x", 30000, 0), call(t0 + 5000, "kimi-x", 70000, 29000),
+      call(t0 + 5000 + 1100000, "kimi-x", 71000, 70000)])), { "kimi-x": 1100 });
+    // only the shared system prompt cached (own part not): no proof
+    assert.deepStrictEqual(core.gapsFromLog(log([call(t0, "kimi-x", 30000, 0), call(t0 + 1100000, "kimi-x", 33000, 30000)])), {});
+    // another call of that model in between also refreshed the cache: the gap counts from it
+    assert.deepStrictEqual(core.gapsFromLog(log([call(t0, "kimi-x", 30000, 0), call(t0 + 5000, "kimi-x", 70000, 29000),
+      call(t0 + 600000, "kimi-x", 2000, 0, "title"), call(t0 + 5000 + 1100000, "kimi-x", 71000, 70000)])), { "kimi-x": 505 });
+    try {
+      core.setMeasuredTtls({ "kimi-x": 1100, "claude-opus-5.5": 307 });
+      assert.strictEqual(core.ttlFor("kimi-x"), 1080, "rounded down to the minute");
+      assert.strictEqual(core.ttlSource("kimi-x"), "measured in your chats");
+      assert.strictEqual(core.ttlFor("claude-opus-5.5"), 300, "a few seconds over the default is call latency, not a longer cache");
+      assert.strictEqual(core.ttlFor("kimi-x", { "kimi-x": 200 }), 200, "a setting wins");
+    } finally { core.setMeasuredTtls({}); }
+  });
+
+  await check("learnTtls: reads several homes (Windows and the remote side), newest session wins", async () => {
+    const mk = (age, model, ttl) => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+      const d = path.join(home, ".copilot", "session-state", "s");
+      fs.mkdirSync(d, { recursive: true });
+      const f = path.join(d, "events.jsonl");
+      fs.writeFileSync(f, `{"modelCacheState":[{"modelId":"${model}","cacheExpiresAt":"x","cacheTtlSeconds":${ttl}}]}\n`);
+      const t = (Date.now() - age) / 1000; fs.utimesSync(f, t, t);
+      return home;
+    };
+    const a = mk(60000, "multi-home-model", 600), b = mk(1000, "multi-home-model", 900);
+    try {
+      const r = await core.learnTtls([{ io: core.nodeIo, home: a }, { io: core.nodeIo, home: b }]);
+      assert.strictEqual(r.ttls["multi-home-model"], 900);
+      assert.strictEqual(r.dirs.length, 2);
+    } finally { [a, b].forEach(h => fs.rmSync(h, { recursive: true, force: true })); }
+  });
+
+  await check("learnTtls: newest exact value wins (shorter too), per call or at checkpoints, and applies to Local chats", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+    const resetLearned = () => core.learnTtls([], undefined, 30, 30, Date.now() + 1000 * 86400000);
+    try {
+      const d = path.join(home, ".copilot", "session-state");
+      const put = (name, lines) => { fs.mkdirSync(path.join(d, name), { recursive: true });
+        fs.writeFileSync(path.join(d, name, "events.jsonl"), lines.map(l => JSON.stringify(l)).join("\n") + "\n"); };
+      // an SDK chat: a checkpoint said 300 s two days ago...
+      put("sdk", [{ type: "session.usage_checkpoint", timestamp: iso(now - 2 * 86400000),
+                    data: { modelCacheState: [{ modelId: "claude-opus-5.5", cacheExpiresAt: "x", cacheTtlSeconds: 300 }] } }]);
+      // ...then a Copilot CLI call an hour ago reported a shorter lifetime (in a usage record, not a checkpoint)
+      put("cli", [{ type: "session.usage_record", timestamp: iso(now - 3600000),
+                    data: { usage: { model: "claude-opus-5.5", inputTokens: 1000, cacheTtlSeconds: 240 } } }]);
+      const r = await core.learnTtls(core.nodeIo, home, 30, 30, now);
+      assert.strictEqual(r.ttls["claude-opus-5.5"], 240, "newest wins, even when shorter");
+      assert.ok(r.ages["claude-opus-5.5"] >= 3600000 - 1000);
+      // a Local chat of that model uses it: same backend
+      const s = core.analyze("/logs/x", chatLog(now - 60000), MODELS, now);
+      assert.strictEqual(s.ttl, 240);
+      assert.strictEqual(s.ttlFrom, "Copilot CLI/SDK log");
+      // an SDK chat still goes by its own log
+      assert.strictEqual(core.analyzeSdk("/x/s", sdkChatLog(now - 60000), {}, now).ttl, 300);
+    } finally { await resetLearned(); fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  await check("learnTtls: values older than the cutoff are not used, also ones learned earlier", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "ck-ttl-"));
+    const resetLearned = () => core.learnTtls([], undefined, 30, 30, Date.now() + 1000 * 86400000);
+    try {
+      const d = path.join(home, ".copilot", "session-state", "s");
+      fs.mkdirSync(d, { recursive: true });
+      // the file changed recently, but the event inside is 40 days old
+      fs.writeFileSync(path.join(d, "events.jsonl"), JSON.stringify({ type: "session.usage_record", timestamp: iso(now - 40 * 86400000),
+        data: { usage: { model: "old-model-x", cacheTtlSeconds: 900 } } }) + "\n");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 30, now)).ttls["old-model-x"], undefined);
+      assert.strictEqual(core.ttlFor("old-model-x"), 300, "default");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 60, now)).ttls["old-model-x"], 900, "longer cutoff: used");
+      assert.strictEqual(core.LIFETIME_MAX_AGE_DAYS, 60, "default cutoff");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, undefined, now)).ttls["old-model-x"], 900, "40 days old: within the default");
+      // learned earlier, then it ages past the cutoff: dropped, back to the default
+      fs.rmSync(d, { recursive: true });
+      await core.learnTtls(core.nodeIo, home, 30, 60, now + 25 * 86400000);
+      assert.strictEqual(core.ttlFor("old-model-x"), 300);
+    } finally { await resetLearned(); fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  await check("extension: SDK chat in this folder gets its keep-alive, sent to agent-host-copilotcli:/<VS Code id>", async () => {
+    const h = await harness({ kind: "sdk", answer: () => "Keep warm" });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.warnings.length, 1, "warned once");
+      assert.strictEqual(h.sent.length, 1, "one keep-alive");
+      assert.ok(core.isKeepAlive(h.sent[0].text));
+      const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
+      assert.strictEqual(open.a.resource.scheme, "agent-host-copilotcli");
+      assert.strictEqual(open.a.resource.path, "/vsc-0007", "VS Code's id from agent-host.db, not the log folder's");
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      assert.ok(h.lists.at(-1)[0].description.startsWith("Copilot SDK"), h.lists.at(-1)[0].description);
+    } finally { h.close(); }
+  });
+
+  await check("extension: SDK keep-alive goes out within the lead before the expiry in the log", async () => {
+    const h = await harness({ kind: "sdk", answer: () => "Keep warm" });
+    try {
+      const expiry = h.cacheFrom + 300000;
+      await h.run(300, () => h.sent.length > 0);
+      const lead = (expiry - h.sent[0].at) / 1000;
+      assert.ok(lead > 1.5 && lead <= 9, `sent ${lead} s before expiry`);
+    } finally { h.close(); }
+  });
+
+  await check("extension: SDK chat of another folder is left to its window", async () => {
+    const h = await harness({ kind: "sdk", sdkCwd: "/somewhere/else", answer: () => "Keep warm" });
+    try {
+      await h.run(300);
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.sent.length, 0);
+    } finally { h.close(); }
+  });
+
+  await check("extension: SDK chat without a folder: claimed by one window, named from its folder", async () => {
+    const h = await harness({ kind: "sdk", sdkId: "sdk-unmapped", sdkCwd: "/home/u/.copilot/chats/vsc-from-cwd", answer: () => "Keep warm" });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.sent.length, 1);
+      const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
+      assert.strictEqual(open.a.resource.path, "/vsc-from-cwd");
+      assert.ok(fs.existsSync(path.join(h.globalStorage, "local.copilot-cache-keeper", "sdk-claims", "sdk-unmapped")), "claim file written");
+    } finally { h.close(); }
+  });
+
+  await check("extension: SDK chat without a folder claimed by another window is left alone", async () => {
+    const h = await harness({ kind: "sdk", sdkId: "sdk-unmapped", sdkCwd: "/home/u/.copilot/chats/vsc-x", answer: () => "Keep warm" });
+    try {
+      const claim = path.join(h.globalStorage, "local.copilot-cache-keeper", "sdk-claims", "sdk-unmapped");
+      // the other window keeps refreshing its claim
+      for (let i = 0; i < 60; i++) { fs.writeFileSync(claim, `otherwin ${h.clock}`); await h.run(5); }
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.sent.length, 0);
+    } finally { h.close(); }
+  });
+
+  await check("extension: SDK chat without a folder and not in agent-host.db: no send, no wrong chat", async () => {
+    const h = await harness({ kind: "sdk", sdkId: "sdk-unknown", sdkCwd: "/w/proj", answer: () => "Keep warm" });
+    try {
+      // the window has the folder open, but VS Code's id for the chat can't be found
+      await h.run(300);
+      assert.strictEqual(h.sent.length, 0, "nothing submitted");
+      assert.ok(!h.ran.some(r => r.id === "workbench.action.chat.submit"));
+    } finally { h.close(); }
+  });
+
+  await check("cacheKeeper.expiredChats: how many expired chats the list keeps", async () => {
+    // the chat where you last typed, plus 6 expired ones; default keeps 5 of them
+    for (const [n, want] of [[0, 1], [1, 2], [2, 3], [undefined, 6]]) {
+      const h = await harness({ answer: never, settings: n === undefined ? {} : { expiredChats: n } });
+      try {
+        for (let i = 1; i <= 6; i++) {
+          const d = path.join(h.logs, `old-${i}`);
+          fs.mkdirSync(d);
+          fs.writeFileSync(path.join(d, "models.json"), MODELS);
+          fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3600000 - i * 60000, { ctx: 40000 }));
+        }
+        await h.run(6);
+        await h.commands["cacheKeeper.options"]();
+        assert.strictEqual(h.lists.at(-1).length, want, `expiredChats ${n}: ${h.lists.at(-1).map(i => i.label).join(" | ")}`);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("cacheKeeper.lookbackHours: older chats are not read (default 48 h)", async () => {
+    for (const [settings, want] of [[{ lookbackHours: 1 }, 1], [{}, 2]]) {
+      const h = await harness({ answer: never, settings });
+      try {
+        const d = path.join(h.logs, "old-3h");
+        fs.mkdirSync(d);
+        fs.writeFileSync(path.join(d, "models.json"), MODELS);
+        fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3 * 3600000, { ctx: 40000 }));
+        const t = (h.clock - 3 * 3600000) / 1000; fs.utimesSync(path.join(d, "main.jsonl"), t, t);
+        await h.run(6);
+        await h.commands["cacheKeeper.options"]();
+        assert.strictEqual(h.lists.at(-1).length, want, JSON.stringify(settings));
+      } finally { h.close(); }
+    }
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
