@@ -14,7 +14,7 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
 
 - **Status bar:** the countdown for the chat where you last typed, for example `cache 3:12 +1`
   (`+1` = one more chat managed in this window). Click it to see the chats in the window (all
-  warm ones plus the most recently expired, `cacheKeeper.expiredChats`, default 1), each marked
+  warm ones plus the most recently expired, `cacheKeeper.expiredChats`, default 5), each marked
   Local or Copilot SDK, with its live countdown, model,
   context, cost if it expires and spend so far. Pick one to choose what happens to it.
   - **While the agent works** (including subagents and long terminal commands), it shows
@@ -78,8 +78,8 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
     write in it again.
 - **Status-bar list order:** the chat where you last typed first (marked "where you last
   typed"), then the other warm or working chats by soonest expiry, then the latest expired chats
-  (`cacheKeeper.expiredChats`, default 1) and any with a handoff summary ready. Only chats active
-  within `cacheKeeper.lookbackHours` (default 3) are read at all, so older ones are never listed.
+  (`cacheKeeper.expiredChats`, default 5) and any with a handoff summary ready. Only chats active
+  within `cacheKeeper.lookbackHours` (default 48) are read at all, so older ones are never listed.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
   Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
@@ -299,9 +299,9 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.keepAliveJitterPercent` | 5 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
-| `cacheKeeper.expiredChats` | 1 | How many expired chats the status-bar list keeps (most recent first) |
+| `cacheKeeper.expiredChats` | 5 | How many expired chats the status-bar list keeps (most recent first) |
 | `cacheKeeper.lifetimeMaxAgeDays` | 60 | Ignore cache lifetimes from Copilot logs, or measured in Local chats, older than this |
-| `cacheKeeper.lookbackHours` | 3 | Read chats whose log changed within this many hours; older ones are never listed |
+| `cacheKeeper.lookbackHours` | 48 | Read chats whose log changed within this many hours; older ones are never listed |
 
 ## Build from source
 

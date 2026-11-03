@@ -561,7 +561,7 @@ function describeLog(mainText) {
  * All chats under a debug-logs folder whose log changed in the last `maxAgeMs`. Chats skipped for
  * another reason are added to `skipped` ({ id, why }) when given.
  */
-async function readSessions(io, root, now = Date.now(), maxAgeMs = 3 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
+async function readSessions(io, root, now = Date.now(), maxAgeMs = 48 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
   const out = [];
   for (const n of await io.list(root)) {
     const dir = io.join(root, n);
@@ -706,7 +706,7 @@ async function readSdkSession(io, dir, now = Date.now(), ttlOverrides = {}) {
  * VS Code Copilot SDK chats under `home`/.copilot/session-state whose log changed in the last
  * `maxAgeMs`. Which of them belong to this window is decided by the caller (from their cwd).
  */
-async function readSdkSessions(io, home, now = Date.now(), maxAgeMs = 3 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
+async function readSdkSessions(io, home, now = Date.now(), maxAgeMs = 48 * 3600 * 1000, ttlOverrides = {}, skipped = null) {
   const root = io.join(home, ".copilot", "session-state");
   const out = [];
   for (const n of await io.list(root)) {

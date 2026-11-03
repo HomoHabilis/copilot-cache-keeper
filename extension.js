@@ -200,7 +200,7 @@ const RELOCATE_MS = 60000;     // look again for a newer sibling storage folder 
 let locatedAt = 0;
 
 let sdkLoc = null;             // { home, db } for this window's Copilot SDK chats
-function lookbackMs() { return Math.max(1, Number(cfg("lookbackHours")) || 3) * 3600 * 1000; }
+function lookbackMs() { return Math.max(1, Number(cfg("lookbackHours")) || 48) * 3600 * 1000; }
 
 async function readAll(context) {
   if (!logRootPath || !sdkLoc || Date.now() - locatedAt > RELOCATE_MS) {
@@ -821,10 +821,10 @@ async function offerAtCap(context, s) {
   if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
 
-/** How many expired chats the list keeps (cacheKeeper.expiredChats, default 1). */
+/** How many expired chats the list keeps (cacheKeeper.expiredChats, default 5). */
 function expiredShown() {
   const n = Number(cfg("expiredChats"));
-  return Number.isFinite(n) && n >= 0 ? Math.min(50, Math.floor(n)) : 1;
+  return Number.isFinite(n) && n >= 0 ? Math.min(50, Math.floor(n)) : 5;
 }
 
 /**

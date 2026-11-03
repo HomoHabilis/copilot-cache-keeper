@@ -124,14 +124,14 @@
         },
         "cacheKeeper.expiredChats": {
           "type": "number",
-          "default": 1,
+          "default": 5,
           "minimum": 0,
           "maximum": 50,
           "description": "How many expired chats the status-bar list keeps, most recently expired first (warm and working chats are always listed, as are the chat where you last typed and chats with a handoff summary ready). Only chats active within cacheKeeper.lookbackHours are read at all."
         },
         "cacheKeeper.lookbackHours": {
           "type": "number",
-          "default": 3,
+          "default": 48,
           "minimum": 1,
           "maximum": 168,
           "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."

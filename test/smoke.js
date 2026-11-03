@@ -1020,14 +1020,15 @@ const never = () => new Promise(() => {});
   });
 
   await check("cacheKeeper.expiredChats: how many expired chats the list keeps", async () => {
-    for (const [n, want] of [[0, 1], [1, 2], [2, 3], [undefined, 2]]) {
+    // the chat where you last typed, plus 6 expired ones; default keeps 5 of them
+    for (const [n, want] of [[0, 1], [1, 2], [2, 3], [undefined, 6]]) {
       const h = await harness({ answer: never, settings: n === undefined ? {} : { expiredChats: n } });
       try {
-        for (const id of ["old-1", "old-2"]) {
-          const d = path.join(h.logs, id);
+        for (let i = 1; i <= 6; i++) {
+          const d = path.join(h.logs, `old-${i}`);
           fs.mkdirSync(d);
           fs.writeFileSync(path.join(d, "models.json"), MODELS);
-          fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3600000 - (id === "old-2" ? 60000 : 0), { ctx: 40000 }));
+          fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3600000 - i * 60000, { ctx: 40000 }));
         }
         await h.run(6);
         await h.commands["cacheKeeper.options"]();
@@ -1036,18 +1037,20 @@ const never = () => new Promise(() => {});
     }
   });
 
-  await check("cacheKeeper.lookbackHours: older chats are not read", async () => {
-    const h = await harness({ answer: never, settings: { expiredChats: 5, lookbackHours: 1 } });
-    try {
-      const d = path.join(h.logs, "old-3h");
-      fs.mkdirSync(d);
-      fs.writeFileSync(path.join(d, "models.json"), MODELS);
-      fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3 * 3600000, { ctx: 40000 }));
-      const t = (h.clock - 3 * 3600000) / 1000; fs.utimesSync(path.join(d, "main.jsonl"), t, t);
-      await h.run(6);
-      await h.commands["cacheKeeper.options"]();
-      assert.strictEqual(h.lists.at(-1).length, 1);
-    } finally { h.close(); }
+  await check("cacheKeeper.lookbackHours: older chats are not read (default 48 h)", async () => {
+    for (const [settings, want] of [[{ lookbackHours: 1 }, 1], [{}, 2]]) {
+      const h = await harness({ answer: never, settings });
+      try {
+        const d = path.join(h.logs, "old-3h");
+        fs.mkdirSync(d);
+        fs.writeFileSync(path.join(d, "models.json"), MODELS);
+        fs.writeFileSync(path.join(d, "main.jsonl"), chatLog(h.clock - 3 * 3600000, { ctx: 40000 }));
+        const t = (h.clock - 3 * 3600000) / 1000; fs.utimesSync(path.join(d, "main.jsonl"), t, t);
+        await h.run(6);
+        await h.commands["cacheKeeper.options"]();
+        assert.strictEqual(h.lists.at(-1).length, want, JSON.stringify(settings));
+      } finally { h.close(); }
+    }
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
