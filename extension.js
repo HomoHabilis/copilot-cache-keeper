@@ -162,7 +162,7 @@ async function readAll(context) {
       logx(`reading Copilot logs at ${remote ? remote.authority + ":" : ""}${found}`);
       logRootPath = found;
       baseline = null;         // "seen active since start" is judged afresh in the new folder
-      core.learnTtls(io, remoteHome || require("os").homedir()).catch(() => {});
+      learnLifetimes();
     }
   }
   if (!logRootPath) return [];
@@ -172,6 +172,23 @@ async function readAll(context) {
   for (const k of skipped) noteWhy(k.id, k.why);
   for (const s of r) noteWhy(s.id, unmanagedWhy(s));
   return r;
+}
+
+// Cache lifetimes learned from Copilot CLI logs. Logged when they change, so the Output panel
+// says where each countdown's length comes from.
+let lifetimesShown = null;
+async function learnLifetimes() {
+  try {
+    const r = await core.learnTtls(io, remoteHome || require("os").homedir());
+    const line = lifetimesLine(r);
+    if (line !== lifetimesShown) { lifetimesShown = line; logx(line); }
+  } catch (e) { logx("cache lifetimes: " + e.message); }
+}
+function lifetimesLine(r) {
+  const known = Object.entries(r.ttls).map(([m, t]) => `${m} ${t} s`).join(", ");
+  return `cache lifetimes from Copilot CLI logs (${r.files} sessions in ${r.dir}): ` +
+    (known || "none, using defaults (Claude 300 s, Sol 6.1 1800 s, other 300 s)") +
+    "; cacheKeeper.ttlSeconds overrides";
 }
 
 const whyShown = new Map();    // chat id -> reason last logged for not listing it ("" = listed)
@@ -194,6 +211,8 @@ async function diagnose(context) {
   out.show(true);
   logx(`--- diagnostics: Copilot logs at ${logRootPath ? (remote ? remote.authority + ":" : "") + logRootPath : "(not found yet)"}`);
   if (!logRootPath) return;
+  lifetimesShown = null;
+  await learnLifetimes();
   const now = Date.now();
   for (const n of await io.list(logRootPath)) {
     const dir = io.join(logRootPath, n);
@@ -202,7 +221,7 @@ async function diagnose(context) {
     const s = st && await core.readSession(io, dir, now, cfg("ttlSeconds") || {});
     const text = st && !s ? await io.readText(io.join(dir, "main.jsonl")) : null;
     logx(`${n.slice(0, 8)} (log changed ${age}): ` + (s
-      ? `${describe(s)}, ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, language ${s.lang}, ` +
+      ? `${describe(s)}, cache lifetime ${s.ttl} s (${s.ttlFrom}), ${s.cost ? `expiry +${core.fmt(s.cost.missExtra)} cr` : "no price"}, language ${s.lang}, ` +
         (unmanagedWhy(s) ? `not listed: ${unmanagedWhy(s)}` : "listed")
       : st ? `not tracked: ${core.describeLog(text)}` : "not tracked"));
   }
@@ -804,7 +823,7 @@ function updateStatus(context) {
     (s.cost ? `: next msg +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
   // Tooltip: short Markdown lines rather than one long sentence.
   const md = [`**${s.title ? s.title.replace(/[\\`*_[\]<>]/g, "") : s.id.slice(0, 8)}**  `,
-              `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s`, ""];
+              `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s (${s.ttlFrom})`, ""];
   if (costlyRestart) {
     md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
       (s.cost ? ` (**+${core.fmt(s.cost.missExtra)} cr**)` : "") + ".", "");
@@ -855,7 +874,7 @@ function activate(context) {
   const timers = [
     setInterval(() => { readAll(context).then(setAll).catch(e => logx("read error: " + e.message)); }, READ_MS),
     setInterval(() => decide(context).catch(e => console.error("cache-keeper", e)), DECIDE_MS),
-    setInterval(() => { if (logRootPath) core.learnTtls(io, remoteHome || require("os").homedir()).catch(() => {}); }, 30 * 60 * 1000),
+    setInterval(() => { if (logRootPath) learnLifetimes(); }, 30 * 60 * 1000),
   ];
   readAll(context).then(setAll).catch(e => logx("read error: " + e.message));
   context.subscriptions.push({ dispose: () => timers.forEach(clearInterval) });
