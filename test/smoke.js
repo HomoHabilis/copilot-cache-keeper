@@ -943,6 +943,8 @@ const never = () => new Promise(() => {});
       assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 30, now)).ttls["old-model-x"], undefined);
       assert.strictEqual(core.ttlFor("old-model-x"), 300, "default");
       assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, 60, now)).ttls["old-model-x"], 900, "longer cutoff: used");
+      assert.strictEqual(core.LIFETIME_MAX_AGE_DAYS, 60, "default cutoff");
+      assert.strictEqual((await core.learnTtls(core.nodeIo, home, 30, undefined, now)).ttls["old-model-x"], 900, "40 days old: within the default");
       // learned earlier, then it ages past the cutoff: dropped, back to the default
       fs.rmSync(d, { recursive: true });
       await core.learnTtls(core.nodeIo, home, 30, 60, now + 25 * 86400000);

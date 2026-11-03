@@ -144,14 +144,14 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
      backend, the same one Local chats use, so they apply to Local chats too: using a model in a
      Copilot SDK chat or Copilot CLI teaches its lifetime to all chats. The newest value per model
      wins (by the event's own time), even when it is shorter. Values older than
-     `cacheKeeper.lifetimeMaxAgeDays` (default 30) are dropped, since Copilot can change a lifetime
+     `cacheKeeper.lifetimeMaxAgeDays` (default 60) are dropped, since Copilot can change a lifetime
      server side.
   4. **Measured in your Local chats:** Local chat logs don't state lifetimes, but a call that still
      hit the cache after a pause of N seconds proves it lasts at least N. Only proofs where the
      cache covered the chat's own conversation count (not just the shared system prompt, which
      another chat may keep warm), timed from the previous call of that model of any kind (title and
      summary calls also refresh it). The longest proof per model is kept across windows for
-     `cacheKeeper.lifetimeMaxAgeDays` (default 30).
+     `cacheKeeper.lifetimeMaxAgeDays` (default 60).
      It only ever lengthens the default (rounded down to the minute, and only when more than 60 s
      longer): a cache miss can have other causes, so it never shortens it. On real logs this gives
      for example `kimi-k2.7-code` 1080 s, while Claude models stay at 300 s.
@@ -300,7 +300,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
 | `cacheKeeper.expiredChats` | 1 | How many expired chats the status-bar list keeps (most recent first) |
-| `cacheKeeper.lifetimeMaxAgeDays` | 30 | Ignore cache lifetimes from Copilot logs, or measured in Local chats, older than this |
+| `cacheKeeper.lifetimeMaxAgeDays` | 60 | Ignore cache lifetimes from Copilot logs, or measured in Local chats, older than this |
 | `cacheKeeper.lookbackHours` | 3 | Read chats whose log changed within this many hours; older ones are never listed |
 
 ## Build from source

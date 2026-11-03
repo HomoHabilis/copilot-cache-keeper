@@ -211,7 +211,7 @@ function summaryWords(stats, max = Infinity) {
 let learnedTtls = {};          // model id -> { ttl, at }: newest value from Copilot CLI / Copilot SDK logs
 let measuredTtls = {};         // model id -> seconds the cache was seen to last, from Local chat logs
 const DAY_MS = 86400000;
-const LIFETIME_MAX_AGE_DAYS = 30;
+const LIFETIME_MAX_AGE_DAYS = 60;
 
 /** Every (model, cacheTtlSeconds) a parsed log line carries, wherever it sits in the event. */
 function ttlsInEvent(e, out = []) {
