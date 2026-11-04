@@ -55,11 +55,12 @@ function capPercent() {
   return p > 0 ? p : 50;
 }
 
-/** cacheKeeper.autoKeepWarmMaxMinutes (default 120) in ms; 0 = no time limit. */
+const MAX_WARM_MINUTES = 120;  // hard cap on keep-warm time: the setting can only lower it
+
+/** cacheKeeper.autoKeepWarmMaxMinutes in ms: 1 to 120 min, 120 when unset or invalid. */
 function maxWarmMs() {
-  const m = cfg("autoKeepWarmMaxMinutes");
-  const n = m === undefined || m === null || m === "" ? 120 : Number(m);
-  return n > 0 ? n * 60000 : Infinity;
+  const n = Number(cfg("autoKeepWarmMaxMinutes"));
+  return (n > 0 ? Math.min(MAX_WARM_MINUTES, n) : MAX_WARM_MINUTES) * 60000;
 }
 
 /** "45 min", "2 h", "1 h 10 min". */
@@ -479,7 +480,14 @@ async function reread(s) {
 }
 // Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
 // fits cheap and expensive models. Acting on its own still needs a known price.
-function aboveThreshold(s) { return !!s.cost && s.ctx >= cfg("thresholdTokens"); }
+// Not in the Settings UI (no reason to change them), but still read from settings.json if set
+// there: thresholdTokens, keepAliveLeadSeconds, keepAliveJitterPercent, lifetimeMaxAgeDays.
+/** From this context size a chat is expensive to let expire (cacheKeeper.thresholdTokens, default 100k). */
+function thresholdTokens() {
+  const v = cfg("thresholdTokens");
+  return typeof v === "number" && v >= 0 ? v : 100000;
+}
+function aboveThreshold(s) { return !!s.cost && s.ctx >= thresholdTokens(); }
 /**
  * The chat you are most likely looking at: the one where you last typed. (Not the latest model call:
  * Cache Keeper's own keep-alives and summaries, or another chat's agent, make those newer.)
@@ -802,7 +810,7 @@ async function choose(context, s, pick) {
 }
 
 function capText(st, s) {
-  const time = maxWarmMs() < Infinity ? ` and for at most ${fmtDuration(maxWarmMs())} of keep-warm time` : "";
+  const time = ` and for at most ${fmtDuration(maxWarmMs())} of keep-warm time`;
   return st.cap === null ? "while the price is known"
     : `until about ${core.fmt(st.cap)} cr is spent (${capPercent()}% of what an expiry would add when it started` +
       (closingSummary(s) ? ", the closing handoff summary included)" : ")") + time;
@@ -891,7 +899,7 @@ function chatItem(s, cur = currentChat()) {
     description: `${s.kind === "sdk" ? "Copilot SDK" : "Local"} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") +
-      (st.warmSince ? ` · kept warm ${fmtDuration(warmMs(st))}` + (maxWarmMs() < Infinity ? ` of ${fmtDuration(maxWarmMs())}` : "") : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
+      (st.warmSince ? ` · kept warm ${fmtDuration(warmMs(st))} of ${fmtDuration(maxWarmMs())}` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
       (st.handoff ? " · handoff summary ready" : "") +
       (cur && cur.id === s.id ? " · where you last typed" : ""),
     s,
@@ -929,7 +937,7 @@ async function pickChat(context) {
     ...handoff,
     { label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
     { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent` +
-      (maxWarmMs() < Infinity ? ` or ${fmtDuration(maxWarmMs())} of keep-warm time` : "") + ", then summary" },
+      ` or ${fmtDuration(maxWarmMs())} of keep-warm time, then summary` },
     { label: "Summarize", detail: "Write the handoff summary now" },
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
@@ -1082,7 +1090,7 @@ function updateStatus(context) {
   // Coming back to an expired chat: make an expensive next message stand out (orange). Measured in
   // context tokens, since a cold send costs about context x the model's input price: the same
   // setting then fits a cheap model and an expensive one.
-  const costlyRestart = r <= 0 && !s.busy && s.ctx >= cfg("thresholdTokens");
+  const costlyRestart = r <= 0 && !s.busy && s.ctx >= thresholdTokens();
   if (s.busy) statusItem.text = `$(sync~spin) agent working · cache ${r > 0 ? mmss(r) : "expired"}${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} cache ${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}` +
@@ -1107,11 +1115,10 @@ function updateStatus(context) {
       `| Handoff summary | ~${core.fmt(s.cost.summary)} cr |`,
       `| Session so far | ${core.fmt(s.credits)} cr |`, "");
   } else md.push("No price for this model in Copilot's price sheet.", "");
-  if (st.warmSince) md.push(`Kept warm ${fmtDuration(warmMs(st))}` +
-    (maxWarmMs() < Infinity ? ` of ${fmtDuration(maxWarmMs())} (cacheKeeper.autoKeepWarmMaxMinutes)` : "") + ".", "");
+  if (st.warmSince) md.push(`Kept warm ${fmtDuration(warmMs(st))} of ${fmtDuration(maxWarmMs())} (cacheKeeper.autoKeepWarmMaxMinutes).`, "");
   if (autoChats.length) md.push(`$(zap) Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
     "click to change it, or run *Cache Keeper: Stop keeping warm*.", "");
-  if (costlyRestart) md.push(`*Orange: expired and over cacheKeeper.thresholdTokens (${Math.round(cfg("thresholdTokens") / 1000)}k).*  `);
+  if (costlyRestart) md.push(`*Orange: expired with at least ${Math.round(thresholdTokens() / 1000)}k tokens of context.*  `);
   md.push(`Click to manage the ${shownInList} chat(s) in the list.`);
   const tip = new vscode.MarkdownString(md.join("\n"), true);
   statusItem.tooltip = tip;

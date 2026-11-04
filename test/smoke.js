@@ -707,6 +707,21 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("keep-warm time: 120 min is a hard cap, a higher setting counts as 120", async () => {
+    // 10-min cache so the time limit, not the spending cap, ends it
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(),
+                              settings: { autoKeepWarmCapPercent: 100, autoKeepWarmMaxMinutes: 600,
+                                          ttlSeconds: { "claude-opus-5.5": 600 } } });
+    try {
+      const start = h.clock;
+      await h.run(600 * 20, () => h.sent.some(x => !core.isKeepAlive(x.text)));
+      const alives = h.sent.filter(x => core.isKeepAlive(x.text));
+      assert.ok(h.warnings[1] && h.warnings[1].msg.includes("reached its 2 h limit"), h.warnings[1] && h.warnings[1].msg);
+      assert.ok(alives.every(x => x.at - start + 600000 <= 120 * 60000), "none keeps it warm past 2 h");
+      assert.ok(alives.length >= 10, `${alives.length} keep-alives`);
+    } finally { h.close(); }
+  });
+
   await check("keep-warm time: Back to default stops counting, keeping warm again starts from zero", async () => {
     const answers = ["Auto keep warm", "Back to default", "Auto keep warm"];
     let k = 0;
@@ -733,7 +748,7 @@ const never = () => new Promise(() => {});
         const bg = (h.status.backgroundColor || {}).id;
         assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
         assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
-        assert.strictEqual(h.status.tooltip.value.includes("thresholdTokens"), orange, h.status.tooltip);
+        assert.strictEqual(h.status.tooltip.value.includes("tokens of context"), orange, h.status.tooltip);
       } finally { h.close(); }
     }
   });

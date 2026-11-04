@@ -49,11 +49,6 @@
           "default": 60,
           "description": "Warn this many seconds before the cache expires."
         },
-        "cacheKeeper.thresholdTokens": {
-          "type": "number",
-          "default": 100000,
-          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary (if cacheKeeper.autoSummary is on and the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
-        },
         "cacheKeeper.autoSummary": {
           "type": "boolean",
           "default": true,
@@ -79,8 +74,9 @@
         "cacheKeeper.autoKeepWarmMaxMinutes": {
           "type": "number",
           "default": 120,
-          "minimum": 0,
-          "description": "Auto keep warm stops once its next keep-alive would keep the chat warm past this many minutes of keep-warm time (0 = no time limit; the spending cap still applies). Keep-warm time counts Keep warm once and Auto keep warm together, from the first keep-warm choice, until the cache expires, you pick another option (default, Ignore, Summarize, Stop keeping warm) or close the warning; your own message in the chat starts it again from then. Picking Auto keep warm again once the limit is reached starts a new period."
+          "minimum": 1,
+          "description": "Auto keep warm stops once its next keep-alive would keep the chat warm past this many minutes of keep-warm time. 120 is a hard cap: you can set it lower, never higher (a higher value counts as 120). Keep-warm time counts Keep warm once and Auto keep warm together, from the first keep-warm choice, until the cache expires, you pick another option (default, Ignore, Summarize, Stop keeping warm) or close the warning; your own message in the chat starts it again from then. Picking Auto keep warm again once the limit is reached starts a new period.",
+          "maximum": 120
         },
         "cacheKeeper.summaryAfterKeepWarm": {
           "type": "boolean",
@@ -90,7 +86,7 @@
         "cacheKeeper.minCredits": {
           "type": "number",
           "default": 5,
-          "description": "Ignore chats where letting the cache expire would add less than this many credits: no listing, warnings, automatic actions or orange status for them. Applies on top of cacheKeeper.thresholdTokens."
+          "description": "Ignore chats where letting the cache expire would add less than this many credits: no listing, warnings, automatic actions or orange status for them."
         },
         "cacheKeeper.ttlSeconds": {
           "type": "object",
@@ -98,20 +94,7 @@
           "additionalProperties": {
             "type": "number"
           },
-          "description": "Cache lifetime override per model id, in seconds, e.g. {\"claude-opus-5.5\": 300}. Otherwise: what the chat's own log says (Copilot SDK chats), else the newest value from Copilot CLI and Copilot SDK logs (all chats, Local included: same backend), else the longest pause after which a Local chat still hit the cache (only if longer than the default), else built-in defaults (Claude 300, Sol 6.1 1800, others 300). Learned and measured values older than cacheKeeper.lifetimeMaxAgeDays are not used."
-        },
-        "cacheKeeper.keepAliveLeadSeconds": {
-          "type": "number",
-          "default": 5,
-          "minimum": 2,
-          "description": "Send keep-alives this many seconds before the cache expires (all models). A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper; too late risks missing it."
-        },
-        "cacheKeeper.keepAliveJitterPercent": {
-          "type": "number",
-          "default": 5,
-          "minimum": 0,
-          "maximum": 20,
-          "description": "Vary when keep-alives go out (Keep warm and Auto keep warm), so they don't arrive on a fixed beat: each one is sent at a random point within +/- this share of the cache lifetime around a point that far ahead of cacheKeeper.keepAliveLeadSeconds. Never later than that lead, so the safety margin before expiry is kept. 5 with a 5 min cache: between 5 s and 35 s before expiry. 0 turns it off."
+          "description": "Cache lifetime override per model id, in seconds, e.g. {\"claude-opus-5.5\": 300}. Otherwise: what the chat's own log says (Copilot SDK chats), else the newest value from Copilot CLI and Copilot SDK logs (all chats, Local included: same backend), else the longest pause after which a Local chat still hit the cache (only if longer than the default), else built-in defaults (Claude 300, Sol 6.1 1800, others 300). Learned and measured values older than 60 days are not used."
         },
         "cacheKeeper.afterSend": {
           "type": "string",
@@ -141,13 +124,6 @@
           "minimum": 1,
           "maximum": 168,
           "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."
-        },
-        "cacheKeeper.lifetimeMaxAgeDays": {
-          "type": "number",
-          "default": 60,
-          "minimum": 1,
-          "maximum": 365,
-          "description": "Use cache lifetimes learned from Copilot CLI and Copilot SDK logs, and lifetimes measured in Local chats, only if they are at most this many days old. Copilot can change a lifetime server side, so older values are dropped and the next source applies (measured, then built-in default)."
         }
       }
     }
