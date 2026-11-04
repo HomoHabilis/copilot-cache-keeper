@@ -1591,6 +1591,21 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+
+  await check("Claude and Codex: attachments the harness adds to a message are not part of what you typed", () => {
+    const reminder = "<system-reminder>\nThe user provided the following references:\n- /home/u/models.json\n</system-reminder>";
+    const userWith = (t, text) => cl("user", t, { cwd: "/w", message: { role: "user", content: [{ type: "text", text }, { type: "text", text: reminder }] } });
+    const c = core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(lines([userWith(now - 60000, "hi"),
+      ...claudeCall(now - 59990, now - 59000, { input: 30000, read: 0, id: "a" }),
+      userWith(now - 30000, core.KEEPALIVES[0]), ...claudeCall(now - 29990, now - 29000, { input: 30500, read: 30000, id: "b" })])), { now, priceFor });
+    assert.strictEqual(c.title, "hi");
+    assert.strictEqual(c.stats.turns, 1, "our keep-alive still recognised with a reminder block added");
+    assert.strictEqual(c.lastUserText, core.KEEPALIVES[0]);
+    const x = core.analyzeTrace("codex", "/x/x", harnesses.codexTrace(codexChatLog(now - 60000).replace(
+      '"text":"Refactor the parser"', '"text":"Refactor the parser\\n\\n@/home/u/attach-me.txt\\n@/home/u/b.txt"')), { now, priceFor });
+    assert.strictEqual(x.title, "Refactor the parser");
+  });
+
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
   process.exit(failures ? 1 : 0);
 })();

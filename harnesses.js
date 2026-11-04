@@ -147,7 +147,9 @@ function claudeTrace(text) {
     else if (e.type === "system" && e.subtype === "compact_boundary") ev.push({ t: "compaction", ts });
     else if (e.type === "user" && !e.isMeta) {
       const c = m.content;
-      const textPart = typeof c === "string" ? c : Array.isArray(c) ? c.filter(p => p && p.type === "text").map(p => p.text).join("\n") : "";
+      // what you typed only: the harness adds attachments as separate <system-reminder> text blocks
+      const textPart = withoutReminders(typeof c === "string" ? c
+        : Array.isArray(c) ? c.filter(p => p && p.type === "text").map(p => p.text).join("\n") : "");
       if (Array.isArray(c) && c.some(p => p && p.type === "tool_result")) { ev.push({ t: "activity", ts }); continue; }
       if (/^\[Request interrupted/.test(textPart)) { ev.push({ t: "abort", ts }); continue; }
       if (textPart) ev.push({ t: "user", ts, text: textPart.trim() }, { t: "turn_start", ts });
@@ -173,6 +175,9 @@ function claudeTrace(text) {
 
 // ---------------------------------------------------------------- Codex harness
 // ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<threadId>.jsonl
+
+/** Text without the <system-reminder> blocks Claude's harness adds (attachment references, ...). */
+function withoutReminders(t) { return String(t || "").replace(/<system-reminder>[\s\S]*?(<\/system-reminder>|$)/g, "").trim(); }
 
 function codexText(content) {
   return (Array.isArray(content) ? content : []).map(p => p && (p.text || "")).join("\n").trim();
@@ -203,7 +208,8 @@ function codexTrace(text) {
     }
     if (e.type !== "response_item") continue;
     if (p.type === "message" && p.role === "user") {
-      const t = codexText(p.content);
+      // what you typed only: Codex appends attachments as "@/path" lines
+      const t = codexText(p.content).replace(/(\n+@\S+)+\s*$/, "").trim();
       lastInput = ts;
       // Codex adds its own context blocks as user messages (<environment_context>, ...): not yours
       if (t && !/^<[a-z_]+>[\s\S]*<\/[a-z_]+>$/.test(t)) ev.push({ t: "user", ts, text: t });
