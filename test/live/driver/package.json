@@ -1,0 +1,11 @@
+{
+  "name": "cache-keeper-live-driver",
+  "displayName": "Cache Keeper live test driver",
+  "description": "Runs a live test plan in a real VS Code window (test/live). Never install it: run.sh loads it for one window only.",
+  "publisher": "local",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.100.0" },
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js"
+}

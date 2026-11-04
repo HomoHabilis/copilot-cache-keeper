@@ -1,6 +1,6 @@
 // Smoke test: core logic on a synthetic Copilot debug log, then the extension loaded with a
 // minimal stand-in for the VS Code API, deciding to send a keep-alive before the cache expires.
-// Run: node test/smoke.js   (no dependencies)
+// Run: node test/smoke.js   (no dependencies; ONLY=<part of a check name> runs just those)
 "use strict";
 
 const assert = require("assert");
@@ -12,6 +12,8 @@ const core = require("../core");
 
 let failures = 0;
 function check(name, fn) {
+  // ONLY=<text> runs just the checks whose name contains it
+  if (process.env.ONLY && !name.includes(process.env.ONLY)) return Promise.resolve();
   return Promise.resolve().then(fn).then(
     () => console.log(`ok   ${name}`),
     e => { failures++; console.log(`FAIL ${name}\n     ${e && e.stack || e}`); });
@@ -86,6 +88,49 @@ function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model } = {}) {
          ].map(e => JSON.stringify(e)).join("\n") + "\n";
 }
 
+// Claude harness transcript (~/.claude/projects/<folder>/<sdkSessionId>.jsonl), Anthropic model names.
+const cl = (type, t, extra = {}) => ({ type, timestamp: iso(t), ...extra });
+function claudeCall(t, end, { input, read, out = 300, stop = "end_turn", model = "claude-opus-5-5", ttl = "5m", id }) {
+  const written = input - read - 2;
+  return [cl("api-request", t, { id }),
+          cl("assistant", end, { requestRef: id, message: { id: "msg_" + id, model, stop_reason: stop,
+            content: [{ type: "text", text: "Done: the parser is split in three files." }],
+            usage: { input_tokens: 2, cache_read_input_tokens: read, cache_creation_input_tokens: written, output_tokens: out,
+                     cache_creation: { ephemeral_5m_input_tokens: ttl === "5m" ? written : 0, ephemeral_1h_input_tokens: ttl === "1h" ? written : 0 } } } })];
+}
+function claudeTurn(t, text, { input, read, out = 300, cwd = "/w" } = {}) {
+  return [cl("queue-operation", t - 5, { operation: "enqueue" }),
+          cl("user", t, { cwd, message: { role: "user", content: [{ type: "text", text }] } }),
+          ...claudeCall(t + 10, t + 510, { input, read, out, id: "r" + t })];
+}
+function claudeChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}) {
+  return [cl("user", t0, { cwd, message: { role: "user", content: [{ type: "text", text: "Refactor the parser" }] } }),
+          ...claudeCall(t0 + 50, t0 + 3000, { input: first, read: 0, out: 800, stop: "tool_use", id: "r1" }),
+          cl("user", t0 + 3900, { message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } }),
+          ...claudeCall(t0 + 4000, t0 + 6000, { input: ctx, read: ctx - 1000, id: "r2" }),
+         ].map(e => JSON.stringify(e)).join("\n") + "\n";
+}
+// Codex harness rollout (~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<threadId>.jsonl).
+const cx = (type, t, payload = {}) => ({ type, timestamp: iso(t), payload });
+const cxUser = (t, text) => cx("response_item", t, { type: "message", role: "user", content: [{ type: "input_text", text }] });
+const cxUsage = (t, input, read, out) => cx("token_usage_record", t, { usage: { input_tokens: input, cached_input_tokens: read,
+  cache_write_input_tokens: input - read, output_tokens: out } });
+function codexTurn(t, text, { input, read, out = 300 } = {}) {
+  return [cx("event_msg", t, { type: "task_started" }), cxUser(t + 5, "<environment_context>\n  <cwd>/w</cwd>\n</environment_context>"),
+          cxUser(t + 10, text), cxUsage(t + 510, input, read, out),
+          cx("response_item", t + 520, { type: "message", role: "assistant", content: [{ type: "output_text", text: "OK" }] }),
+          cx("event_msg", t + 600, { type: "task_complete" })];
+}
+function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}) {
+  return [cx("session_meta", t0 - 100, { id: "thread-1", cwd, originator: "vscode_agent_host", model_provider: "vscode-proxy" }),
+          cx("turn_context", t0 - 50, { model: "gpt-6.1-sol", cwd }),
+          cx("event_msg", t0, { type: "task_started" }), cxUser(t0 + 10, "Refactor the parser"), cxUsage(t0 + 3000, first, 0, 800),
+          cx("response_item", t0 + 3500, { type: "function_call", name: "shell", arguments: "{}" }),
+          cx("response_item", t0 + 4000, { type: "function_call_output", output: "ok" }), cxUsage(t0 + 6000, ctx, ctx - 1000, 300),
+          cx("event_msg", t0 + 6500, { type: "task_complete" }),
+         ].map(e => JSON.stringify(e)).join("\n") + "\n";
+}
+
 // ---------------------------------------------------------------- extension with a stand-in VS Code
 
 /**
@@ -95,25 +140,32 @@ function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model } = {}) {
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
-                         kind = "local", sdkCwd, sdkId = "sdk-0007" }) {
+                         kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
   const logs = path.join(storage, "GitHub.copilot-chat", "debug-logs");
   // Copilot SDK chats live under ~/.copilot: point the home folder at the temp dir
   const realHome = process.env.HOME;
+  // lifetimes learned by an earlier harness (module state in core) must not leak into this one
+  await core.learnTtls([], undefined, 30, 30, Date.now() + 1000 * 86400000);
   process.env.HOME = path.join(tmp, "home");
   const sdkRoot = path.join(tmp, "home", ".copilot", "session-state");
-  const globalStorage = path.join(tmp, "globalStorage");
+  const globalStorage = path.join(tmp, "data", "User", "globalStorage");
   fs.mkdirSync(globalStorage, { recursive: true });
   fs.copyFileSync(path.join(__dirname, "fixtures", "agent-host.db"), path.join(globalStorage, "agent-host.db"));
-  const chat = kind === "sdk" ? path.join(sdkRoot, sdkId) : path.join(logs, "sess-1");
-  const logName = kind === "sdk" ? "events.jsonl" : "main.jsonl";
+  fs.cpSync(path.join(__dirname, "fixtures", "agentSessionData"), path.join(tmp, "data", "agentSessionData"), { recursive: true });
+  const day = new Date(now), pad = n => String(n).padStart(2, "0");
+  const chat = { sdk: path.join(sdkRoot, sdkId), local: path.join(logs, "sess-1"),
+    claude: path.join(tmp, "home", ".claude", "projects", "-w", ),
+    codex: path.join(tmp, "home", ".codex", "sessions", String(day.getFullYear()), pad(day.getMonth() + 1), pad(day.getDate())) }[kind];
+  const logName = { sdk: "events.jsonl", local: "main.jsonl", claude: "claude-sdk-1.jsonl", codex: "rollout-2026-11-03T13-19-13-thread-1.jsonl" }[kind];
+  const cwd = sdkCwd || tmp;
   let clock = now;
-  const sent = [], warnings = [], commands = {}, ran = [], lists = [];
+  const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [];
   let status;
   const fakeFs = {
-    stat: async u => ({ mtime: fs.statSync(u.fsPath).mtimeMs }),
+    stat: async u => { const st = fs.statSync(u.fsPath); return { mtime: st.mtimeMs, size: st.size }; },
     readFile: async u => fs.readFileSync(u.fsPath),
     writeFile: async (u, b) => fs.writeFileSync(u.fsPath, b),
     createDirectory: async u => fs.mkdirSync(u.fsPath, { recursive: true }),
@@ -123,11 +175,21 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                      keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab",
                      autoKeepWarmCapPercent: 50, ...extra };
   const tab = { label: "chat", input: {} };
+  // Chat input boxes, as VS Code exposes them to extensions: the chat's own (with what you typed and
+  // not sent), and another chat's in the Chat view. A submit empties the focused one.
+  const changeListeners = [];
+  const inputDoc = (name, text) => { const d = { uri: { scheme: "chatSessionInput", toString: () => `chatSessionInput:${name}` },
+    text, isClosed: false, getText() { return this.text; }, get lineCount() { return this.text.split("\n").length; } }; return d; };
+  const chatInput = inputDoc("input-0", draft), otherInput = inputDoc("input-1", "other chat's draft");
+  const setText = (d, t) => { d.text = t; changeListeners.forEach(f => f({ document: d })); };
   const append = evs => fs.appendFileSync(path.join(chat, logName), evs.map(e => JSON.stringify(e)).join("\n") + "\n");
   let lastCtx = ctx;
   const vscode = {
     env: { remoteName: undefined },
     workspace: { getConfiguration: () => ({ get: k => settings[k] }), fs: fakeFs,
+                 textDocuments: [chatInput, otherInput],
+                 onDidChangeTextDocument: f => { changeListeners.push(f); return { dispose() { changeListeners.splice(changeListeners.indexOf(f), 1); } }; },
+                 applyEdit: async e => { for (const [u, t] of e.edits) setText([chatInput, otherInput].find(d => d.uri.toString() === u.toString()), t); return true; },
                  // more folders = a multi-root workspace: tmp, tmp/repo2, ...
                  workspaceFolders: Array.from({ length: folders }, (_, i) => {
                    const f = i ? path.join(tmp, `repo${i + 1}`) : tmp;
@@ -137,7 +199,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
       showWarningMessage: async (msg, ...buttons) => { warnings.push({ at: clock, msg }); return answer(msg, buttons, warnings.length); },
-      showInformationMessage: async () => undefined,
+      showInformationMessage: async m => { infos.push(m); return undefined; },
       showErrorMessage: async m => { throw new Error("unexpected error message: " + m); },
       showQuickPick: async items => menu(items),
       // the status-bar list: picks the first chat
@@ -153,12 +215,19 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
         if (id === "workbench.action.chat.openSessionInEditorGroup") {
           vscode.window.tabGroups.all[0].tabs = [tab]; vscode.window.tabGroups.all[0].activeTab = tab;
           // the agent starts working (e.g. a subagent) while the tab is being opened
-          if (busyOnOpen) append([kind === "sdk" ? ev("assistant.turn_start", clock) : { type: "turn_start", ts: clock }]);
+          if (busyOnOpen) append([{ sdk: ev("assistant.turn_start", clock), claude: cl("queue-operation", clock, { operation: "enqueue" }),
+            codex: cx("event_msg", clock, { type: "task_started" }) }[kind] || { type: "turn_start", ts: clock }]);
         }
         if (id === "workbench.action.chat.submit") {
           sent.push({ at: clock, text: a.inputValue });
+          submits.push(a);
+          // preserveInput: only the given text is sent, the input box (text, attachments) is left alone;
+          // otherwise (or a VS Code that ignores the option) the box is filled, sent and emptied
+          if (ignorePreserve || !(a.acceptInputOptions && a.acceptInputOptions.preserveInput)) { setText(chatInput, a.inputValue); setText(chatInput, ""); }
           lastCtx += 700;
           if (kind === "sdk") append(sdkTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4, dur: 500 }));
+          else if (kind === "claude") append(claudeTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4, cwd }));
+          else if (kind === "codex") append(codexTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4 }));
           else append([{ type: "user_message", ts: clock, attrs: { content: a.inputValue } },
                   { type: "turn_start", ts: clock + 5 },
                   { type: "llm_request", ts: clock + 10, dur: 500, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
@@ -171,6 +240,8 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
     StatusBarAlignment: { Right: 2 },
     MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
     ThemeColor: class { constructor(id) { this.id = id; } },
+    Range: class { constructor(...a) { this.a = a; } },
+    WorkspaceEdit: class { constructor() { this.edits = []; } replace(uri, range, text) { this.edits.push([uri, text]); } },
     Uri: { file: f => ({ scheme: "file", fsPath: f, path: f }),
            from: o => ({ ...o, toString: () => `${o.scheme}://${o.authority}${o.path}` }),
            joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return { scheme: "file", fsPath: f, path: f }; } },
@@ -193,6 +264,13 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   if (kind === "sdk") {
     fs.writeFileSync(path.join(chat, "workspace.yaml"), `id: ${sdkId}\ncwd: ${sdkCwd || tmp}\nclient_name: vscode-agent-host\nsummary_count: 0\n`);
     fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+  } else if (kind === "claude" || kind === "codex") {
+    fs.writeFileSync(path.join(chat, logName), (kind === "claude" ? claudeChatLog : codexChatLog)(clock - 7000, { ctx, cwd, ...(first ? { first } : {}) }));
+    // Copilot's price sheet, as a Local chat of the workspace has it (Claude and Codex logs carry no prices)
+    if (!noPrices) {
+      fs.mkdirSync(path.join(logs, "price-src"), { recursive: true });
+      fs.writeFileSync(path.join(logs, "price-src", "models.json"), MODELS);
+    }
   } else {
     fs.writeFileSync(path.join(chat, "models.json"), MODELS);
     fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
@@ -200,12 +278,14 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
-    memento, globalStorage, sdkRoot, lists, logs,
+    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
       lastCtx += 2000;
       if (kind === "sdk") { append(sdkTurn(clock, "Next step please", { input: lastCtx, read: lastCtx - 2000 })); h.cacheFrom = clock + 10; return; }
+      if (kind === "claude") { append(claudeTurn(clock, "Next step please", { input: lastCtx, read: lastCtx - 2000, cwd })); h.cacheFrom = clock + 10; return; }
+      if (kind === "codex") { append(codexTurn(clock, "Next step please", { input: lastCtx, read: lastCtx - 2000 })); h.cacheFrom = clock + 10; return; }
       append([{ type: "user_message", ts: clock, attrs: { content: "Next step please" } },
               { type: "turn_start", ts: clock + 5 },
               { type: "llm_request", ts: clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
@@ -1114,6 +1194,461 @@ const never = () => new Promise(() => {});
         assert.strictEqual(h.lists.at(-1).length, want, JSON.stringify(settings));
       } finally { h.close(); }
     }
+  });
+
+
+  // ---------------------------------------------------------------- Claude and Codex harnesses
+  const harnesses = require("../harnesses");
+  const ALL_KINDS = [["local", {}], ["sdk", {}], ["claude", {}], ["codex", { ttlSeconds: { "gpt-6.1-sol": 300 } }]];
+  const priceFor = m => core.priceSheetFrom(MODELS, m);
+  const lines = evs => evs.map(e => JSON.stringify(e)).join("\n") + "\n";
+
+  await check("Claude log: same chat state as the other harnesses (timer, lifetime, costs, title)", () => {
+    const s = core.analyzeTrace("claude", "/c/claude-sdk-1.jsonl", harnesses.claudeTrace(claudeChatLog(now - 60000)), { now, priceFor });
+    assert.ok(s);
+    assert.strictEqual(s.model, "claude-opus-5.5", "Anthropic name mapped to Copilot's");
+    assert.strictEqual(s.ttl, 300);
+    assert.strictEqual(s.ttlFrom, "this chat's log");
+    assert.strictEqual(s.cacheFrom, now - 60000 + 4000, "cache refreshed when the request was sent (api-request), not when the reply ended");
+    assert.strictEqual(s.busy, false);
+    assert.strictEqual(s.ctx, 150000);
+    assert.ok(s.cost && s.cost.missExtra > 60 && s.cost.missExtra < 75, String(s.cost && s.cost.missExtra));
+    assert.strictEqual(s.title, "Refactor the parser");
+    assert.strictEqual(s.stats.turns, 1, "a tool result is not your message");
+    assert.strictEqual(s.creditsEstimated, true, "no credits in Claude's log: estimated from Copilot's prices");
+    const billed = core.analyzeTrace("claude", "/c/x.jsonl", harnesses.claudeTrace(claudeChatLog(now - 60000)), { now, priceFor, credits: 70 });
+    assert.strictEqual(billed.credits, 70);
+    assert.strictEqual(billed.creditsEstimated, false);
+  });
+
+  await check("Claude log: busy while a tool runs or a message waits; idle after end_turn or a stop; 1-hour cache", () => {
+    const base = claudeChatLog(now - 60000);
+    const busy = extra => core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(base + lines(extra)), { now, priceFor }).busy;
+    assert.strictEqual(busy([cl("queue-operation", now - 1000, { operation: "enqueue" })]), true, "message queued");
+    assert.strictEqual(busy([cl("user", now - 9000, { message: { content: [{ type: "text", text: "go" }] } }),
+      ...claudeCall(now - 8990, now - 5000, { input: 151000, read: 150000, stop: "tool_use", id: "t1" })]), true, "tool running");
+    assert.strictEqual(busy([cl("user", now - 9000, { message: { content: [{ type: "text", text: "go" }] } }),
+      ...claudeCall(now - 8990, now - 5000, { input: 151000, read: 150000, stop: "tool_use", id: "t1" }),
+      cl("user", now - 4000, { message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } })]), false, "stopped");
+    assert.strictEqual(busy([cl("user", now - 9000, { message: { content: [{ type: "text", text: "go" }] } }),
+      ...claudeCall(now - 8990, now - 5000, { input: 151000, read: 150000, id: "t2" })]), false, "turn ended");
+    const s = core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(base + lines(claudeCall(now - 30000, now - 29000,
+      { input: 152000, read: 150000, ttl: "1h", id: "t3" }))), { now, priceFor });
+    assert.strictEqual(s.ttl, 3600, "1-hour cache tier in the log");
+  });
+
+  await check("Claude log: a reply streamed in blocks counts once; subagent calls don't move the timer", () => {
+    const [req, reply] = claudeCall(now - 30000, now - 29000, { input: 152000, read: 150000, id: "dup" });
+    const sub = { ...claudeCall(now - 1000, now - 500, { input: 9000, read: 0, id: "sub" })[1], isSidechain: true };
+    const t = harnesses.claudeTrace(claudeChatLog(now - 60000) + lines([req, reply, { ...reply, timestamp: iso(now - 28990) }, sub]));
+    assert.strictEqual(t.events.filter(e => e.t === "call").length, 3);
+    const s = core.analyzeTrace("claude", "/c/x", t, { now, priceFor });
+    assert.strictEqual(s.cacheFrom, now - 30000);
+    assert.strictEqual(s.ctx, 152000);
+  });
+
+  await check("Codex log: its own context blocks aren't messages; busy during a task; model from the log", () => {
+    const s = core.analyzeTrace("codex", "/x/rollout-thread-1.jsonl", harnesses.codexTrace(codexChatLog(now - 60000)), { now, priceFor });
+    assert.ok(s);
+    assert.strictEqual(s.model, "gpt-6.1-sol");
+    assert.strictEqual(s.ttl, 1800, "no lifetime in Codex's log: learned or default");
+    assert.strictEqual(s.cacheFrom, now - 60000 + 4000, "request started when its last input (a tool output) arrived");
+    assert.strictEqual(s.title, "Refactor the parser");
+    assert.strictEqual(s.stats.turns, 1);
+    assert.strictEqual(s.busy, false);
+    const busy = extra => core.analyzeTrace("codex", "/x", harnesses.codexTrace(codexChatLog(now - 60000) + lines(extra)), { now, priceFor }).busy;
+    assert.strictEqual(busy([cx("event_msg", now - 2000, { type: "task_started" }), cxUser(now - 1990, "go")]), true);
+    assert.strictEqual(busy([cx("event_msg", now - 2000, { type: "task_started" }), cx("event_msg", now - 100, { type: "turn_aborted" })]), false);
+    const ka = core.KEEPALIVES[0];
+    const k = core.analyzeTrace("codex", "/x", harnesses.codexTrace(codexChatLog(now - 60000) + lines(codexTurn(now - 20000, ka, { input: 150700, read: 150000, out: 4 }))), { now, priceFor });
+    assert.strictEqual(k.lastUserText, ka);
+    assert.ok(k.lastRealUserTs < now - 50000, "the keep-alive is not your message");
+  });
+
+  await check("extension: Claude chat gets its keep-alive through agent-host-claude:/<VS Code id>, credits as billed", async () => {
+    const h = await harness({ kind: "claude", answer: () => "Keep warm" });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.warnings.length, 1);
+      assert.strictEqual(h.sent.length, 1);
+      assert.ok(core.isKeepAlive(h.sent[0].text));
+      const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
+      assert.strictEqual(open.a.resource.scheme, "agent-host-claude");
+      assert.strictEqual(open.a.resource.path, "/vsc-claude-1");
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      const item = h.lists.at(-1)[0];
+      assert.ok(item.description.startsWith("Claude"), item.description);
+      assert.ok(/spent 70 cr/.test(item.detail), item.detail);
+    } finally { h.close(); }
+  });
+
+  await check("extension: Codex chat gets its keep-alive through agent-host-codex:/<VS Code id>", async () => {
+    const h = await harness({ kind: "codex", answer: () => "Keep warm", settings: { ttlSeconds: { "gpt-6.1-sol": 300 } } });
+    try {
+      const expiry = h.cacheFrom + 300000;
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.sent.length, 1);
+      const lead = (expiry - h.sent[0].at) / 1000;
+      assert.ok(lead > 1.5 && lead <= 9, `sent ${lead} s before expiry`);
+      const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
+      assert.strictEqual(open.a.resource.scheme, "agent-host-codex");
+      assert.strictEqual(open.a.resource.path, "/vsc-codex-1");
+    } finally { h.close(); }
+  });
+
+  await check("extension: Claude chat busy when its tab opens: nothing submitted", async () => {
+    const h = await harness({ kind: "claude", answer: () => "Keep warm", busyOnOpen: true });
+    try {
+      await h.run(300);
+      assert.strictEqual(h.sent.length, 0);
+    } finally { h.close(); }
+  });
+
+  await check("extension: Claude/Codex chats of another folder, your own Claude Code sessions, own-account billing: left alone", async () => {
+    const log = path.join(os.tmpdir(), `ck-smoke-log-${process.pid}.txt`);
+    const h = await harness({ kind: "claude", sdkCwd: "/somewhere/else", answer: () => "Keep warm", settings: { debugLogFile: log } });
+    try {
+      await h.run(300);
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.sent.length, 0);
+      const text = fs.readFileSync(log, "utf8");
+      assert.ok(/Claude chat in \/somewhere\/else, not open in this window/.test(text), "other folder");
+      assert.ok(/not created in VS Code/.test(text), "discovered Claude Code session");
+      assert.ok(/billed to your own anthropic account/.test(text), "own Anthropic account");
+    } finally { h.close(); fs.rmSync(log, { force: true }); }
+  });
+
+
+  await check("diagnostics run without error for every harness and name the chat", async () => {
+    for (const [kind, id, extra] of [["local", "sess-1", {}], ["sdk", "sdk-0007", {}], ["claude", "vsc-clau", {}],
+                                     ["codex", "vsc-code", { ttlSeconds: { "gpt-6.1-sol": 300 } }]]) {
+      const log = path.join(os.tmpdir(), `ck-smoke-diag-${process.pid}-${kind}.txt`);
+      const h = await harness({ kind, answer: never, settings: { debugLogFile: log, ...extra } });
+      try {
+        await h.run(6);
+        await h.commands["cacheKeeper.diagnose"]();
+        await new Promise(r => setTimeout(r, 50));
+        const text = fs.readFileSync(log, "utf8");
+        const err = /^\d\d:\d\d:\d\d diagnostics: .*$/m.exec(text);   // the command's error line
+        assert.ok(!err, `${kind}: ${err && err[0]}`);
+        assert.ok(new RegExp(`${id}[^\\n]*listed`).test(text), `${kind}: chat not in diagnostics\n${text}`);
+      } finally { h.close(); fs.rmSync(log, { force: true }); }
+    }
+  });
+
+
+  await check("every harness: our message is sent alone (preserveInput): your unsent text and attachments stay in the box", async () => {
+    for (const [kind, extra] of ALL_KINDS) {
+      const h = await harness({ kind, answer: () => "Keep warm", draft: "half-written question", settings: extra });
+      try {
+        await h.run(300, () => h.sent.length > 0);
+        assert.strictEqual(h.sent.length, 1, kind);
+        const o = h.submits[0].acceptInputOptions || {};
+        assert.strictEqual(o.preserveInput, true, `${kind}: sent without the box's attachments and implicit context`);
+        assert.strictEqual(h.chatInput.text, "half-written question", `${kind}: box untouched`);
+        await h.run(15);
+        assert.strictEqual(h.chatInput.text, "half-written question", kind);
+        assert.strictEqual(h.otherInput.text, "other chat's draft", kind);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("fallback, a VS Code that ignores preserveInput: the unsent text is put back after the reply, for every harness", async () => {
+    for (const [kind, extra] of ALL_KINDS) {
+      const h = await harness({ kind, answer: () => "Keep warm", draft: "half-written question", settings: extra, ignorePreserve: true });
+      try {
+        await h.run(300, () => h.sent.length > 0);
+        assert.strictEqual(h.sent.length, 1, kind);
+        assert.strictEqual(h.chatInput.text, "", `${kind}: the submit emptied the box`);
+        await h.run(15);
+        assert.strictEqual(h.chatInput.text, "half-written question", `${kind}: draft back after the reply`);
+        assert.strictEqual(h.otherInput.text, "other chat's draft", `${kind}: other chats' boxes untouched`);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("unsent text: never overwrites what you typed again meanwhile; nothing to do without a draft", async () => {
+    const h = await harness({ answer: () => "Keep warm", draft: "old draft", ignorePreserve: true });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      h.setText(h.chatInput, "new text typed meanwhile");
+      await h.run(15);
+      assert.strictEqual(h.chatInput.text, "new text typed meanwhile");
+    } finally { h.close(); }
+    const h2 = await harness({ answer: () => "Keep warm" });
+    try {
+      await h2.run(300, () => h2.sent.length > 0);
+      await h2.run(15);
+      assert.strictEqual(h2.chatInput.text, "");
+    } finally { h2.close(); }
+  });
+
+
+  // ---------------------------------------------------------------- the same features on every harness
+  // One chat, written in each harness's own log format: Italian, 2 files edited, 1 compaction, a cache
+  // hit after a 20 min pause, then one of our keep-alives and one of our summary requests.
+  const IT_USER = "Ciao, puoi rifattorizzare il parser? Grazie, è per il nuovo modulo.";
+  const IT_REPLY = "Certo, ho diviso il parser in tre file e questa è la nuova struttura del modulo.";
+  const KA = core.KEEPALIVES_BY_LANG.it[0];
+  const SUM = core.summaryPrompt("it", { rel: "/w/.copilot-handoff/x.md", turns: 1, compactions: 1, files: 2, ctxK: 50, words: 300 });
+  // calls: [startOffsetMs, input, cached, out]; the 3rd comes 20 min after the 2nd and still hits the cache
+  const P0 = now - 3600000, GAP = 20 * 60000;
+  const CALLS = [[0, 30000, 0, 800], [5000, 60000, 29000, 300], [5000 + GAP, 61000, 60000, 300]];
+  const KA_CALL = [5000 + GAP + 60000, 61900, 61000, 4], SUM_CALL = [5000 + GAP + 120000, 63000, 61900, 400];
+  const LOCAL_MODEL = "claude-opus-5.5";
+  const build = {
+    local() {
+      const e = [{ type: "user_message", ts: P0 - 10, attrs: { content: IT_USER } }, { type: "turn_start", ts: P0 - 5 }];
+      const call = ([o, i, c, out]) => ({ type: "llm_request", ts: P0 + o, dur: 1000, attrs: { debugName: "panel/editAgent", model: LOCAL_MODEL,
+        inputTokens: i, cachedTokens: c, outputTokens: out, copilotUsageNanoAiu: ((i - c) * 480 + c * 20 + out * 2000) * 1e3 } });
+      e.push(call(CALLS[0]),
+        { type: "tool_call", ts: P0 + 1500, name: "replace_string_in_file", attrs: { args: JSON.stringify({ filePath: "/w/a.js" }) } },
+        { type: "tool_call", ts: P0 + 1600, name: "create_file", attrs: { args: JSON.stringify({ filePath: "/w/b.js" }) } },
+        { type: "llm_request", ts: P0 + 2000, dur: 500, attrs: { debugName: "summarizeConversationHistory", model: LOCAL_MODEL } },
+        call(CALLS[1]), { type: "agent_response", ts: P0 + 6200, attrs: { response: IT_REPLY } }, { type: "turn_end", ts: P0 + 6500 },
+        { type: "user_message", ts: P0 + CALLS[2][0] - 10, attrs: { content: IT_USER + " Ancora una cosa." } }, { type: "turn_start", ts: P0 + CALLS[2][0] - 5 },
+        call(CALLS[2]), { type: "turn_end", ts: P0 + CALLS[2][0] + 1200 });
+      for (const [text, c] of [[KA, KA_CALL], [SUM, SUM_CALL]]) {
+        e.push({ type: "user_message", ts: P0 + c[0] - 10, attrs: { content: text } }, { type: "turn_start", ts: P0 + c[0] - 5 }, call(c),
+               { type: "turn_end", ts: P0 + c[0] + 1200 });
+      }
+      return { text: e.map(x => JSON.stringify(x)).join("\n"), trace: harnesses.localTrace };
+    },
+    sdk() {
+      const e = [ev("user.message", P0 - 10, { content: IT_USER }), ev("assistant.turn_start", P0 - 5)];
+      const call = ([o, i, c, out]) => sdkUsage(P0 + o, 1000, { input: i, read: c, out });
+      e.push(call(CALLS[0]), ev("tool.execution_start", P0 + 1500, { toolName: "edit", arguments: { path: "/w/a.js" } }),
+        ev("tool.execution_start", P0 + 1600, { toolName: "create", arguments: { path: "/w/b.js" } }),
+        ev("session.compaction_complete", P0 + 2000), ev("assistant.turn_end", P0 + 4900), ev("assistant.turn_start", P0 + 4950),
+        call(CALLS[1]), ev("assistant.message", P0 + 6200, { content: IT_REPLY }), ev("assistant.turn_end", P0 + 6500), ev("session.usage_checkpoint", P0 + 6510),
+        ev("user.message", P0 + CALLS[2][0] - 10, { content: IT_USER + " Ancora una cosa." }), ev("assistant.turn_start", P0 + CALLS[2][0] - 5),
+        call(CALLS[2]), ev("assistant.turn_end", P0 + CALLS[2][0] + 1200), ev("session.usage_checkpoint", P0 + CALLS[2][0] + 1210));
+      for (const [text, c] of [[KA, KA_CALL], [SUM, SUM_CALL]]) {
+        e.push(ev("user.message", P0 + c[0] - 10, { content: text }), ev("assistant.turn_start", P0 + c[0] - 5), call(c),
+               ev("assistant.turn_end", P0 + c[0] + 1200), ev("session.usage_checkpoint", P0 + c[0] + 1210));
+      }
+      return { text: lines(e), trace: t => harnesses.sdkTrace(t, { cwd: "/w" }) };
+    },
+    claude() {
+      const user = (t, text) => cl("user", t, { cwd: "/w", message: { role: "user", content: [{ type: "text", text }] } });
+      const call = ([o, i, c, out], stop = "end_turn", content) => {
+        const [req, rep] = claudeCall(P0 + o, P0 + o + 1000, { input: i, read: c, out, stop, id: "r" + o });
+        if (content) rep.message.content = content;
+        return [req, rep];
+      };
+      const e = [user(P0 - 10, IT_USER),
+        ...call(CALLS[0], "tool_use", [{ type: "tool_use", name: "Edit", input: { file_path: "/w/a.js" } }, { type: "tool_use", name: "Write", input: { file_path: "/w/b.js" } }]),
+        cl("user", P0 + 1500, { message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } }),
+        cl("system", P0 + 2000, { subtype: "compact_boundary" }),
+        ...call(CALLS[1], "end_turn", [{ type: "text", text: IT_REPLY }]),
+        user(P0 + CALLS[2][0] - 10, IT_USER + " Ancora una cosa."), ...call(CALLS[2])];
+      for (const [text, c] of [[KA, KA_CALL], [SUM, SUM_CALL]]) e.push(user(P0 + c[0] - 10, text), ...call(c));
+      return { text: lines(e), trace: harnesses.claudeTrace };
+    },
+    codex() {
+      const e = [cx("session_meta", P0 - 100, { id: "thread-1", cwd: "/w" }), cx("turn_context", P0 - 50, { model: LOCAL_MODEL, cwd: "/w" })];
+      const turn = (t, text, calls, extra = []) => {
+        e.push(cx("event_msg", t - 20, { type: "task_started" }), cxUser(t - 15, "<environment_context>\n</environment_context>"), cxUser(t - 10, text));
+        for (const [o, i, c, out] of calls) {
+          if (o !== calls[0][0]) e.push(cx("response_item", P0 + o - 10, { type: "function_call_output", output: "ok" }));
+          e.push(cxUsage(P0 + o + 1000, i, c, out));
+        }
+        e.push(...extra, cx("event_msg", t + 9000 + (calls.at(-1)[0] - calls[0][0]), { type: "task_complete" }));
+      };
+      turn(P0, IT_USER, [CALLS[0], CALLS[1]], [
+        cx("response_item", P0 + 1500, { type: "custom_tool_call", name: "apply_patch", input: "*** Begin Patch\n*** Update File: /w/a.js\n*** Add File: /w/b.js\n*** End Patch" }),
+        cx("compacted", P0 + 2000), cx("response_item", P0 + 6200, { type: "message", role: "assistant", content: [{ type: "output_text", text: IT_REPLY }] })]);
+      turn(P0 + CALLS[2][0], IT_USER + " Ancora una cosa.", [CALLS[2]]);
+      for (const [text, c] of [[KA, KA_CALL], [SUM, SUM_CALL]]) turn(P0 + c[0], text, [c]);
+      return { text: lines(e).replace(/"timestamp":"[^"]+"/g, m => m), trace: harnesses.codexTrace };
+    },
+  };
+  const expectTtl = { local: [300, "default"], sdk: [300, "this chat's log"], claude: [300, "this chat's log"], codex: [300, "default"] };
+
+  for (const kind of ["local", "sdk", "claude", "codex"]) {
+    await check(`feature matrix, ${kind}: language, summary sizing, your messages vs ours, prices, credits, lifetime, timer, keep-alive cost, measured lifetime`, () => {
+      const { text, trace } = build[kind]();
+      const s = core.analyzeTrace(kind, "/x/chat-1", trace(text), { now, priceFor: kind === "local" ? m => core.priceSheetFrom(MODELS, m) : priceFor });
+      assert.ok(s, "parsed");
+      assert.strictEqual(s.model, LOCAL_MODEL);
+      assert.strictEqual(s.lang, "it", "language from the agent's answers and your messages");
+      assert.strictEqual(s.stats.files, 2, "edited files");
+      assert.strictEqual(s.stats.compactions, 1, "compactions");
+      assert.strictEqual(s.stats.turns, 2, "your messages only, not our keep-alive and summary request");
+      assert.strictEqual(s.title, IT_USER.slice(0, 47) + "...");
+      assert.strictEqual(s.lastUserText, SUM.trim());
+      assert.ok(core.isOwnMessage(s.lastUserText));
+      assert.ok(Math.abs(s.lastRealUserTs - (P0 + CALLS[2][0] - 10)) < 20, "last message you typed");
+      assert.strictEqual(s.ctx, SUM_CALL[1]);
+      assert.strictEqual(s.busy, false);
+      const [ttl, from] = expectTtl[kind];
+      assert.strictEqual(s.ttl, ttl, "lifetime");
+      assert.strictEqual(s.ttlFrom, from, "lifetime source");
+      // cache refreshed when the last call started (Codex: when its last input arrived, just before)
+      assert.ok(Math.abs(s.cacheFrom - (P0 + SUM_CALL[0])) <= 10, `timer start ${s.cacheFrom - P0} vs ${SUM_CALL[0]}`);
+      // prices: Opus 500/20/2000 per 1M; Local's write price is corrected to what calls were billed (480)
+      const write = kind === "local" ? 480e-6 : 500e-6, read = 20e-6;
+      assert.ok(Math.abs(s.cost.missExtra - SUM_CALL[1] * (write - read)) < 0.01, `expiry cost ${s.cost.missExtra}`);
+      // keep-alive cost learned from our earlier messages (keep-alive and summary request): uncached part
+      // minus the reply before it; of the two samples the upper middle one is used
+      const samples = [(KA_CALL[1] - KA_CALL[2]) - CALLS[2][3], (SUM_CALL[1] - SUM_CALL[2]) - KA_CALL[3]].sort((a, b) => a - b);
+      const fixed = Math.max(400, samples[1]);
+      const heartbeat = SUM_CALL[1] * read + (fixed + SUM_CALL[3]) * write + 30 * 2000e-6;
+      assert.ok(Math.abs(s.cost.heartbeat - heartbeat) < 0.01, `keep-alive cost ${s.cost.heartbeat} vs ${heartbeat}`);
+      assert.ok(s.cost.summary > 0 && s.cost.restart > 0);
+      assert.ok(s.summaryWords >= 150 && s.summaryWords <= 1500);
+      // credits: as billed where the log has them (Local, SDK), else estimated from the prices
+      assert.strictEqual(s.creditsEstimated, kind === "claude" || kind === "codex");
+      const all = [...CALLS, KA_CALL, SUM_CALL];
+      const billed = all.reduce((a, [, i, c, out]) => a + ((i - c) * (kind === "local" ? 480 : 500) + c * 20 + out * 2000) / 1e6, 0);
+      assert.ok(Math.abs(s.credits - billed) < 0.05, `credits ${s.credits} vs ${billed}`);
+      // measured lifetime: only where the log doesn't state it
+      if (kind === "local" || kind === "codex") assert.ok(s.hitGaps[LOCAL_MODEL] >= 1190, JSON.stringify(s.hitGaps));
+      else assert.deepStrictEqual(s.hitGaps, {});
+    });
+  }
+
+
+  const URI = { local: "vscode-chat-session", sdk: "agent-host-copilotcli", claude: "agent-host-claude", codex: "agent-host-codex" };
+
+  await check("every harness: Summarize writes the handoff request into that chat, through its own URI", async () => {
+    for (const [kind, settings] of ALL_KINDS) {
+      const h = await harness({ kind, answer: () => "Summarize", settings, ctx: 150000 });
+      try {
+        await h.run(300, () => h.sent.length > 0);
+        assert.strictEqual(h.sent.length, 1, kind);
+        assert.ok(h.sent[0].text.startsWith("[summary]"), `${kind}: ${h.sent[0].text.slice(0, 40)}`);
+        assert.ok(/\.copilot-handoff\/.*\.md/.test(h.sent[0].text), kind);
+        const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
+        assert.strictEqual(open.a.resource.scheme, URI[kind], kind);
+        assert.ok(h.infos.some(m => /writing handoff summary/.test(m)), kind);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("every harness: status bar countdown, tooltip with lifetime source and costs, list label", async () => {
+    const from = { local: "default", sdk: "this chat's log", claude: "this chat's log", codex: "setting" };
+    for (const [kind, settings] of ALL_KINDS) {
+      const h = await harness({ kind, answer: never, settings, ctx: 150000 });
+      try {
+        await h.run(3);
+        assert.ok(/cache \d:\d\d/.test(h.status.text), `${kind}: ${h.status.text}`);
+        const tip = String(h.status.tooltip.value);
+        assert.ok(tip.includes(`cache lifetime 300 s (${from[kind]})`), `${kind}: ${tip.split("\n")[1]}`);
+        assert.ok(/Expiry adds \| ~\d+ cr/.test(tip) && /Keep-alive \| ~/.test(tip) && /Handoff summary \| ~/.test(tip), kind);
+        await h.commands["cacheKeeper.options"]();
+        assert.ok(h.lists.at(-1)[0].description.startsWith({ local: "Local", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" }[kind]), kind);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("every harness: at expiry, the notice says what the next message will cost", async () => {
+    for (const [kind, settings] of ALL_KINDS) {
+      const h = await harness({ kind, answer: never, settings, ctx: 40000 });   // below the summary threshold: it just expires
+      try {
+        await h.run(320);
+        const n = h.infos.find(m => /^Copilot cache expired/.test(m));
+        assert.ok(n && /~[\d.]+ extra credits/.test(n), `${kind}: ${n}`);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("Claude/Codex without Copilot prices: warning says so, nothing automatic, no costs shown", async () => {
+    for (const [kind, settings] of ALL_KINDS.filter(([k]) => k === "claude" || k === "codex")) {
+      const h = await harness({ kind, answer: never, settings, noPrices: true, ctx: 150000 });
+      try {
+        await h.run(320);
+        assert.strictEqual(h.sent.length, 0, `${kind}: no automatic summary without a price`);
+        assert.ok(h.warnings.length === 1 && /No price for this model/.test(h.warnings[0].msg), `${kind}: ${h.warnings[0] && h.warnings[0].msg}`);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("Codex chat: a cache hit after a long pause is kept as a measured lifetime, like Local chats", async () => {
+    const h = await harness({ kind: "codex", answer: never });
+    try {
+      // 25 min after the last call, the cache still covered the chat's own conversation
+      h.append(codexTurn(h.clock + 1500000, "Next step please", { input: 152000, read: 150500 }));
+      await h.run(6);
+      const ev = h.memento.get("measuredCacheGaps") || {};
+      assert.ok(ev["gpt-6.1-sol"] && ev["gpt-6.1-sol"].gap >= 1490, JSON.stringify(ev));
+    } finally { h.close(); }
+  });
+
+
+  await check("a log appended within the same millisecond (same mtime) is still re-read", async () => {
+    const h = await harness({ kind: "codex", answer: never });
+    try {
+      const pin = Math.floor(Date.now() / 1000) - 5;     // a whole second: utimes keeps it exactly
+      fs.utimesSync(h.logFile, pin, pin);
+      await h.run(1);
+      h.append(codexTurn(h.clock + 1500000, "Next step please", { input: 152000, read: 150500 }));
+      fs.utimesSync(h.logFile, pin, pin);                // as if written in the same millisecond as before
+      await h.run(6);
+      await h.commands["cacheKeeper.options"]();
+      assert.ok(/152k/.test(h.lists.at(-1)[0].description), h.lists.at(-1)[0].description);
+    } finally { h.close(); }
+  });
+
+
+  await check("Claude and Codex: attachments the harness adds to a message are not part of what you typed", () => {
+    const reminder = "<system-reminder>\nThe user provided the following references:\n- /home/u/models.json\n</system-reminder>";
+    const userWith = (t, text) => cl("user", t, { cwd: "/w", message: { role: "user", content: [{ type: "text", text }, { type: "text", text: reminder }] } });
+    const c = core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(lines([userWith(now - 60000, "hi"),
+      ...claudeCall(now - 59990, now - 59000, { input: 30000, read: 0, id: "a" }),
+      userWith(now - 30000, core.KEEPALIVES[0]), ...claudeCall(now - 29990, now - 29000, { input: 30500, read: 30000, id: "b" })])), { now, priceFor });
+    assert.strictEqual(c.title, "hi");
+    assert.strictEqual(c.stats.turns, 1, "our keep-alive still recognised with a reminder block added");
+    assert.strictEqual(c.lastUserText, core.KEEPALIVES[0]);
+    const x = core.analyzeTrace("codex", "/x/x", harnesses.codexTrace(codexChatLog(now - 60000).replace(
+      '"text":"Refactor the parser"', '"text":"Refactor the parser\\n\\n@/home/u/attach-me.txt\\n@/home/u/b.txt"')), { now, priceFor });
+    assert.strictEqual(x.title, "Refactor the parser");
+  });
+
+
+  await check("every harness: Summarize on an expired chat asks first (cost), writes it if you confirm", async () => {
+    for (const [kind, settings] of ALL_KINDS) {
+      const h = await harness({ kind, settings, ctx: 40000,      // below the threshold: no automatic summary
+        answer: (msg) => /already expired/.test(msg) ? "Write anyway" : never(),
+        menu: items => items.find(i => i.label === "Summarize") });
+      try {
+        await h.run(320);
+        assert.strictEqual(h.sent.length, 0, `${kind}: expired, nothing sent yet`);
+        await h.commands["cacheKeeper.options"]();
+        await h.run(3);
+        const ask = h.warnings.find(w => /already expired/.test(w.msg));
+        assert.ok(ask && /re-sends the whole context: ~[\d.]+ cr/.test(ask.msg), `${kind}: ${ask && ask.msg}`);
+        assert.strictEqual(h.sent.length, 1, `${kind}: summary sent after confirming`);
+        assert.ok(h.sent[0].text.startsWith("[summary]"), kind);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("Summarize on an expired chat, declined: nothing sent, back to default (not left waiting)", async () => {
+    const h = await harness({ ctx: 40000, answer: () => undefined, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(320);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(10);
+      assert.strictEqual(h.sent.length, 0);
+      // re-open the list: the chat's mode is shown in its detail line
+      await h.commands["cacheKeeper.options"]();
+      const item = h.lists.at(-1)[0];
+      assert.ok(/^default/.test(item.detail) && !/summary waiting/.test(item.detail), item.detail);
+    } finally { h.close(); }
+  });
+
+  await check("Summarize on a warm chat from the list: written right away, no question", async () => {
+    const h = await harness({ ctx: 40000, answer: never, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(30);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(2);
+      assert.strictEqual(h.sent.length, 1);
+      assert.ok(h.sent[0].text.startsWith("[summary]"));
+      assert.ok(!h.warnings.some(w => /already expired/.test(w.msg)));
+    } finally { h.close(); }
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

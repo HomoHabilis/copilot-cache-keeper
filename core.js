@@ -8,6 +8,7 @@
 "use strict";
 
 const path = require("path");
+const harnesses = require("./harnesses");
 
 // Older versions started every message they sent with this tag; still recognised in old logs.
 const MARKER = "[cache-keeper]";
@@ -98,12 +99,6 @@ function detectLanguage(texts) {
   return n >= 2 && n >= 1.5 * second ? best : "en";
 }
 
-/** The text of one of Copilot's answers in the log (whichever text fields it carries). */
-function replyText(e) {
-  const a = e.attrs || {};
-  return Object.values(a).filter(v => typeof v === "string" && v.length > 1).join(" ").slice(0, 4000);
-}
-
 /** A keep-alive wording in `lang` (English if not covered), never the same as `previous`. */
 function keepAliveText(previous, rand = Math.random, lang = "en") {
   const pool = (KEEPALIVES_BY_LANG[lang] || KEEPALIVES).filter(t => t !== previous);
@@ -185,7 +180,6 @@ const SUMMARY_MAX_SHARE = 1 / 3;
 // Only write one automatically when it, plus starting a new chat from it, costs at most this share
 // of continuing the chat cold: the margin pays for the cases where you continue the old chat anyway.
 const SUMMARY_PAYS_SHARE = 0.75;
-const EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edit_file|write_file|edit_notebook/i;
 
 /** Local disk access, for tests and command-line use. */
 const nodeIo = (() => {
@@ -309,27 +303,28 @@ function ttlFor(model, overrides = {}) {
 }
 
 /**
- * Longest proven cache lifetime per model in one Local chat: the gap between a model call and the
- * previous call of the same model (any kind: title or summary calls also refresh the cache), when
- * the cache still covered this chat's own conversation, not just the shared system prompt and tools
- * another chat may have kept warm: at least 5k tokens of its own, and at least 80% of them cached.
+ * Longest proven cache lifetime per model in one chat whose log doesn't state it (Local, Codex): the
+ * gap between a model call and the previous call of the same model (any kind: title or summary
+ * calls also refresh the cache, `refreshes`), when the cache still covered this chat's own
+ * conversation, not just the shared system prompt and tools another chat may have kept warm: at
+ * least 5k tokens of its own, and at least 80% of them cached. `calls`: the chat's "call" events.
  */
-function provenGaps(events, calls) {
+function provenGaps(calls, refreshes = calls) {
   const out = {};
   if (calls.length < 2) return out;
-  const base = calls[0].attrs.inputTokens || 0;
-  const all = events.filter(e => e.type === "llm_request" && e.ts).sort((a, b) => a.ts - b.ts);
+  const base = calls[0].input || 0;
+  const all = refreshes.filter(e => e.ts).sort((a, b) => a.ts - b.ts);
   for (let i = 1; i < calls.length; i++) {
-    const a0 = calls[i - 1].attrs, a1 = calls[i].attrs, model = a1.model;
+    const a0 = calls[i - 1], a1 = calls[i], model = a1.model;
     if (!model || a0.model !== model) continue;
-    const prev = a0.inputTokens || 0, cached = a1.cachedTokens || 0, own = prev - base;
+    const prev = a0.input || 0, cached = a1.cached || 0, own = prev - base;
     if (own < 5000 || cached < base + 0.8 * own || cached < 0.9 * prev) continue;
-    let last = calls[i - 1].ts;
+    let last = a0.ts;
     for (const e of all) {
-      if (e.ts >= calls[i].ts) break;
-      if (e.attrs && e.attrs.model === model) last = Math.max(last, e.ts);
+      if (e.ts >= a1.ts) break;
+      if (e.model === model) last = Math.max(last, e.ts);
     }
-    const gap = Math.round((calls[i].ts - last) / 1000);
+    const gap = Math.round((a1.ts - last) / 1000);
     if (gap > (out[model] || 0)) out[model] = gap;
   }
   return out;
@@ -381,11 +376,10 @@ const CALIBRATE_MIN_UNCACHED = 2000;  // only calls that sent at least this much
 function billedWriteRate(calls, sheet) {
   const samples = [];
   for (const c of calls) {
-    const a = c.attrs, nano = a.copilotUsageNanoAiu;
-    const input = a.inputTokens || 0, cached = a.cachedTokens || 0, uncached = input - cached;
-    if (!nano || uncached < CALIBRATE_MIN_UNCACHED) continue;
+    const input = c.input || 0, cached = c.cached || 0, uncached = input - cached;
+    if (!c.credits || uncached < CALIBRATE_MIN_UNCACHED) continue;
     const r = rates(sheet, input);
-    const w = (nano / 1e9 - cached * r.read - (a.outputTokens || 0) * r.out) / uncached;
+    const w = (c.credits - cached * r.read - (c.out || 0) * r.out) / uncached;
     if (w > 0) samples.push(w);
   }
   const recent = samples.slice(-5).sort((x, y) => x - y);
@@ -430,108 +424,133 @@ function keepAliveFixedPart(pairs) {
   return recent.length ? Math.max(KEEPALIVE_MIN_NEW, recent[Math.floor(recent.length / 2)]) : KEEPALIVE_NEW;
 }
 
-/** State of one chat from its log text, or null if it has no agent call yet. Pure. */
-function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
-  const events = parseJsonl(mainText);
-  const calls = events.filter(e => e.type === "llm_request" && e.attrs &&
-    String(e.attrs.debugName || "").startsWith("panel/") && "inputTokens" in e.attrs);
+/**
+ * State of one chat from its shared event list (harnesses.js), the same for every harness, or null
+ * without a model call yet. Pure. `kind`: "local", "sdk", "claude" or "codex". opts:
+ *   now, ttlOverrides (cacheKeeper.ttlSeconds),
+ *   priceFor(model) -> Copilot price sheet (token_prices) when the log carries no prices,
+ *   credits: credits spent, when known from elsewhere (else summed from the calls, or estimated).
+ */
+function analyzeTrace(kind, dir, trace, opts = {}) {
+  if (!trace) return null;
+  const { events, info = {} } = trace;
+  const now = opts.now === undefined ? Date.now() : opts.now, ttlOverrides = opts.ttlOverrides || {};
+  const calls = events.filter(e => e.t === "call");
   if (!calls.length) return null;
-  calls.sort((a, b) => a.ts - b.ts);
   const last = calls[calls.length - 1];
-  const a = last.attrs;
-  const model = a.model || "?";
-  const ctx = a.inputTokens;                         // after any compaction: what a miss re-sends
-  // Size of a fresh chat's first prompt: about the session's first call, minus any big
-  // attachments in that first message (capped).
-  const firstCtx = Math.min(calls[0].attrs.inputTokens, 40000);
-  const lastEnd = last.ts + (last.dur || 0);
-  const credits = calls.reduce((s, c) => s + (c.attrs.copilotUsageNanoAiu || 0), 0) / 1e9;
-  const userMessages = events.filter(e => e.type === "user_message");
-  const lastUser = userMessages[userMessages.length - 1];
-  const isOurs = u => isOwnMessage(u.attrs && u.attrs.content);
-  // Busy: a turn is still open. Turns nest (a subagent logs its own turn_start/turn_end inside the
-  // agent's turn), so count depth rather than comparing the last start with the last end; a message
-  // sent after everything closed also counts (its turn_start may not be logged yet). (Not "the log
-  // changed": VS Code also appends discovery lines to a chat's log when another chat is opened.)
-  let depth = 0, pendingMsg = false, lastActivity = 0;
-  for (const e of [...events].sort((x, y) => (x.ts || 0) - (y.ts || 0))) {
-    if (e.type === "turn_start") { depth++; pendingMsg = false; }
-    else if (e.type === "turn_end") { depth = Math.max(0, depth - 1); if (!depth) pendingMsg = false; }
-    // A new message ends whatever came before: Copilot leaves a turn open, with no turn_end, when
-    // the request is stopped or when you send a message while a tool is still running.
-    else if (e.type === "user_message") { depth = 0; pendingMsg = true; }
-    if (/^(turn_start|turn_end|user_message|llm_request|tool_call)$/.test(e.type)) lastActivity = Math.max(lastActivity, e.ts || 0);
+  const model = last.model || "?";
+  const ctx = last.input;                            // after any compaction: what a miss re-sends
+  // Size of a fresh chat's first prompt: about the chat's first call, minus any big attachments in
+  // that first message (capped).
+  const firstCtx = Math.min(calls[0].input, 40000);
+  const users = events.filter(e => e.t === "user");
+  const isOurs = u => isOwnMessage(u.text);
+  const real = users.filter(u => !isOurs(u));
+  // Busy: a turn is still open. Turns nest (a subagent logs its own turn inside the agent's turn), so
+  // count depth rather than comparing the last start with the last end; a message waiting for its
+  // turn also counts. (Not "the log changed": VS Code also appends discovery lines to a Local chat's
+  // log when another chat is opened.) Harnesses with one turn per model call (stepTurns) have a few
+  // ms with no turn open between two steps of a request: right after a turn_end with no idle event
+  // yet still counts as working.
+  let depth = 0, pending = false, lastActivity = 0, lastTurnEnd = 0, settled = true;
+  for (const e of events) {
+    if (e.t === "turn_start") { depth++; pending = false; settled = false; }
+    else if (e.t === "turn_end") { depth = Math.max(0, depth - 1); if (!depth) pending = false; lastTurnEnd = e.ts; }
+    else if (e.t === "user" || e.t === "queued") { pending = true; settled = false; }
+    else if (e.t === "abort") { depth = 0; pending = false; settled = true; }
+    else if (e.t === "idle" && !depth) settled = true;
+    if (e.t !== "reply" && e.t !== "edit" && e.t !== "compaction" && e.t !== "idle") lastActivity = Math.max(lastActivity, e.ts || 0, e.end || 0);
   }
+  const between = !!info.stepTurns && !depth && !settled && now - lastTurnEnd < 3000;
   // A long tool run (tests, a push) logs nothing until it ends, so no short cap: only a turn quiet
   // for hours is taken as one that never logged its end.
-  const busy = (depth > 0 || pendingMsg) && now - lastActivity < BUSY_CAP_MS;
-  const ttl = ttlFor(model, ttlOverrides), ttlFrom = ttlSource(model, ttlOverrides);
+  const busy = (depth > 0 || pending || between) && now - lastActivity < BUSY_CAP_MS;
+  // Cache lifetime: a setting wins, then what the chat's own log says, then learned or default.
+  const logTtl = [...calls].reverse().map(c => c.ttl).find(t => t > 0);
+  const ttl = ttlOverrides[model] || logTtl || ttlFor(model, ttlOverrides);
+  const ttlFrom = ttlOverrides[model] ? "setting" : logTtl ? "this chat's log" : ttlSource(model, ttlOverrides);
+  // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
+  const cacheFrom = last.expiresAt && last.ttl ? last.expiresAt - last.ttl * 1000 : last.ts;
   // What the chat contains, for sizing a handoff summary.
-  const realTurns = userMessages.filter(u => !isOurs(u)).length;
-  const compactions = events.filter(e => e.type === "llm_request" &&
-    /summarizeConversationHistory/.test(String((e.attrs && e.attrs.debugName) || ""))).length;
-  const files = new Set();
-  for (const e of events) {
-    if (e.type !== "tool_call" || !EDIT_TOOLS.test(e.name || "")) continue;
-    const args = String((e.attrs && e.attrs.args) || "");
-    for (const m of args.matchAll(/"(?:filePath|path|file)"\s*:\s*"([^"]+)"/g)) files.add(m[1]);
-    for (const m of args.matchAll(/\*\*\* (?:Update|Add|Delete) File: ([^\\\n]+)/g)) files.add(m[1].trim());
-  }
-  const stats = { ctx, turns: realTurns, compactions, files: files.size, calls: calls.length };
-  let words = summaryWords(stats);
+  const files = new Set(events.filter(e => e.t === "edit").flatMap(e => e.files || []));
+  const compactions = Math.max(info.compactions || 0, events.filter(e => e.t === "compaction").length);
+  const stats = { ctx, turns: real.length, compactions, files: files.size, calls: calls.length };
   // Tokens a keep-alive adds uncached: measured on this chat's earlier keep-alives when there are
   // any (exact); otherwise VS Code's context block + our message + the agent's last reply, which is
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
   // Learn only the fixed part (what a keep-alive added minus the agent's reply just before it), then
   // add the current last reply: a keep-alive after a long answer adds more than one after "OK".
+  const slack = info.stepTurns ? 1000 : 0;           // call starts derived from end - duration
   const pairs = [];
-  for (const u of userMessages.filter(isOurs)) {
-    const i = calls.findIndex(c => c.ts >= u.ts);
+  for (const u of users.filter(isOurs)) {
+    const i = calls.findIndex(c => c.ts >= u.ts - slack);
     if (i <= 0) continue;
-    pairs.push({ input: calls[i].attrs.inputTokens || 0, cached: calls[i].attrs.cachedTokens || 0,
-                 prevOut: calls[i - 1].attrs.outputTokens || 0 });
+    pairs.push({ input: calls[i].input || 0, cached: calls[i].cached || 0, prevOut: calls[i - 1].out || 0 });
   }
-  const heartbeatNew = keepAliveFixedPart(pairs) + (a.outputTokens || 0);
-  const sheet = modelsText ? priceSheetFrom(modelsText, model) : null;
-  let cost = null;                                   // null = price unknown for this model
-  let billedWrite = null;
-  if (sheet) {
-    // What Copilot actually billed per uncached prompt token, from this chat's own calls (the log
-    // has each call's exact cost). Observed: a cold call is billed near the input price, below the
-    // sheet's cache_write_price, so the sheet alone over-estimates an expiry by ~15%.
-    billedWrite = billedWriteRate(calls, sheet);
-    const scale = r0 => billedWrite === null ? r0 : { ...r0, write: billedWrite };
-    const r = scale(rates(sheet, ctx));              // tier that applies at the current context size
-    const fresh = scale(rates(sheet, firstCtx));
-    ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
+  const heartbeatNew = keepAliveFixedPart(pairs) + (last.out || 0);
+  // Prices: what the log says this chat was billed per token (exact), else Copilot's price sheet,
+  // with the write price corrected from what calls with a known cost were billed. Observed on Local
+  // chats: a cold call is billed near the input price, below the sheet's cache_write_price, so the
+  // sheet alone over-estimates an expiry by ~15%.
+  const per = Object.assign({}, ...calls.map(c => c.rates || {}));
+  const toR = p => p.cache_read === undefined && p.input === undefined ? null
+    : { read: p.cache_read || 0, write: p.cache_write || p.input || 0, out: p.output || 0 };
+  let r = toR(per), fresh = r && (toR({ ...per, ...(calls[0].rates || {}) }) || r);
+  let billedWrite = r ? r.write : null, rateAt = () => r;
+  if (!r) {
+    const sheet = opts.priceFor ? opts.priceFor(model) : null;
+    if (sheet) {
+      billedWrite = billedWriteRate(calls, sheet);
+      const scale = r0 => billedWrite === null ? r0 : { ...r0, write: billedWrite };
+      r = scale(rates(sheet, ctx));                  // tier that applies at the current context size
+      fresh = scale(rates(sheet, firstCtx));
+      rateAt = c => scale(rates(sheet, c.input || 0));
+    }
   }
-  const firstReal = userMessages.find(u => !isOurs(u));
-  // The language for Cache Keeper's own messages: Copilot's recent answers (it already answers in
+  let cost = null, words = summaryWords(stats);      // cost null = price unknown for this model
+  if (r) ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
+  // Credits spent: billed per call when the log says, otherwise estimated from the prices.
+  let credits = 0, creditsEstimated = false;
+  for (const c of calls) {
+    if (c.credits !== undefined) { credits += c.credits; continue; }
+    const rc = rateAt(c);
+    if (rc) { credits += ((c.input || 0) - (c.cached || 0)) * rc.write + (c.cached || 0) * rc.read + (c.out || 0) * rc.out; creditsEstimated = true; }
+  }
+  if (typeof opts.credits === "number") { credits = opts.credits; creditsEstimated = false; }
+  const firstReal = real[0];
+  // The language for Cache Keeper's own messages: the agent's recent answers (it already answers in
   // your language, and says more than a short question does), plus your last few messages.
-  const replies = events.filter(e => e.type === "agent_response").slice(-5).map(replyText);
-  const lang = detectLanguage([...replies,
-    ...userMessages.filter(u => !isOurs(u)).slice(-10).map(u => String(u.attrs.content || ""))]);
-  const title = firstReal ? String(firstReal.attrs.content).replace(/\s+/g, " ").trim() : "";
+  const replies = events.filter(e => e.t === "reply").slice(-5).map(e => e.text || "");
+  const lang = detectLanguage([...replies, ...real.slice(-10).map(u => u.text || "")]);
+  const title = firstReal ? String(firstReal.text).replace(/\s+/g, " ").trim() : "";
+  const lastUser = users[users.length - 1];
+  const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
   return {
-    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind: "local", dir, model, ctx, ttl, ttlFrom, lastEnd, busy, credits,
-    cost, stats, summaryWords: words, billedWrite, lang, hitGaps: provenGaps(events, calls),
-    // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
-    cacheFrom: last.ts,
-    remaining: ttl - (now - last.ts) / 1000,
-    lastUserText: lastUser && lastUser.attrs ? String(lastUser.attrs.content || "") : "",
+    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom,
+    lastEnd: last.end || last.ts, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
+    // lifetimes are only worth measuring where the log doesn't state them
+    hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
+    cacheFrom,
+    remaining: ttl - (now - cacheFrom) / 1000,
+    lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,
     title: title.length > 50 ? title.slice(0, 47) + "..." : title,   // which chat a warning is about
     // Last message you typed yourself (not one of ours): tells whether a handoff is still current.
-    lastRealUserTs: Math.max(0, ...userMessages.filter(u => !isOurs(u)).map(u => u.ts || 0)),
+    lastRealUserTs: Math.max(0, ...real.map(u => u.ts || 0)),
+    cwd: info.cwd || "", gitRoot: info.gitRoot || "",
   };
+}
+
+/** State of one Local chat from its Agent Debug Log (main.jsonl + models.json). */
+function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
+  return analyzeTrace("local", dir, harnesses.localTrace(mainText),
+    { now, ttlOverrides, priceFor: m => modelsText ? priceSheetFrom(modelsText, m) : null });
 }
 
 /** provenGaps() of a whole Local chat log, without the rest of analyze(). */
 function gapsFromLog(mainText) {
-  const events = parseJsonl(mainText);
-  const calls = events.filter(e => e.type === "llm_request" && e.attrs &&
-    String(e.attrs.debugName || "").startsWith("panel/") && "inputTokens" in e.attrs).sort((a, b) => a.ts - b.ts);
-  return provenGaps(events, calls);
+  const t = harnesses.localTrace(mainText);
+  return t ? provenGaps(t.events.filter(e => e.t === "call"), t.events.filter(e => e.t === "call" || e.t === "aux")) : {};
 }
 
 async function readSession(io, dir, now = Date.now(), ttlOverrides = {}) {
@@ -582,8 +601,6 @@ async function readSessions(io, root, now = Date.now(), maxAgeMs = 48 * 3600 * 1
 // format) and workspace.yaml (client_name: vscode-agent-host). Copilot CLI sessions share the
 // folder; they are not VS Code chats and are left out.
 
-const SDK_EDIT_TOOLS = /^(apply_patch|create|edit|str_replace|str_replace_editor|write|write_file|create_file|insert)$/i;
-
 /** Simple `key: value` lines of workspace.yaml (enough for id, cwd, git_root, client_name, ...). */
 function parseYamlFlat(text) {
   const out = {};
@@ -594,105 +611,9 @@ function parseYamlFlat(text) {
   return out;
 }
 
-/** Per-token credits from a usage record's tokenDetails, or null when it carries none. */
-function sdkRates(u) {
-  const d = u && u.copilotUsage && u.copilotUsage.tokenDetails;
-  if (!Array.isArray(d) || !d.length) return null;
-  const per = {};
-  for (const t of d) if (t.batchSize) per[t.tokenType] = t.costPerBatch / t.batchSize / 1e9;
-  return per;
-}
-
-/** A user message's text as typed: a message sent while the agent works gets a <reminder> appended. */
-function sdkUserText(e) {
-  return String((e.data && e.data.content) || "").replace(/\n*<reminder>[\s\S]*$/, "").trim();
-}
-
 /** State of one Copilot SDK chat from its events.jsonl, same shape as analyze(). Null without a call. */
 function analyzeSdk(dir, eventsText, yaml = {}, now = Date.now(), ttlOverrides = {}) {
-  const events = parseJsonl(eventsText).map(e => ({ ...e, ts: Date.parse(e.timestamp) || 0 }))
-    .sort((x, y) => x.ts - y.ts);
-  const calls = events.filter(e => e.type === "session.usage_record" && e.data && e.data.usage &&
-    typeof e.data.usage.inputTokens === "number");
-  if (!calls.length) return null;
-  const U = c => c.data.usage;
-  const last = calls[calls.length - 1], u = U(last);
-  const model = u.model || "?";
-  const ctx = u.inputTokens;
-  const firstCtx = Math.min(U(calls[0]).inputTokens, 40000);
-  const callStart = c => c.ts - (U(c).duration || 0);
-  // The log says exactly when this chat's cache expires and how long it lasts; a setting still wins.
-  const logTtl = Number(u.cacheTtlSeconds) || 0;
-  const exp = Date.parse(u.cacheExpiresAt || "");
-  const ttl = ttlOverrides[model] || logTtl || ttlFor(model, ttlOverrides);
-  const ttlFrom = ttlOverrides[model] ? "setting" : logTtl ? "this chat's log" : ttlSource(model, ttlOverrides);
-  const cacheFrom = logTtl && exp ? exp - logTtl * 1000 : callStart(last);
-  const credits = calls.reduce((s, c) => s + ((U(c).copilotUsage && U(c).copilotUsage.totalNanoAiu) || 0), 0) / 1e9;
-  const userMessages = events.filter(e => e.type === "user.message");
-  const isOurs = e => isOwnMessage(sdkUserText(e));
-  // Busy: an assistant turn is open (turn_start .. turn_end, several per request: one per model call
-  // and its tools), or a message is waiting for its turn. A stopped request logs "abort". Between
-  // two turns of the same request there are a few ms with none open: right after a turn_end with no
-  // idle checkpoint yet still counts as working.
-  let depth = 0, pendingMsg = false, lastActivity = 0, lastTurnEnd = 0, settled = true;
-  for (const e of events) {
-    const t = e.type;
-    if (t === "assistant.turn_start") { depth++; pendingMsg = false; settled = false; }
-    else if (t === "assistant.turn_end") { depth = Math.max(0, depth - 1); pendingMsg = false; lastTurnEnd = e.ts; }
-    else if (t === "user.message") { pendingMsg = true; settled = false; }
-    else if (t === "abort" || t === "session.shutdown") { depth = 0; pendingMsg = false; settled = true; }
-    else if (t === "session.usage_checkpoint" && !depth) settled = true;
-    if (/^(assistant\.turn_start|assistant\.turn_end|user\.message|session\.usage_record|tool\.execution_(start|complete))$/.test(t)) {
-      lastActivity = Math.max(lastActivity, e.ts);
-    }
-  }
-  const between = !depth && !settled && now - lastTurnEnd < 3000;
-  const busy = (depth > 0 || pendingMsg || between) && now - lastActivity < BUSY_CAP_MS;
-  const realTurns = userMessages.filter(e => !isOurs(e)).length;
-  const compactions = Math.max(Number(yaml.summary_count) || 0,
-    events.filter(e => /compaction_(complete|completed|end)$/.test(e.type)).length);
-  const files = new Set();
-  for (const e of events) {
-    if (e.type !== "tool.execution_start" || !SDK_EDIT_TOOLS.test((e.data && e.data.toolName) || "")) continue;
-    const args = JSON.stringify((e.data && e.data.arguments) || {});
-    for (const m of args.matchAll(/"(?:filePath|path|file)"\s*:\s*"([^"]+)"/g)) files.add(m[1]);
-    for (const m of args.matchAll(/\*\*\* (?:Update|Add|Delete) File: ([^\\\n]+)/g)) files.add(m[1].trim());
-  }
-  const stats = { ctx, turns: realTurns, compactions, files: files.size, calls: calls.length };
-  // Prices: what this chat was billed per token type, from the newest records that have each type.
-  const per = {};
-  for (const c of calls) Object.assign(per, sdkRates(U(c)) || {});
-  const firstPer = { ...per, ...(sdkRates(U(calls[0])) || {}) };
-  const toR = p => p.cache_read === undefined && p.input === undefined ? null
-    : { read: p.cache_read || 0, write: p.cache_write || p.input || 0, out: p.output || 0 };
-  const r = toR(per), fresh = toR(firstPer) || r;
-  const pairs = [];
-  for (const m of userMessages.filter(isOurs)) {
-    const i = calls.findIndex(c => callStart(c) >= m.ts - 1000);
-    if (i <= 0) continue;
-    pairs.push({ input: U(calls[i]).inputTokens || 0, cached: U(calls[i]).cacheReadTokens || 0,
-                 prevOut: U(calls[i - 1]).outputTokens || 0 });
-  }
-  const heartbeatNew = keepAliveFixedPart(pairs) + (u.outputTokens || 0);
-  let cost = null, words = summaryWords(stats);
-  if (r) ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
-  const firstReal = userMessages.find(e => !isOurs(e));
-  const replies = events.filter(e => e.type === "assistant.message").slice(-5)
-    .map(e => String((e.data && e.data.content) || "").slice(0, 4000));
-  const lang = detectLanguage([...replies, ...userMessages.filter(e => !isOurs(e)).slice(-10).map(sdkUserText)]);
-  const title = firstReal ? sdkUserText(firstReal).replace(/\s+/g, " ").trim() : "";
-  const lastUser = userMessages[userMessages.length - 1];
-  return {
-    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind: "sdk", dir, model, ctx, ttl, ttlFrom,
-    lastEnd: last.ts, busy, credits, cost, stats, summaryWords: words, billedWrite: r ? r.write : null, lang, hitGaps: {},
-    cacheFrom,
-    remaining: ttl - (now - cacheFrom) / 1000,
-    lastUserText: lastUser ? sdkUserText(lastUser) : "",
-    lastUserTs: lastUser ? lastUser.ts : 0,
-    title: title.length > 50 ? title.slice(0, 47) + "..." : title,
-    lastRealUserTs: Math.max(0, ...userMessages.filter(e => !isOurs(e)).map(e => e.ts || 0)),
-    cwd: yaml.cwd || "", gitRoot: yaml.git_root || "",
-  };
+  return analyzeTrace("sdk", dir, harnesses.sdkTrace(eventsText, yaml), { now, ttlOverrides });
 }
 
 async function readSdkSession(io, dir, now = Date.now(), ttlOverrides = {}) {
@@ -723,13 +644,13 @@ async function readSdkSessions(io, home, now = Date.now(), maxAgeMs = 48 * 3600 
 }
 
 /**
- * Does an SDK chat belong to this window? Its working folder (or git root) is one of the window's
+ * Does an Agent Host chat (Copilot SDK, Claude, Codex) belong to this window? Its working folder (or git root) is one of the window's
  * folders or inside one. Paths compared case-insensitively on Windows. Chats started without a
  * folder (cwd ~/.copilot/chats/<id>) return "workspaceless": any window on that machine shows them.
  */
 function sdkChatOwner(s, folders, windows = false) {
   const norm = p => { let x = String(p || "").replace(/\\/g, "/").replace(/\/+$/, ""); return windows ? x.toLowerCase() : x; };
-  if (/\/\.copilot\/chats\/[^/]+$/.test(norm(s.cwd))) return "workspaceless";
+  if (s.workspaceless || /\/\.copilot\/chats\/[^/]+$/.test(norm(s.cwd))) return "workspaceless";
   for (const p of [s.cwd, s.gitRoot].map(norm).filter(Boolean)) {
     for (const f of folders.map(norm)) if (p === f || p.startsWith(f + "/")) return "window";
   }
@@ -798,4 +719,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
+  analyzeTrace,
 };
