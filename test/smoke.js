@@ -675,6 +675,69 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("auto keep warm: stops at its time limit (autoKeepWarmMaxMinutes) before the cap", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(),
+                              settings: { autoKeepWarmCapPercent: 100, autoKeepWarmMaxMinutes: 20 } });
+    try {
+      const start = h.clock;
+      await h.run(300 * 30, () => h.sent.some(x => !core.isKeepAlive(x.text)));
+      const alives = h.sent.filter(x => core.isKeepAlive(x.text));
+      // keep-alives only while they keep it warm within 20 min of the click: at ~1, ~6 and ~11 min
+      assert.strictEqual(alives.length, 3, `${alives.length} keep-alives`);
+      assert.ok(alives.every(x => x.at - start + 300000 <= 20 * 60000), "none keeps it warm past the limit");
+      assert.ok(h.warnings[1] && h.warnings[1].msg.includes("reached its 20 min limit"), h.warnings[1] && h.warnings[1].msg);
+      assert.ok(h.sent[h.sent.length - 1].text.includes("handoff summary"), "ends with a summary");
+    } finally { h.close(); }
+  });
+
+  await check("keep-warm time: Keep warm once counts too, and Auto keep warm again at the limit starts a new period", async () => {
+    const answers = ["Keep warm", "Auto keep warm", "Auto keep warm"];
+    const h = await harness({ answer: (m, b, n) => answers[n - 1] || never(),
+                              settings: { autoKeepWarmCapPercent: 100, autoKeepWarmMaxMinutes: 20 } });
+    try {
+      const start = h.clock;
+      await h.run(300 * 30, () => h.sent.some(x => !core.isKeepAlive(x.text)));
+      const limitAt = h.warnings[2].at;
+      assert.ok(h.warnings[2].msg.includes("reached its 20 min limit"), h.warnings[2].msg);
+      // once + auto together: the same 3 keep-alives as auto alone before the limit
+      assert.strictEqual(h.sent.filter(x => x.at < limitAt).length, 3);
+      assert.ok(limitAt - start < 20 * 60000, "limit counted from the Keep warm once click");
+      assert.ok(h.sent.filter(x => x.at > limitAt && core.isKeepAlive(x.text)).length >= 3, "a new period after choosing again");
+      assert.ok(h.warnings[3] && h.warnings[3].msg.includes("20 min limit"), "and its own limit");
+    } finally { h.close(); }
+  });
+
+  await check("keep-warm time: 120 min is a hard cap, a higher setting counts as 120", async () => {
+    // 10-min cache so the time limit, not the spending cap, ends it
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(),
+                              settings: { autoKeepWarmCapPercent: 100, autoKeepWarmMaxMinutes: 600,
+                                          ttlSeconds: { "claude-opus-5.5": 600 } } });
+    try {
+      const start = h.clock;
+      await h.run(600 * 20, () => h.sent.some(x => !core.isKeepAlive(x.text)));
+      const alives = h.sent.filter(x => core.isKeepAlive(x.text));
+      assert.ok(h.warnings[1] && h.warnings[1].msg.includes("reached its 2 h limit"), h.warnings[1] && h.warnings[1].msg);
+      assert.ok(alives.every(x => x.at - start + 600000 <= 120 * 60000), "none keeps it warm past 2 h");
+      assert.ok(alives.length >= 10, `${alives.length} keep-alives`);
+    } finally { h.close(); }
+  });
+
+  await check("keep-warm time: Back to default stops counting, keeping warm again starts from zero", async () => {
+    const answers = ["Auto keep warm", "Back to default", "Auto keep warm"];
+    let k = 0;
+    const h = await harness({ answer: never, settings: { autoKeepWarmCapPercent: 100, autoKeepWarmMaxMinutes: 20 },
+                              menu: items => { const want = answers[k++]; return items.find(i => i.label === want); } });
+    try {
+      await h.commands["cacheKeeper.options"]();
+      await h.run(300 * 2 + 30);                         // ~10 min of auto keep warm
+      assert.strictEqual(h.sent.length, 2);
+      await h.commands["cacheKeeper.options"]();         // back to default: counting stops
+      await h.commands["cacheKeeper.options"]();         // auto again: a fresh 20 min
+      await h.run(300 * 30, () => h.sent.some(x => !core.isKeepAlive(x.text)));
+      assert.ok(h.sent.filter(x => core.isKeepAlive(x.text)).length >= 5, `${h.sent.length} sent`);
+    } finally { h.close(); }
+  });
+
   await check("expired chat: orange status only when its context is at least thresholdTokens", async () => {
     for (const [threshold, orange] of [[30000, true], [100000, false]]) {     // the chat has 40k tokens
       const h = await harness({ answer: () => undefined, settings: { thresholdTokens: threshold, autoSummary: false } });
@@ -685,7 +748,7 @@ const never = () => new Promise(() => {});
         const bg = (h.status.backgroundColor || {}).id;
         assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
         assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
-        assert.strictEqual(h.status.tooltip.value.includes("thresholdTokens"), orange, h.status.tooltip);
+        assert.strictEqual(h.status.tooltip.value.includes("tokens of context"), orange, h.status.tooltip);
       } finally { h.close(); }
     }
   });

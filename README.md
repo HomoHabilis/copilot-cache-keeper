@@ -45,16 +45,22 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
     from common words in Copilot's recent answers and your last messages; English when
     unsure). Cache Keeper recognises them by that list, and its output log shows each one it sent.
     A keep-alive buys a full cache lifetime from when it is sent, so later is cheaper. To avoid a
-    fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 2 x
-    `cacheKeeper.keepAliveJitterPercent` (default 5%) of the cache lifetime ahead of that, so
+    fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 10% of
+    the cache lifetime ahead of that, so
     5 to 35 s before expiry for a 5 min cache. Never later than the 5 s lead. The next
     timeout warns you again. If you don't keep it warm again, a handoff summary is written before
     that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
   - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
     (default 50%) of what letting the cache expire would add, priced when auto keep warm starts.
-    The closing handoff summary counts against the cap. When the next keep-alive would not fit,
-    you get a warning to choose again (Keep warm once more, Auto keep warm with a fresh cap,
-    Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
+    It also stops at a time limit: no keep-alive goes out that would keep the chat warm past 2 h
+    of keep-warm time. 2 h is a hard cap; `cacheKeeper.autoKeepWarmMaxMinutes` can only lower it. Keep-warm
+    time counts Keep warm once and Auto keep warm together, from your first keep-warm choice,
+    until the cache expires, you pick Back to default, Ignore, Summarize or Stop keeping warm, or
+    close the warning. Writing in the chat yourself starts it again from then. The chat list and
+    the status-bar tooltip show it ("kept warm 1 h 10 min of 2 h").
+    The closing handoff summary counts against the cap. When the next keep-alive would not fit
+    the cap or the time limit, you get a warning to choose again (Keep warm once more, Auto keep
+    warm with a fresh cap, and a fresh 2 h if the time limit was reached, Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.
@@ -144,14 +150,14 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
      backend, the same one Local chats use, so they apply to Local chats too: using a model in a
      Copilot SDK chat or Copilot CLI teaches its lifetime to all chats. The newest value per model
      wins (by the event's own time), even when it is shorter. Values older than
-     `cacheKeeper.lifetimeMaxAgeDays` (default 60) are dropped, since Copilot can change a lifetime
+     60 days are dropped, since Copilot can change a lifetime
      server side.
   4. **Measured in your Local chats:** Local chat logs don't state lifetimes, but a call that still
      hit the cache after a pause of N seconds proves it lasts at least N. Only proofs where the
      cache covered the chat's own conversation count (not just the shared system prompt, which
      another chat may keep warm), timed from the previous call of that model of any kind (title and
      summary calls also refresh it). The longest proof per model is kept across windows for
-     `cacheKeeper.lifetimeMaxAgeDays` (default 60).
+     60 days.
      It only ever lengthens the default (rounded down to the minute, and only when more than 60 s
      longer): a cache miss can have other causes, so it never shortens it. On real logs this gives
      for example `kimi-k2.7-code` 1080 s, while Claude models stay at 300 s.
@@ -293,15 +299,17 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
+| `cacheKeeper.autoKeepWarmMaxMinutes` | 120 | Auto keep warm stops after this much keep-warm time (Keep warm once included); 1 to 120, never more |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
-| `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |
-| `cacheKeeper.keepAliveJitterPercent` | 5 | Random spread of each keep-alive, +/- this share of the cache lifetime, always before the lead (0 = off) |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
 | `cacheKeeper.expiredChats` | 5 | How many expired chats the status-bar list keeps (most recent first) |
-| `cacheKeeper.lifetimeMaxAgeDays` | 60 | Ignore cache lifetimes from Copilot logs, or measured in Local chats, older than this |
 | `cacheKeeper.lookbackHours` | 48 | Read chats whose log changed within this many hours; older ones are never listed |
+
+Fixed values, not shown in the Settings UI: 5 s keep-alive lead, 5% keep-alive jitter, 60-day
+maximum age for learned cache lifetimes. They can still be overridden in `settings.json`
+(`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 
 ## Build from source
 
