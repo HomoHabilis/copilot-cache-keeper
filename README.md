@@ -152,9 +152,10 @@ See [Supported chat harnesses](#supported-chat-harnesses).
   price sheet from the newest Local chat log on the window's side (this workspace's first, else the
   most recently used workspaces), with Claude's model names mapped to Copilot's
   (`claude-haiku-5-5` is `claude-haiku-5.5`).
-- **Credits spent so far:** as billed per call for Local and Copilot SDK chats, as billed per turn
-  for Claude chats (VS Code's `session.db`), estimated from the prices for Codex chats (shown with
-  `~`).
+- **Credits spent so far:** all four harnesses are billed by the same Copilot backend at the same
+  prices. Shown as billed per call for Local and Copilot SDK chats, as billed per turn for Claude
+  chats (VS Code's `session.db`). Codex logs don't record the billed amount, so its credits are
+  computed from its token counts at Copilot's prices.
 - **Unknown prices:** if a model isn't in the sheet, Cache Keeper shows no costs and never acts on
   its own.
 - **Cache lifetimes** vary by model and aren't in the price sheet. In order:
@@ -234,7 +235,7 @@ host or container for a remote window, Windows for a local one.
 | Countdown starts | last call's start | exact expiry in the log | when the request was sent | when the request's last input arrived |
 | Cache lifetime | setting, Copilot logs, measured, default | setting, the chat's log | setting, the chat's log (cache tier) | setting, Copilot logs, measured, default |
 | Prices | price sheet, calibrated | billed per token, exact | Copilot price sheet | Copilot price sheet |
-| Credits spent | billed | billed | billed per turn | estimated |
+| Credits spent | as billed | as billed | as billed, per turn | from token counts at Copilot's prices |
 | "Agent working" (never sends then) | open turns | open turns, waiting message, the ms between steps | turn not ended (`end_turn`), queued message | task started, not complete |
 | Warnings, Keep warm, Auto keep warm, Summarize, Ignore, handoff | yes | yes | yes | yes |
 | Opened by | `vscode-chat-session://local/<id>` | `agent-host-copilotcli:/<VS Code id>` | `agent-host-claude:/<VS Code id>` | `agent-host-codex:/<VS Code id>` |
