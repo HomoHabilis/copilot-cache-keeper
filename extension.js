@@ -984,7 +984,7 @@ async function excludeFromGit() {
   } catch { /* not writable */ }
 }
 
-async function summary(context, s, why) {
+async function summary(context, s, why, opts = {}) {
   const st = stateFor(s.id);
   if (await findHandoff(st) && st.handoffCovers === s.lastRealUserTs) {
     st.mode = "done";            // a handoff written since your last message still covers this chat
@@ -1000,7 +1000,7 @@ async function summary(context, s, why) {
   const full = file.scheme === "file" ? file.fsPath : file.path;
   const prompt = core.summaryPrompt(s.lang, { rel: full, turns: s.stats.turns, compactions: s.stats.compactions,
     files: s.stats.files, ctxK: Math.round(s.ctx / 1000), words: s.summaryWords });
-  if (!(await trySend(context, s, prompt, "summary request"))) return false;
+  if (!(await trySend(context, s, prompt, "summary request", opts))) return false;
   st.mode = "done";
   st.handoff = file;
   st.handoffLang = s.lang;
@@ -1031,6 +1031,24 @@ async function keepWarmNow(context, s) {
   await keepAlive(context, s, { allowCold: true });   // you chose to send it, cold or warm
 }
 
+/**
+ * Summarize now, when you ask for it (status-bar list, warning, command). On an expired cache, say
+ * what it costs first: the request re-sends the whole context, like Keep warm now. Declined: back to
+ * the default, rather than a summary left waiting for a warm cache that won't come.
+ */
+async function summaryNow(context, s) {
+  const st = stateFor(s.id);
+  if (!s.busy && live(s) <= 0) {
+    const price = s.cost ? ` The summary request re-sends the whole context: ~${core.fmt(s.cost.missExtra + s.cost.summary)} cr ` +
+      `instead of ~${core.fmt(s.cost.summary)} cr while the cache is warm.` : " The summary request re-sends the whole context at full price.";
+    const go = await vscode.window.showWarningMessage(`Cache Keeper: the cache has already expired (${describe(s)}).` + price,
+      { modal: true }, "Write anyway");
+    if (go !== "Write anyway") { setMode(st, s, "ask"); return false; }
+    return summary(context, s, "on request", { allowCold: true });
+  }
+  return summary(context, s, "on request");
+}
+
 // ---------------------------------------------------------------- choices
 
 // No click = nothing kept warm: the cache expires (after a handoff summary if the summary rule
@@ -1045,6 +1063,9 @@ const NEW_FROM_HANDOFF = "New chat from handoff";
 async function choose(context, s, pick) {
   const st = stateFor(s.id);
   if (!pick) return;
+  // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
+  // the next decision tick (within a second), or once the agent is done (decide()).
+  if (CHOICES[pick] === "summarize" && !s.busy && live(s) <= 0) { setMode(st, s, "ask"); await summaryNow(context, s); return; }
   setMode(st, s, CHOICES[pick] || "ask");      // DEFAULT_CHOICE -> "ask"
   if (st.mode === "once" || st.mode === "auto") {
     const extra = Math.round(core.keepAliveJitter(s.ttl, jitterPercent(), () => 1));
@@ -1053,7 +1074,6 @@ async function choose(context, s, pick) {
       (st.mode === "auto" ? `, each time, ${capText(st, s)}.`
        : closingSummary(s) ? ", then a handoff summary before the next expiry." : "."));
   }
-  // "summarize" goes out on the next decision tick (now if the chat is on screen).
 }
 
 function capText(st, s) {
@@ -1185,7 +1205,7 @@ async function pickChat(context) {
     { label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
     { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent` +
       ` or ${fmtDuration(maxWarmMs())} of keep-warm time, then summary` },
-    { label: "Summarize", detail: "Write the handoff summary now" },
+    { label: "Summarize", detail: "Write the handoff summary now (asks first if the cache expired: it re-sends the whole context)" },
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
   ], { placeHolder: `${describe(chat.s)}: what should happen before its cache expires?` });
@@ -1256,7 +1276,11 @@ async function decide(context) {
     const summaryRule = cfg("autoSummary") && aboveThreshold(s) && seenLive(s) && core.summaryPays(s);
     const afterOnce = closingSummary(s) && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
 
-    if (st.mode === "summarize" && r > 0) {
+    if (st.mode === "summarize" && r <= 0) {
+      // asked for while the agent worked, and the cache expired meanwhile: ask about the cost now
+      setMode(st, s, "ask");
+      summaryNow(context, s);    // not awaited: the question stays while we keep deciding
+    } else if (st.mode === "summarize" && r > 0) {
       if (await summary(context, s, "on request")) st.actedFor = s.cacheFrom;
     } else if (st.mode === "once" && r > 0 && r <= dueAlive && actOnce) {
       if (await keepAlive(context, s)) {
@@ -1395,7 +1419,7 @@ function activate(context) {
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = shownOrNewest(); if (s) await keepWarmNow(context, s); }),
-    vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summary(context, s, "on request"); }),
+    vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summaryNow(context, s); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {
       for (const st of sessions.values()) {

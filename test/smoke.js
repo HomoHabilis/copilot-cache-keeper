@@ -1606,6 +1606,51 @@ const never = () => new Promise(() => {});
     assert.strictEqual(x.title, "Refactor the parser");
   });
 
+
+  await check("every harness: Summarize on an expired chat asks first (cost), writes it if you confirm", async () => {
+    for (const [kind, settings] of ALL_KINDS) {
+      const h = await harness({ kind, settings, ctx: 40000,      // below the threshold: no automatic summary
+        answer: (msg) => /already expired/.test(msg) ? "Write anyway" : never(),
+        menu: items => items.find(i => i.label === "Summarize") });
+      try {
+        await h.run(320);
+        assert.strictEqual(h.sent.length, 0, `${kind}: expired, nothing sent yet`);
+        await h.commands["cacheKeeper.options"]();
+        await h.run(3);
+        const ask = h.warnings.find(w => /already expired/.test(w.msg));
+        assert.ok(ask && /re-sends the whole context: ~[\d.]+ cr/.test(ask.msg), `${kind}: ${ask && ask.msg}`);
+        assert.strictEqual(h.sent.length, 1, `${kind}: summary sent after confirming`);
+        assert.ok(h.sent[0].text.startsWith("[summary]"), kind);
+      } finally { h.close(); }
+    }
+  });
+
+  await check("Summarize on an expired chat, declined: nothing sent, back to default (not left waiting)", async () => {
+    const h = await harness({ ctx: 40000, answer: () => undefined, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(320);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(10);
+      assert.strictEqual(h.sent.length, 0);
+      // re-open the list: the chat's mode is shown in its detail line
+      await h.commands["cacheKeeper.options"]();
+      const item = h.lists.at(-1)[0];
+      assert.ok(/^default/.test(item.detail) && !/summary waiting/.test(item.detail), item.detail);
+    } finally { h.close(); }
+  });
+
+  await check("Summarize on a warm chat from the list: written right away, no question", async () => {
+    const h = await harness({ ctx: 40000, answer: never, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(30);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(2);
+      assert.strictEqual(h.sent.length, 1);
+      assert.ok(h.sent[0].text.startsWith("[summary]"));
+      assert.ok(!h.warnings.some(w => /already expired/.test(w.msg)));
+    } finally { h.close(); }
+  });
+
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
   process.exit(failures ? 1 : 0);
 })();

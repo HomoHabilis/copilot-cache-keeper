@@ -70,7 +70,9 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
     chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
     expires instead. **Summarize** (clicked) always writes one.
-  - **Summarize:** asks the agent, in the chat's language and starting with `[summary]` (or
+  - **Summarize:** on a chat whose cache has already expired, asks first, with the cost (the
+    request re-sends the whole context), like *Keep warm now*; declined, the chat is back to the
+    default. On a warm chat it is written right away; while the agent works, once it's done. It asks the agent, in the chat's language and starting with `[summary]` (or
     `[riepilogo]`, `[résumé]`, `[resumen]`, `[Zusammenfassung]`), to write
     `.copilot-handoff/<time>-<session>.md` now
     (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
@@ -131,6 +133,12 @@ See [Supported chat harnesses](#supported-chat-harnesses).
   text goes out, and your text and attachments are left as they were. Should a VS Code version
   ignore that option, Cache Keeper notices the emptied box and puts your text back once the reply
   is in (attachments can't be restored that way). Tested live on all four harnesses.
+- **"Do you trust the authors of the files in this folder?"** (VS Code 1.145, WSL/remote windows):
+  VS Code checks the folder of an existing Agent Host chat (Copilot SDK, Claude, Codex) against the
+  trust list as if it were a Windows path (`\home\you\project`), so the second message into such a
+  chat asks for trust, whoever sends it (you or Cache Keeper). That is a VS Code bug, not Cache
+  Keeper. Answer *Trust Folder & Continue* once per folder. Until it's answered, Cache Keeper's
+  message waits (it warns "probably queued") and may arrive after the cache expired.
 - **Focus:** this takes focus for a second or two. If you're typing in an editor at that exact
   moment, focus jumps to the chat tab and comes back when it closes.
 - **Verification:** after sending, it checks the debug logs to confirm the message landed in the
