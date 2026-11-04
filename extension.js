@@ -481,7 +481,7 @@ async function reread(s) {
 // Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
 // fits cheap and expensive models. Acting on its own still needs a known price.
 // Not in the Settings UI (no reason to change them), but still read from settings.json if set
-// there: thresholdTokens, keepAliveLeadSeconds, keepAliveJitterPercent, lifetimeMaxAgeDays.
+// there: keepAliveLeadSeconds, keepAliveJitterPercent, lifetimeMaxAgeDays.
 /** From this context size a chat is expensive to let expire (cacheKeeper.thresholdTokens, default 100k). */
 function thresholdTokens() {
   const v = cfg("thresholdTokens");

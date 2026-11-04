@@ -49,6 +49,12 @@
           "default": 60,
           "description": "Warn this many seconds before the cache expires."
         },
+        "cacheKeeper.thresholdTokens": {
+          "type": "number",
+          "default": 100000,
+          "minimum": 0,
+          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary (if cacheKeeper.autoSummary is on and the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
+        },
         "cacheKeeper.autoSummary": {
           "type": "boolean",
           "default": true,

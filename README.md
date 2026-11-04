@@ -21,7 +21,7 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
     `agent working · cache 2:41` and never sends anything into that chat: a message would be
     queued and could run after the cache expired.
   - **Expired and large:** when that chat's cache has expired and its context is at least
-    100k tokens, the status bar turns orange:
+    `cacheKeeper.thresholdTokens` (default 100k tokens), the status bar turns orange:
     `⚠ cache expired: next msg +72 cr`. Coming back to an old chat, this tells you before you type
     that your next message re-sends all of it. The threshold is in tokens because a cold send
     costs about context × the model's input price, so one value fits Haiku and Opus alike; the
@@ -33,8 +33,8 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
 - **60 s before expiry**, one notification per chat. It says what happens if you don't click,
   and has four buttons:
   - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
-    takes a click. If the chat's context is at least 100k tokens (about
-    40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
+    takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
+    tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
     first. Below that, or when the model's price is unknown, it just expires. An
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
@@ -189,7 +189,7 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
 - **Ignored chats:** chats with only Cache Keeper messages, and chats where an expiry would add
   less than `cacheKeeper.minCredits` (default 5). Nothing at all happens for them: no listing,
   warning, automatic action or orange status.
-- **The "expensive" threshold is in tokens** (100k): an expiry costs
+- **The "expensive" threshold is in tokens** (`cacheKeeper.thresholdTokens`): an expiry costs
   about context × the model's input price, so one value fits cheap and expensive models alike.
   It applies only to chats that already pass `minCredits`. Costs are still shown in credits.
 - **No settings changes:** it never changes mode or model, since either would invalidate the
@@ -296,6 +296,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | Setting | Default | |
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
+| `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.autoKeepWarmMaxMinutes` | 120 | Auto keep warm stops after this much keep-warm time (Keep warm once included); 1 to 120, never more |
@@ -306,10 +307,9 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.expiredChats` | 5 | How many expired chats the status-bar list keeps (most recent first) |
 | `cacheKeeper.lookbackHours` | 48 | Read chats whose log changed within this many hours; older ones are never listed |
 
-Fixed values, not shown in the Settings UI: 100k-token "expensive" threshold, 5 s keep-alive lead,
-5% keep-alive jitter, 60-day maximum age for learned cache lifetimes. They can still be overridden
-in `settings.json` (`cacheKeeper.thresholdTokens`, `keepAliveLeadSeconds`, `keepAliveJitterPercent`,
-`lifetimeMaxAgeDays`), mainly for testing.
+Fixed values, not shown in the Settings UI: 5 s keep-alive lead, 5% keep-alive jitter, 60-day
+maximum age for learned cache lifetimes. They can still be overridden in `settings.json`
+(`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 
 ## Build from source
 
