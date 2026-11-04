@@ -384,6 +384,10 @@ above the previous one, so it installs over it. (VS Code needs semver, so no 4-p
   (`test/fixtures`): keep-alives, summaries, status bar, expiry notice, which window acts, your
   unsent text, diagnostics. Run it locally with `node test/smoke.js`, or only some checks with
   `ONLY="<part of a check name>" node test/smoke.js`.
+- **Live test** (manual, costs credits, not on GitHub): `test/live/run.sh` runs this working tree
+  in a real VS Code window, with one new chat per harness and a keep-alive sent by Cache Keeper
+  itself. It then checks each chat's real log: the keep-alive landed, hit the cache, didn't carry
+  the attachment, and the draft stayed. See [test/live/README.md](test/live/README.md).
 - **Release** (`.github/workflows/release.yml`): GitHub → *Actions* → **Release** →
   **Run workflow**. It runs the smoke test first, then:
   - **Existing tag:** pick it in *Use workflow from*, and leave "tag" empty.

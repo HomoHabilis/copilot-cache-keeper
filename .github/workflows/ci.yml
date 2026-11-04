@@ -28,6 +28,8 @@ jobs:
           node --check core.js
           node --check sqlite.js
           node --check harnesses.js
+          for f in test/live/check.js test/live/plan.js test/live/driver/extension.js; do node --check "$f"; done
+          bash -n test/live/run.sh
           node -e "JSON.parse(require('fs').readFileSync('package.json','utf8'))"
 
       - name: Smoke test (core logic + extension with a stand-in VS Code)
