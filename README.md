@@ -52,9 +52,15 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
     that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
   - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
     (default 50%) of what letting the cache expire would add, priced when auto keep warm starts.
-    The closing handoff summary counts against the cap. When the next keep-alive would not fit,
-    you get a warning to choose again (Keep warm once more, Auto keep warm with a fresh cap,
-    Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
+    It also stops at a time limit: `cacheKeeper.autoKeepWarmMaxMinutes` (default 120 min, 0 = none).
+    No keep-alive goes out that would keep the chat warm past 2 h of keep-warm time. Keep-warm
+    time counts Keep warm once and Auto keep warm together, from your first keep-warm choice,
+    until the cache expires, you pick Back to default, Ignore, Summarize or Stop keeping warm, or
+    close the warning. Writing in the chat yourself starts it again from then. The chat list and
+    the status-bar tooltip show it ("kept warm 1 h 10 min of 2 h").
+    The closing handoff summary counts against the cap. When the next keep-alive would not fit
+    the cap or the time limit, you get a warning to choose again (Keep warm once more, Auto keep
+    warm with a fresh cap, and a fresh 2 h if the time limit was reached, Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.
@@ -293,6 +299,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
 | `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
+| `cacheKeeper.autoKeepWarmMaxMinutes` | 120 | Auto keep warm stops after this much keep-warm time (Keep warm once included); 0 = no time limit |
 | `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
 | `cacheKeeper.keepAliveLeadSeconds` | 5 | Send keep-alives this long before expiry |

@@ -55,8 +55,44 @@ function capPercent() {
   return p > 0 ? p : 50;
 }
 
+/** cacheKeeper.autoKeepWarmMaxMinutes (default 120) in ms; 0 = no time limit. */
+function maxWarmMs() {
+  const m = cfg("autoKeepWarmMaxMinutes");
+  const n = m === undefined || m === null || m === "" ? 120 : Number(m);
+  return n > 0 ? n * 60000 : Infinity;
+}
+
+/** "45 min", "2 h", "1 h 10 min". */
+function fmtDuration(ms) {
+  const m = Math.max(0, Math.round(ms / 60000)), h = Math.floor(m / 60);
+  return h ? `${h} h${m % 60 ? ` ${m % 60} min` : ""}` : `${m} min`;
+}
+
+/**
+ * Keep-warm time: how long Cache Keeper has kept this chat warm in a row, Keep warm once and Auto
+ * keep warm alike. It starts at the first keep-warm choice and ends when the cache expires, when
+ * you pick another option (default, Ignore, Summarize, Stop) or close the warning. Your own
+ * message in the chat starts it again from then.
+ */
+function warmMs(st) { return st.warmSince ? Date.now() - st.warmSince : 0; }
+
+/** Whether one more keep-alive keeps the chat warm within the keep-warm time limit. */
+function warmFits(st, s) { return !st.warmSince || warmMs(st) + s.ttl * 1000 <= maxWarmMs(); }
+
+/** What stops auto keep warm before the next keep-alive: its time limit or its spending cap; null if neither. */
+function autoLimit(st, s) {
+  if (!warmFits(st, s)) return `${fmtDuration(maxWarmMs())} limit`;
+  if (!core.canAffordHeartbeat(s, st.spent, st.cap, closingSummary(s))) return `${capPercent()}% cap`;
+  return null;
+}
+
 /** Switch a chat's mode. Starting auto keep warm fixes its spending cap from the cost right now. */
 function setMode(st, s, mode) {
+  if (mode === "once" || mode === "auto") {
+    // keep-warm time keeps counting from earlier keep-warm choices; picking Auto keep warm again
+    // once the time limit is reached starts a new period
+    if (!st.warmSince || (mode === "auto" && !warmFits(st, s))) st.warmSince = Date.now();
+  } else st.warmSince = null;
   st.mode = mode;
   if (mode === "auto") { st.spent = 0; st.cap = core.autoCap(s, capPercent()); }
 }
@@ -766,9 +802,10 @@ async function choose(context, s, pick) {
 }
 
 function capText(st, s) {
+  const time = maxWarmMs() < Infinity ? ` and for at most ${fmtDuration(maxWarmMs())} of keep-warm time` : "";
   return st.cap === null ? "while the price is known"
     : `until about ${core.fmt(st.cap)} cr is spent (${capPercent()}% of what an expiry would add when it started` +
-      (closingSummary(s) ? ", the closing handoff summary included)" : ")");
+      (closingSummary(s) ? ", the closing handoff summary included)" : ")") + time;
 }
 
 /**
@@ -811,10 +848,13 @@ async function offerAtCap(context, s) {
   const st = stateFor(s.id);
   const c = s.cost;
   const fresh = core.autoCap(s, capPercent());
-  const msg = `Auto keep warm reached its ${capPercent()}% cap: ${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr spent ` +
+  const timeUp = !warmFits(st, s);
+  const msg = `Auto keep warm reached its ${autoLimit(st, s) || `${capPercent()}% cap`}: kept warm ${fmtDuration(warmMs(st))}, ` +
+    `${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr spent ` +
     `(${describe(s)}). Cache expires in ${Math.max(0, Math.round(live(s)))}s; letting it expire adds ~${core.fmt(c.missExtra)} cr ` +
     `to your next message. Keep warm: one more keep-alive (~${core.fmt(c.heartbeat)} cr). ` +
-    `Auto keep warm: start again with a new cap of ~${core.fmt(fresh)} cr. ` +
+    `Auto keep warm: start again with a new cap of ~${core.fmt(fresh)} cr` +
+    (timeUp ? ` for another ${fmtDuration(maxWarmMs())}. ` : ". ") +
     (closingSummary(s) ? `If you don't click, a handoff summary (~${core.fmt(c.summary)} cr) is written and it expires.`
       : "If you don't click, it expires.");
   const pick = await vscode.window.showWarningMessage(msg, ...Object.keys(CHOICES));
@@ -850,7 +890,8 @@ function chatItem(s, cur = currentChat()) {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
     description: `${s.kind === "sdk" ? "Copilot SDK" : "Local"} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
-      (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
+      (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") +
+      (st.warmSince ? ` · kept warm ${fmtDuration(warmMs(st))}` + (maxWarmMs() < Infinity ? ` of ${fmtDuration(maxWarmMs())}` : "") : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
       (st.handoff ? " · handoff summary ready" : "") +
       (cur && cur.id === s.id ? " · where you last typed" : ""),
     s,
@@ -887,7 +928,8 @@ async function pickChat(context) {
   const pick = await vscode.window.showQuickPick([
     ...handoff,
     { label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
-    { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent, then summary` },
+    { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent` +
+      (maxWarmMs() < Infinity ? ` or ${fmtDuration(maxWarmMs())} of keep-warm time` : "") + ", then summary" },
     { label: "Summarize", detail: "Write the handoff summary now" },
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
@@ -922,6 +964,10 @@ async function decide(context) {
       if (!core.isOwnMessage(s.lastUserText) && ["ignore", "done"].includes(st.mode)) {
         st.mode = "ask"; st.spent = 0;
       }
+      // you wrote in the chat: keep-warm time counts again from now
+      if (!core.isOwnMessage(s.lastUserText) && st.warmSince) {
+        st.warmSince = ["once", "auto"].includes(st.mode) ? Date.now() : null;
+      }
     }
     const r = live(s);
     const actOnce = st.actedFor !== s.cacheFrom;
@@ -937,6 +983,7 @@ async function decide(context) {
       st.diagFor = s.cacheFrom;
       logx(`keep-alive due for ${s.id.slice(0, 8)}: ${Math.round(r)}s left (lead ${lead()}s + ${Math.round(st.jitter || 0)}s random), mode ${st.mode}, ` +
         `seen since start ${seenLive(s)}, within cap ${core.canAffordHeartbeat(s, st.spent, st.cap)}, ` +
+        `kept warm ${fmtDuration(warmMs(st))} (within limit ${warmFits(st, s)}), ` +
         `already acted ${!actOnce}, sending lock ${sending}`);
     }
     // This window's warning still unanswered when something automatic is about to happen: that
@@ -947,7 +994,7 @@ async function decide(context) {
       goQuiet(st, s, "warning not answered");
     }
     if (st.mode === "auto" && seenLive(s) && r > 0 && r <= cfg("warnSeconds") && st.capWarnFor !== s.cacheFrom &&
-        s.cost && !core.canAffordHeartbeat(s, st.spent, st.cap, closingSummary(s))) {
+        s.cost && autoLimit(st, s)) {
       st.capWarnFor = s.cacheFrom;
       offerAtCap(context, s);    // not awaited, like the expiry warning
     }
@@ -963,14 +1010,15 @@ async function decide(context) {
         if (closingSummary(s)) st.summaryDueFor = s.lastRealUserTs;
       }
     } else if (st.mode === "auto" && r > 0 && r <= dueAlive && actOnce && seenLive(s)) {
-      if (core.canAffordHeartbeat(s, st.spent, st.cap, closingSummary(s))) {
+      const limit = autoLimit(st, s);
+      if (!limit) {
         if (await keepAlive(context, s)) st.actedFor = s.cacheFrom;
       } else if (!closingSummary(s)) {
         st.actedFor = s.cacheFrom; st.mode = "done";
-        logx(`auto keep warm for ${s.id.slice(0, 8)} reached its cap: stopped, no summary`);
-        vscode.window.showInformationMessage(`Cache Keeper: auto keep warm reached its ${capPercent()}% cap; ` +
+        logx(`auto keep warm for ${s.id.slice(0, 8)} reached its ${limit} after ${fmtDuration(warmMs(st))}: stopped, no summary`);
+        vscode.window.showInformationMessage(`Cache Keeper: auto keep warm reached its ${limit}; ` +
           `the cache now expires (${describe(s)}).`);
-      } else if (await summary(context, s, `auto keep warm reached its ${capPercent()}% cap`)) {
+      } else if (await summary(context, s, `auto keep warm reached its ${limit}`)) {
         st.actedFor = s.cacheFrom;
       }
     } else if (st.mode === "ask" && r > 0 && r <= SUMMARY_LEAD && actOnce && afterOnce) {
@@ -991,6 +1039,7 @@ async function decide(context) {
       const fresh = await reread(s);
       if (fresh && fresh.cacheFrom !== s.cacheFrom) { all = all.map(x => x.id === fresh.id ? fresh : x); continue; }
       st.expiredFor = s.cacheFrom;
+      st.warmSince = null;       // keeping warm ended: keep-warm time starts over next time
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
       const actions = await findHandoff(st) ? [NEW_FROM_HANDOFF] : [];
       vscode.window.showInformationMessage(
@@ -1058,6 +1107,8 @@ function updateStatus(context) {
       `| Handoff summary | ~${core.fmt(s.cost.summary)} cr |`,
       `| Session so far | ${core.fmt(s.credits)} cr |`, "");
   } else md.push("No price for this model in Copilot's price sheet.", "");
+  if (st.warmSince) md.push(`Kept warm ${fmtDuration(warmMs(st))}` +
+    (maxWarmMs() < Infinity ? ` of ${fmtDuration(maxWarmMs())} (cacheKeeper.autoKeepWarmMaxMinutes)` : "") + ".", "");
   if (autoChats.length) md.push(`$(zap) Auto keep warm is on for ${autoChats.length} chat(s) and spends credits on its own: ` +
     "click to change it, or run *Cache Keeper: Stop keeping warm*.", "");
   if (costlyRestart) md.push(`*Orange: expired and over cacheKeeper.thresholdTokens (${Math.round(cfg("thresholdTokens") / 1000)}k).*  `);
@@ -1093,7 +1144,10 @@ function activate(context) {
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summary(context, s, "on request"); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {
-      for (const st of sessions.values()) if (st.mode === "auto" || st.mode === "once") st.mode = "ask";
+      for (const st of sessions.values()) {
+        if (st.mode === "auto" || st.mode === "once") st.mode = "ask";
+        st.warmSince = null;
+      }
     }),
   );
   const timers = [

@@ -76,6 +76,12 @@
           ],
           "description": "Auto keep warm stops once its keep-alives, plus the closing handoff summary (when cacheKeeper.summaryAfterKeepWarm is on), would cost more than this share of what letting the cache expire would have added, priced when auto keep warm started."
         },
+        "cacheKeeper.autoKeepWarmMaxMinutes": {
+          "type": "number",
+          "default": 120,
+          "minimum": 0,
+          "description": "Auto keep warm stops once its next keep-alive would keep the chat warm past this many minutes of keep-warm time (0 = no time limit; the spending cap still applies). Keep-warm time counts Keep warm once and Auto keep warm together, from the first keep-warm choice, until the cache expires, you pick another option (default, Ignore, Summarize, Stop keeping warm) or close the warning; your own message in the chat starts it again from then. Picking Auto keep warm again once the limit is reached starts a new period."
+        },
         "cacheKeeper.summaryAfterKeepWarm": {
           "type": "boolean",
           "default": true,
