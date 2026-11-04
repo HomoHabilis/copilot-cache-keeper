@@ -13,7 +13,9 @@ const sqlite = require("../../sqlite");
 
 const [logFile, resultFile, runId, ...wanted] = process.argv.slice(2);
 const HOME = os.homedir(), SERVER = path.join(HOME, ".vscode-server", "data");
-const MARKER = "attach-me";                     // the attached file's name: never in a keep-alive's request
+// the attached file's name, outside the test folder (so it is in no workspace listing): it must not
+// appear in a keep-alive's request
+const MARKER = "ck-live-attachment";
 const ckLog = fs.readFileSync(logFile, "utf8"), result = fs.readFileSync(resultFile, "utf8");
 const ls = d => { try { return fs.readdirSync(d); } catch { return []; } };
 const firstMatch = (dir, prefix) => ls(dir).find(n => n.startsWith(prefix));

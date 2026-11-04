@@ -39,8 +39,10 @@ test/live/run.sh --yes --keep    # no cost prompt; keep the scratch folder and l
 ```
 
 A VS Code window opens and closes itself when done (a few minutes per harness). Don't type in it.
-The scratch folder is `~/ck-live-ws`; the test chats ("ck-live ...") stay in VS Code's Sessions list,
-archive them when you like.
+**The first time,** VS Code asks whether you trust the test folder `~/ck-live-ws`: click **Trust**
+(the script tells you when). Until then VS Code holds agent requests back, so the test waits for it.
+The folder is kept between runs so you are asked only once. The test chats ("ck-live ...") stay in
+VS Code's Sessions list; archive them when you like.
 
 **Prerequisites:** Windows VS Code with Copilot signed in, a WSL distro, `node` in WSL, and the
 Claude and Codex harnesses enabled if you test them (their SDKs download on first use).

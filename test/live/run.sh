@@ -26,7 +26,8 @@ DISTRO="${WSL_DISTRO_NAME:?not in WSL}"
 WINTEMP_W="$(cd /mnt/c && cmd.exe /c 'echo %TEMP%' 2>/dev/null | tr -d '\r')"
 WINTEMP="$(wslpath "$WINTEMP_W")"
 LIVE="$WINTEMP/ck-live"                         # driver + working-tree copy of Cache Keeper (Windows side)
-WS="$HOME/ck-live-ws"                           # test folder, opened as a WSL folder
+WS="$HOME/ck-live-ws"                           # test folder, opened as a WSL folder, kept between runs
+ATTACH="$HOME/.ck-live-attachment/ck-live-attachment.txt"   # attached file, outside the test folder
 RUN_ID="r$(date +%H%M%S)"
 RESULT="$WINTEMP/ck-live-result.txt"
 CKLOG="$WINTEMP/ck-live.log"
@@ -43,8 +44,9 @@ cp package.json extension.js core.js sqlite.js harnesses.js "$LIVE/dev/"
 cp test/live/driver/package.json test/live/driver/extension.js "$LIVE/driver/"
 
 # Test folder: Cache Keeper's log mirrored to a file, every chat counted (cheap models too)
-mkdir -p "$WS/.vscode"
-echo "ATTACHMENT-MARKER: attached by the live test, must never go out with a keep-alive." > "$WS/attach-me.txt"
+# Kept between runs: VS Code asks once whether you trust a new folder, and holds agent requests until then.
+mkdir -p "$WS/.vscode" "$(dirname "$ATTACH")"
+echo "Attached by the live test: must never go out with a keep-alive." > "$ATTACH"
 cat > "$WS/.vscode/settings.json" <<EOF
 {
   "cacheKeeper.debugLogFile": "$(echo "$WINTEMP_W\\ck-live.log" | sed 's/\\/\\\\/g')",
@@ -53,7 +55,7 @@ cat > "$WS/.vscode/settings.json" <<EOF
 }
 EOF
 AUTH="wsl%2B$(echo "$DISTRO" | tr '[:upper:]' '[:lower:]')"
-node test/live/plan.js "vscode-remote://$AUTH$WS" "vscode-remote://$AUTH$WS/attach-me.txt" "$RUN_ID" "${HARNESSES[@]}" > "$WINTEMP/ck-live-plan.json"
+node test/live/plan.js "vscode-remote://$AUTH$WS" "vscode-remote://$AUTH$ATTACH" "$RUN_ID" "${HARNESSES[@]}" > "$WINTEMP/ck-live-plan.json"
 rm -f "$RESULT" "$CKLOG"
 
 echo "Opening a VS Code window (it closes itself when done; don't type in it)..."
@@ -61,8 +63,12 @@ echo "Opening a VS Code window (it closes itself when done; don't type in it)...
   --extensionDevelopmentPath="$(wslpath -w "$LIVE/driver")" \
   --extensionDevelopmentPath="$(wslpath -w "$LIVE/dev")" >/dev/null 2>&1)
 
-deadline=$(( $(date +%s) + 60 + 150 * ${#HARNESSES[@]} ))
+deadline=$(( $(date +%s) + 60 + 150 * ${#HARNESSES[@]} )); asked=0
 until grep -q 'DONE\|ERROR' "$RESULT" 2>/dev/null; do
+  if [ $asked -eq 0 ] && grep -q 'WAITING-TRUST' "$RESULT" 2>/dev/null; then
+    asked=1; echo ">>> VS Code asks whether you trust the test folder: click Trust in that window (asked once)."
+    deadline=$(( deadline + 600 ))
+  fi
   [ "$(date +%s)" -gt "$deadline" ] && { echo "timed out; driver log so far:"; cat "$RESULT" 2>/dev/null; exit 1; }
   sleep 5
 done
@@ -72,6 +78,6 @@ echo; echo "--- Cache Keeper"; grep -E 'keep-alive|unsent|moved|not sent|failed|
 
 status=0
 node test/live/check.js "$CKLOG" "$RESULT" "$RUN_ID" "${HARNESSES[@]}" || status=$?
-if [ $KEEP -eq 0 ]; then rm -rf "$LIVE" "$WS" "$RESULT" "$CKLOG" "$WINTEMP/ck-live-plan.json"; fi
+if [ $KEEP -eq 0 ]; then rm -rf "$LIVE" "$RESULT" "$CKLOG" "$WINTEMP/ck-live-plan.json"; fi   # the test folder stays (trusted)
 echo "The test chats (ck-live ...) stay in VS Code's Sessions list; archive them when you like."
 exit $status

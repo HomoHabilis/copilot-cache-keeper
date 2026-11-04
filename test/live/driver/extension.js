@@ -43,6 +43,14 @@ async function run() {
     return;
   }
   fs.unlinkSync(PLAN);                               // run once, even if the window reloads
+  // A folder VS Code doesn't trust yet asks first, and agent requests wait for the answer: wait for it
+  // here (run.sh tells you to click Trust), so no step runs while requests would be held back.
+  if (!vscode.workspace.isTrusted) {
+    log("WAITING-TRUST: click Trust in the VS Code window (once: the test folder is kept between runs)");
+    const ok = await Promise.race([new Promise(r => vscode.workspace.onDidGrantWorkspaceTrust(() => r(true))), sleep(600000).then(() => false)]);
+    if (!ok) { log("ERROR the test folder was not trusted within 10 min"); return; }
+    log("folder trusted");
+  }
   await sleep(12000);                                // let Copilot, the Agent Host and Cache Keeper start
   for (const st of plan.steps) {
     try {
