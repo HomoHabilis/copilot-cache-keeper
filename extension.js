@@ -7,6 +7,7 @@ const vscode = require("vscode");
 const path = require("path");
 const core = require("./core");
 const sqlite = require("./sqlite");
+const harnesses = require("./harnesses");
 
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
@@ -129,7 +130,7 @@ function makeIo(remoteSide) {
     toUri,
     join: (...parts) => isRemote() ? path.posix.join(...parts) : path.join(...parts),
     async stat(p) {
-      try { const st = await vscode.workspace.fs.stat(toUri(p)); return { mtime: st.mtime }; } catch { return null; }
+      try { const st = await vscode.workspace.fs.stat(toUri(p)); return { mtime: st.mtime, size: st.size }; } catch { return null; }
     },
     async readBytes(p) {
       try { return Buffer.from(await vscode.workspace.fs.readFile(toUri(p))); } catch { return null; }
@@ -138,12 +139,13 @@ function makeIo(remoteSide) {
       const st = await self.stat(p);
       if (!st) return null;
       const key = `${isRemote() ? "r" : "l"}|${p}`;
+      // modification time and size: a log appended within the same millisecond keeps its mtime
       const hit = fileCache.get(key);
-      if (hit && hit.mtime === st.mtime) return hit.text;
+      if (hit && hit.mtime === st.mtime && hit.size === st.size) return hit.text;
       const b = await self.readBytes(p);
       if (!b) return null;
       const text = b.toString("utf8");
-      fileCache.set(key, { mtime: st.mtime, text });
+      fileCache.set(key, { mtime: st.mtime, size: st.size, text });
       return text;
     },
     async list(d) {
@@ -201,16 +203,20 @@ async function locateLogs(context) {
  */
 async function locateSdk(context) {
   if (!remote) {
-    return { home: require("os").homedir(),
-             db: context.globalStorageUri ? path.join(path.dirname(context.globalStorageUri.fsPath), "agent-host.db") : null };
+    // globalStorageUri: <data>/User/globalStorage/<extension>; agentSessionData sits in <data>
+    const g = context.globalStorageUri && path.dirname(context.globalStorageUri.fsPath);
+    return { home: require("os").homedir(), db: g ? path.join(g, "agent-host.db") : null,
+             data: g ? path.dirname(path.dirname(g)) : null };
   }
   let home = remoteHome, server = remoteServer;
   if (!home) {
-    // the home folder whose Copilot state changed last (the server runs as that user)
+    // the home folder whose agent state changed last (the server runs as that user)
     let best = null;
     for (const h of ["/root", ...(await io.list("/home")).map(n => `/home/${n}`)]) {
-      const st = await io.stat(`${h}/.copilot/session-state`);
-      if (st && (!best || st.mtime > best.mtime)) best = { h, mtime: st.mtime };
+      for (const sub of [".copilot/session-state", ".vscode-server/data/User/globalStorage"]) {
+        const st = await io.stat(`${h}/${sub}`);
+        if (st && (!best || st.mtime > best.mtime)) best = { h, mtime: st.mtime };
+      }
     }
     home = best && best.h;
   }
@@ -220,7 +226,7 @@ async function locateSdk(context) {
       if (await io.stat(`${s}/data/User/globalStorage`)) { server = s; break; }
     }
   }
-  return { home, db: server ? `${server}/data/User/globalStorage/agent-host.db` : null };
+  return { home, db: server ? `${server}/data/User/globalStorage/agent-host.db` : null, data: server ? `${server}/data` : null };
 }
 
 /** Newest chat log change in a debug-logs folder (0 if none). */
@@ -252,24 +258,27 @@ async function readAll(context) {
     const loc = await locateSdk(context);
     if (loc && (!sdkLoc || loc.home !== sdkLoc.home || loc.db !== sdkLoc.db)) {
       sdkLoc = loc;
-      logx(`reading Copilot SDK chats at ${remote ? remote.authority + ":" : ""}${io.join(loc.home, ".copilot", "session-state")}` +
-        (loc.db ? `, chat names from ${loc.db}` : ", agent-host.db not found"));
+      logx(`reading Agent Host chats (Copilot SDK, Claude, Codex) for ${remote ? remote.authority + ":" : ""}${loc.home}` +
+        (loc.db ? `, chat list and names from ${loc.db}` : ", agent-host.db not found"));
       learnLifetimes();
     }
   }
   const skipped = [], ttls = cfg("ttlSeconds") || {};
   const local = logRootPath ? await core.readSessions(io, logRootPath, Date.now(), lookbackMs(), ttls, skipped) : [];
   const sdkAll = sdkLoc ? await core.readSdkSessions(io, sdkLoc.home, Date.now(), lookbackMs(), ttls, skipped) : [];
-  const sdk = [];
-  for (const s of sdkAll) {
-    const why = await sdkNotMine(s);
-    if (why) noteWhy(s.id, why); else sdk.push(s);
+  await refreshPrices(context).catch(e => logx("prices: " + e.message));
+  let agentAll = [];
+  try { agentAll = await readAgentChats(skipped); } catch (e) { logx("Claude/Codex chats: " + e.message); }
+  const agent = [];
+  for (const s of [...sdkAll, ...agentAll]) {
+    const why = await agentNotMine(s);
+    if (why) noteWhy(s.id, why); else agent.push(s);
   }
-  noteEvidence(local);
+  noteEvidence([...local, ...agent]);
   // Say once (and again when it changes) why a chat is not in the list.
   for (const k of skipped) noteWhy(k.id, k.why);
-  for (const s of [...local, ...sdk]) noteWhy(s.id, unmanagedWhy(s));
-  return [...local, ...sdk].sort((x, y) => y.lastEnd - x.lastEnd);
+  for (const s of [...local, ...agent]) noteWhy(s.id, unmanagedWhy(s));
+  return [...local, ...agent].sort((x, y) => y.lastEnd - x.lastEnd);
 }
 
 // ---------------------------------------------------------------- which window acts on an SDK chat
@@ -287,21 +296,198 @@ function windowFolders() {
   return (vscode.workspace.workspaceFolders || []).map(f => f.uri.scheme === "file" ? f.uri.fsPath : f.uri.path);
 }
 
-/** Why this window leaves an SDK chat alone ("" = it is ours). */
-async function sdkNotMine(s) {
+/** Why this window leaves an Agent Host chat (Copilot SDK, Claude, Codex) alone ("" = it is ours). */
+async function agentNotMine(s) {
+  const label = KIND_LABEL[s.kind] || s.kind;
   const owner = core.sdkChatOwner(s, windowFolders(), !remote && process.platform === "win32");
   if (owner === "window") return "";
-  if (owner === "") return `Copilot SDK chat in ${s.cwd || "another folder"}, not open in this window`;
+  if (owner === "") return `${label} chat in ${s.cwd || "another folder"}, not open in this window`;
   if (!claimDir) return "";
   const f = path.join(claimDir, s.id);
   const now = Date.now();
   const b = await localIo.readBytes(f);   // never from the cache: other windows rewrite it within the same second
   const text = b && b.toString("utf8");
   const [who, at] = String(text || "").split(" ");
-  if (who && who !== windowId && now - Number(at) < CLAIM_STALE_MS) return "Copilot SDK chat without a folder, handled by another window";
+  if (who && who !== windowId && now - Number(at) < CLAIM_STALE_MS) return `${label} chat without a folder, handled by another window`;
   try { await vscode.workspace.fs.writeFile(vscode.Uri.file(f), Buffer.from(`${windowId} ${now}`)); } catch { return ""; }
   return "";
 }
+
+// ---------------------------------------------------------------- Claude and Codex harness chats
+// VS Code's Claude and Codex harnesses run in the same Agent Host as Copilot SDK chats. Generic
+// part (any harness): agent-host.db lists the chats (table sessions: "<harness>:/<VS Code id>",
+// who created it, last change), and each chat's agentSessionData/<VS Code id>/session.db has its
+// metadata: the link to the harness's own log, its folder, how it is billed (model
+// "@provider=copilot:..." or "vscode-proxy:..." = through Copilot) and, for Claude, the credits
+// Copilot billed per turn. Per harness: where its log is, and its translator (harnesses.js).
+// Only chats VS Code created are read (registration "explicit"): the Claude harness also lists
+// your own Claude Code sessions ("discovered"), which are not billed through Copilot.
+
+/** "file:///home/u/x" -> "/home/u/x" (a Windows path for a local window). */
+function uriPath(u) {
+  if (!u) return "";
+  try { const x = vscode.Uri.parse(String(u)); return x.scheme === "file" && !remote ? x.fsPath : x.path; } catch { return String(u); }
+}
+const jsonOr = (v, d) => { try { return JSON.parse(v); } catch { return d; } };
+
+const AGENT_HARNESSES = {
+  claude: {
+    label: "Claude",
+    link: m => jsonOr(m.defaultChatProviderData, {}).sdkSessionId,
+    model: m => (jsonOr(m["claude.model"], {}) || {}).id,
+    cwd: m => uriPath((jsonOr(m["claude.workingDirectories"], []) || [])[0]),
+    translate: harnesses.claudeTrace,
+    // ~/.claude/projects/<folder>/<link>.jsonl: which folder isn't recorded, so look in each
+    async locate(home, link) {
+      const root = io.join(home, ".claude", "projects");
+      for (const d of await io.list(root)) {
+        const f = io.join(root, d, `${link}.jsonl`);
+        if (await io.stat(f)) return f;
+      }
+      return null;
+    },
+  },
+  codex: {
+    label: "Codex",
+    link: m => m["codex.threadId"],
+    model: m => m["codex.model"],
+    cwd: m => uriPath(m["codex.cwd"]),
+    translate: harnesses.codexTrace,
+    // ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<link>.jsonl, dated from the chat's start (UTC or local)
+    async locate(home, link, startedAt) {
+      const root = io.join(home, ".codex", "sessions"), seen = new Set(), now = Date.now();
+      // the log stays in the folder of the day the chat started (never later than today, at most 400 days back)
+      const from = Math.max(Math.min(startedAt || now, now), now - 400 * 86400000);
+      for (let t = from - 86400000; t <= now + 86400000; t += 86400000) {
+        for (const d of [new Date(t)]) {
+          for (const [y, mo, da] of [[d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()], [d.getFullYear(), d.getMonth() + 1, d.getDate()]]) {
+            const dir = io.join(root, String(y), String(mo).padStart(2, "0"), String(da).padStart(2, "0"));
+            if (seen.has(dir)) continue;
+            seen.add(dir);
+            const n = (await io.list(dir)).find(x => x.endsWith(`-${link}.jsonl`));
+            if (n) return io.join(dir, n);
+          }
+        }
+      }
+      return null;
+    },
+  },
+};
+const KIND_LABEL = { local: "Local", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" };
+
+/** Rows of a table in an SQLite file on the window's side, re-read only when the file changes. */
+const dbCache = new Map();     // path -> { key, tables }
+async function dbTable(file, table) {
+  const [a, b] = [await io.stat(file), await io.stat(file + "-wal")];
+  if (!a) return null;
+  const key = `${a.mtime}|${a.size}|${b && b.mtime}|${b && b.size}`;
+  let hit = dbCache.get(file);
+  if (!hit || hit.key !== key) {
+    hit = { key, tables: {}, db: await io.readBytes(file), wal: b ? await io.readBytes(file + "-wal") : null };
+    dbCache.set(file, hit);
+  }
+  if (!(table in hit.tables)) hit.tables[table] = hit.db ? sqlite.readTable(hit.db, hit.wal, table) : null;
+  return hit.tables[table];
+}
+
+/** A harness chat's session.db: metadata (key -> value) and credits Copilot billed (null if unknown). */
+async function chatMeta(vscId) {
+  const f = io.join(sdkLoc.data, "agentSessionData", vscId, "session.db");
+  const rows = await dbTable(f, "session_metadata");
+  if (!rows) return null;
+  const meta = Object.fromEntries(rows.map(r => [r.key, r.value]));
+  let credits = null;
+  for (const r of (await dbTable(f, "turn_usage")) || []) {
+    const nano = (((jsonOr(r.usage, {}) || {})._meta || {}).copilotUsage || {}).totalNanoAiu;
+    if (typeof nano === "number") credits = (credits || 0) + nano / 1e9;
+  }
+  return { meta, credits };
+}
+
+const logPaths = new Map();    // "<harness>:<link>" -> log path (found once)
+
+/**
+ * Claude and Codex chats VS Code created on this window's side, active within the lookback, as
+ * sessions (same shape as Local ones). `skipped` gets { id, why } for the others.
+ */
+async function readAgentChats(skipped, now = Date.now()) {
+  if (!sdkLoc || !sdkLoc.db || !sdkLoc.data) return [];
+  const rows = (await dbTable(sdkLoc.db, "sessions")) || [];
+  const out = [];
+  for (const row of rows) {
+    const m = /^([a-z]+):\/+([^/?#]+)$/.exec(String(row.session_uri || ""));
+    const h = m && AGENT_HARNESSES[m[1]];
+    if (!h || now - Number(row.modified_time || 0) > lookbackMs()) continue;
+    const [kind, vscId] = [m[1], m[2]];
+    const s = await readAgentChat(kind, vscId, row, now, skipped);
+    if (s) out.push(s);
+  }
+  return out;
+}
+
+async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null) {
+  const h = AGENT_HARNESSES[kind];
+  const why = w => { if (skipped) skipped.push({ id: vscId, why: `${h.label} chat: ${w}` }); return null; };
+  if (row.registration_source !== "explicit") return why("not created in VS Code (for example a Claude Code session VS Code found)");
+  const cm = await chatMeta(vscId);
+  if (!cm) return why("no session.db yet");
+  const route = /^@provider=([^:]+):/.exec(h.model(cm.meta) || "");
+  if (route && !["copilot", "vscode-proxy"].includes(route[1])) return why(`billed to your own ${route[1]} account, not through Copilot`);
+  const link = h.link(cm.meta);
+  if (!link) return why("no message sent yet");
+  const key = `${kind}:${link}`;
+  let file = logPaths.get(key);
+  if (!file || !(await io.stat(file))) {
+    file = await h.locate(sdkLoc.home, link, Number(row.start_time) || 0);
+    if (!file) return why(`its log (${link.slice(0, 8)}) was not found`);
+    logPaths.set(key, file);
+  }
+  const s = core.analyzeTrace(kind, file, h.translate(await io.readText(file)), {
+    now, ttlOverrides: cfg("ttlSeconds") || {}, priceFor, credits: cm.credits === null ? undefined : cm.credits });
+  if (!s) return why("no model call yet");
+  return Object.assign(s, { id: vscId, vscId, logPath: file, cwd: h.cwd(cm.meta) || s.cwd,
+    workspaceless: cm.meta["agentHost.workspaceless"] === "true", agentRow: row });
+}
+
+// ---------------------------------------------------------------- Copilot prices for any chat
+// Local chats carry Copilot's price sheet (models.json); Claude and Codex logs carry no prices. The
+// newest models.json of this window's side serves them (same sheet for every chat), re-found every
+// 30 min: this workspace's Local chats first, else the most recently used workspaces.
+let priceBook = { text: null, at: 0, from: "" };
+async function refreshPrices(context) {
+  if (Date.now() - priceBook.at < 30 * 60 * 1000 && priceBook.text) return;
+  priceBook.at = Date.now();
+  const newest = async dirs => {
+    let best = null;
+    for (const dl of dirs) {
+      for (const n of await io.list(dl)) {
+        const f = io.join(dl, n, "models.json");
+        const st = await io.stat(f);
+        if (st && (!best || st.mtime > best.mtime)) best = { f, mtime: st.mtime };
+      }
+    }
+    return best;
+  };
+  let best = logRootPath ? await newest([logRootPath]) : null;
+  if (!best) {
+    const ws = remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
+      : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
+    if (ws) {
+      const dirs = [];
+      for (const w of await io.list(ws)) {
+        const dl = io.join(ws, w, "GitHub.copilot-chat", "debug-logs");
+        const st = await io.stat(dl);
+        if (st) dirs.push({ dl, mtime: st.mtime });
+      }
+      best = await newest(dirs.sort((a, b) => b.mtime - a.mtime).slice(0, 5).map(d => d.dl));
+    }
+  }
+  if (best) {
+    const text = await io.readText(best.f);
+    if (text) { priceBook = { text, at: priceBook.at, from: best.f }; }
+  }
+}
+function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook.text, model) : null; }
 
 // ---------------------------------------------------------------- cache lifetimes
 
@@ -424,10 +610,22 @@ async function diagnose(context) {
     const age = Math.round((now - st.mtime) / 60000);
     if (age > 7 * 24 * 60) continue;                           // keep the list readable
     const s = await core.readSdkSession(io, dir, now, ttls);
-    const mine = s ? await sdkNotMine(s) : "";
+    const mine = s ? await agentNotMine(s) : "";
     const name = s ? sdkVsCodeId(s, ids) : null;
     logx(`${n.slice(0, 8)} SDK (log changed ${age} min ago, folder ${yaml.cwd || "?"}): ` + (!s ? "no model call yet"
       : mine ? `not listed: ${mine}` : line(s, age) + (name ? `, opens as agent-host-copilotcli:/${name.slice(0, 8)}` : ", VS Code's name for it not found: can't send into it")));
+  }
+  logx(`--- Claude and Codex chats, listed in ${sdkLoc.db || "(agent-host.db not found)"}; Copilot prices from ${priceBook.from || "(no models.json found: no costs)"}`);
+  for (const row of (sdkLoc.db && await dbTable(sdkLoc.db, "sessions")) || []) {
+    const m = /^([a-z]+):\/+([^/?#]+)$/.exec(String(row.session_uri || ""));
+    if (!m || !AGENT_HARNESSES[m[1]]) continue;
+    const age = Math.round((now - Number(row.modified_time || 0)) / 60000);
+    if (age > 7 * 24 * 60) continue;
+    const skipped = [];
+    const s = await readAgentChat(m[1], m[2], row, now, skipped);
+    const mine = s ? await agentNotMine(s) : "";
+    logx(`${m[2].slice(0, 8)} ${AGENT_HARNESSES[m[1]].label} (changed ${age} min ago): ` + (!s ? `not tracked: ${skipped.map(k => k.why).join("; ")}`
+      : mine ? `not listed: ${mine}` : line(s, age) + `, log ${s.logPath}, credits ${s.creditsEstimated ? "estimated" : "as billed"}, opens as agent-host-${m[1]}:/${m[2].slice(0, 8)}`));
   }
 }
 
@@ -462,20 +660,23 @@ function describe(s) {
 // "Seen active since this window started", without comparing clocks: the chat's last call changed
 // after our first read of the logs, or the chat appeared after it.
 // Kept per kind of chat: Local chats are judged afresh when their log folder moves, SDK chats not.
-let baseline = { local: null, sdk: null };   // kind -> (id -> cacheFrom at our first read)
+let baseline = {};             // kind -> (id -> cacheFrom at our first read)
 function seenLive(s) {
   const b = baseline[s.kind || "local"];
   if (!b) return false;
   return !b.has(s.id) || b.get(s.id) !== s.cacheFrom;
 }
 function setAll(r) {
-  if (!baseline.local && logRootPath) baseline.local = new Map(r.filter(x => x.kind !== "sdk").map(x => [x.id, x.cacheFrom]));
-  if (!baseline.sdk && sdkLoc) baseline.sdk = new Map(r.filter(x => x.kind === "sdk").map(x => [x.id, x.cacheFrom]));
+  for (const kind of Object.keys(KIND_LABEL)) {
+    const ready = kind === "local" ? !!logRootPath : !!sdkLoc;
+    if (!baseline[kind] && ready) baseline[kind] = new Map(r.filter(x => x.kind === kind).map(x => [x.id, x.cacheFrom]));
+  }
   all = r;
 }
 /** This chat's state read again from its own log (Local or SDK). */
 async function reread(s) {
   const ttls = cfg("ttlSeconds") || {};
+  if (AGENT_HARNESSES[s.kind]) return readAgentChat(s.kind, s.vscId, s.agentRow);
   return s.kind === "sdk" ? core.readSdkSession(io, s.dir, Date.now(), ttls) : core.readSession(io, s.dir, Date.now(), ttls);
 }
 // Thresholds are in context tokens: an expiry costs about context x the model's price, so one value
@@ -528,7 +729,7 @@ let idCache = { key: "", map: new Map() };
 async function sdkIds(force = false) {
   if (!sdkLoc || !sdkLoc.db) return idCache.map;
   const [a, b] = [await io.stat(sdkLoc.db), await io.stat(sdkLoc.db + "-wal")];
-  const key = `${sdkLoc.db}|${a && a.mtime}|${b && b.mtime}`;
+  const key = `${sdkLoc.db}|${a && a.mtime}|${a && a.size}|${b && b.mtime}|${b && b.size}`;
   if (!force && key === idCache.key) return idCache.map;
   const db = await io.readBytes(sdkLoc.db);
   const map = db ? sqlite.sdkChatIds(db, b ? await io.readBytes(sdkLoc.db + "-wal") : null) : new Map();
@@ -542,6 +743,7 @@ function sdkVsCodeId(s, ids) {
 }
 /** The URI VS Code opens this chat by, or null when it can't be told (SDK chat not in agent-host.db). */
 async function chatUri(s) {
+  if (AGENT_HARNESSES[s.kind]) return vscode.Uri.from({ scheme: `agent-host-${s.kind}`, path: "/" + s.vscId });
   if (s.kind !== "sdk") return vscode.Uri.from({ scheme: "vscode-chat-session", authority: "local", path: "/" + Buffer.from(s.id).toString("base64") });
   let id = sdkVsCodeId(s, await sdkIds());
   if (!id) id = sdkVsCodeId(s, await sdkIds(true));
@@ -618,7 +820,7 @@ async function sendNow(context, s, text, label, opts = {}) {
     st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, uri, before: lastMsgs,
                    miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
-    await vscode.commands.executeCommand("workbench.action.chat.submit", { inputValue: text });
+    st.pending.draft = await submitKeepingDraft(text);
     logx(`${label} sent to ${s.id.slice(0, 8)} (${describe(s)})${opened ? ", in a tab opened for it" : ""}` +
       (label === "keep-alive" ? `: "${text}"` : ""));
     return true;
@@ -627,6 +829,51 @@ async function sendNow(context, s, text, label, opts = {}) {
     st.pending = null;
     return false;
   }
+}
+
+// ---------------------------------------------------------------- what you typed or attached, not sent yet
+// A plain submit sends whatever is in the chat's input box, attachments and the implicit context (the
+// active file) included, then empties it: your unsent text and attachments would go out with our
+// keep-alive, and be gone. So our message is sent with VS Code's preserveInput option (what VS Code
+// itself uses to send /compact): only our text is sent, no attachments, no implicit context, and the
+// input box is left as it was. Fallback, should a VS Code version ignore the option: a chat's input
+// box is a document extensions can read and edit (chatSessionInput:input-N, one per chat widget), and
+// VS Code moves the draft along when the chat moves between a tab and the Chat view. So: note the
+// text of every input box, submit, and if our submit emptied the target chat's box, the text is
+// written back once the reply is in, before the tab is closed or moved back. (Tested in VS Code 1.142.)
+
+function chatInputs() { return vscode.workspace.textDocuments.filter(d => d.uri.scheme === "chatSessionInput"); }
+
+/** Submit `text` into the focused chat; returns { doc, text } of the draft it wiped, or null. */
+async function submitKeepingDraft(text) {
+  const before = new Map(chatInputs().map(d => [d.uri.toString(), d.getText()]));
+  const hit = new Set();
+  const sub = vscode.workspace.onDidChangeTextDocument(e => {
+    if (e.document.uri.scheme === "chatSessionInput" && before.get(e.document.uri.toString())) hit.add(e.document);
+  });
+  try {
+    await vscode.commands.executeCommand("workbench.action.chat.submit",
+      { inputValue: text, acceptInputOptions: { preserveInput: true, storeToHistory: false } });
+    await sleep(300);
+  } finally { sub.dispose(); }
+  const doc = [...hit].find(d => d.getText() !== before.get(d.uri.toString()));
+  const draft = doc && before.get(doc.uri.toString());
+  if (!draft || draft === text) return null;
+  logx(`kept your unsent text in that chat (${draft.length} characters) to put it back after the reply`);
+  return { doc, text: draft };
+}
+
+/** Put the draft back, unless you have typed something there in the meantime. */
+async function restoreDraft(p) {
+  const d = p.draft;
+  if (!d) return;
+  p.draft = null;
+  try {
+    if (d.doc.isClosed || d.doc.getText().trim()) { logx("unsent text not put back: that input box is gone or not empty"); return; }
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(d.doc.uri, new vscode.Range(0, 0, d.doc.lineCount, 0), d.text);
+    if (await vscode.workspace.applyEdit(edit)) { logx("your unsent text is back in that chat's input box"); await sleep(300); }
+  } catch (e) { logx("unsent text: " + e.message); }
 }
 
 /**
@@ -688,7 +935,7 @@ async function verifyPending() {
     const done = p.landed && !(pool.find(x => x.id === p.landed) || {}).busy;
     if (done || Date.now() - p.sentAt > 90000) {
       if (!p.landed && !p.queuedWarned) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
-      if (p.tab) withUi(() => finishTab(p));
+      if (p.tab || p.draft) withUi(async () => { await restoreDraft(p); if (p.tab) await finishTab(p); });
       st.pending = null;
     }
   }
@@ -896,7 +1143,7 @@ function chatItem(s, cur = currentChat()) {
   const when = s.busy ? `working · cache ${clock}` : clock;
   return {
     label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
-    description: `${s.kind === "sdk" ? "Copilot SDK" : "Local"} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
+    description: `${KIND_LABEL[s.kind] || s.kind} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") +
       (st.warmSince ? ` · kept warm ${fmtDuration(warmMs(st))} of ${fmtDuration(maxWarmMs())}` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +

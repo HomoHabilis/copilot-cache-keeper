@@ -6,9 +6,10 @@ call, and how long depends on the model: for example, **Opus 5.5 has a 5-minute 
 while **Sol 6.1 has 30 minutes**. After that, your next message re-sends the whole context at
 full price.
 
-It works with both kinds of Copilot chat in VS Code, also when you mix them in one window:
-**Local** (VS Code's own agent) and **Copilot** (the Copilot SDK harness, run by the Agent Host).
-See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
+It works with the chat harnesses in VS Code that spend Copilot credits, also when you mix them in
+one window: **Local** (VS Code's own agent), **Copilot** (the Copilot SDK harness), **Claude**
+(Claude Agent SDK) and **Codex**, the last three run by VS Code's Agent Host.
+See [Supported chat harnesses](#supported-chat-harnesses).
 
 ## What it does
 
@@ -94,8 +95,9 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
 - **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
   since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
-  it found, Local and Copilot SDK (last 7 days), and why each one is or isn't in the list. For an
-  SDK chat it also shows the URI it would be opened by. Start there when a chat gets no warning.
+  it found, for every harness (last 7 days), and why each one is or isn't in the list. For an Agent
+  Host chat it also shows the URI it would be opened by, and for Claude and Codex where the log is
+  and where the prices come from. Start there when a chat gets no warning.
 - **Every new cache window** (each time you or the agent sends something) brings the warning back,
   as long as you answered the last one. After Ignore, a summary, or a warning you closed or left
   unanswered, it comes back only once you send a real message yourself.
@@ -122,6 +124,13 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
     sessions list.
   - `keepTab`: leave the tab open.
   In every case the message itself goes to the right chat.
+- **What you typed or attached, not sent yet:** stays in the chat's input box, and is not sent
+  with Cache Keeper's message. A plain submit would send the input box's attachments and implicit
+  context (the active file) along with the message, then empty the box. Cache Keeper sends with
+  VS Code's `preserveInput` option instead (what VS Code itself uses for `/compact`): only its own
+  text goes out, and your text and attachments are left as they were. Should a VS Code version
+  ignore that option, Cache Keeper notices the emptied box and puts your text back once the reply
+  is in (attachments can't be restored that way). Tested live on all four harnesses.
 - **Focus:** this takes focus for a second or two. If you're typing in an editor at that exact
   moment, focus jumps to the chat tab and comes back when it closes.
 - **Verification:** after sending, it checks the debug logs to confirm the message landed in the
@@ -138,12 +147,20 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
   higher rate above 272k). They're applied to the last call's actual context, after any
   compaction. The cache write rate is then corrected from what Copilot actually billed for that
   chat's recent uncached calls, so the expiry cost matches the bill rather than the list price.
-  Nothing in the code is model-specific.
+  Nothing in the code is model-specific. Copilot SDK chats log the exact per-token prices they
+  were billed, which are used instead. Claude and Codex logs carry no prices: they use Copilot's
+  price sheet from the newest Local chat log on the window's side (this workspace's first, else the
+  most recently used workspaces), with Claude's model names mapped to Copilot's
+  (`claude-haiku-5-5` is `claude-haiku-5.5`).
+- **Credits spent so far:** as billed per call for Local and Copilot SDK chats, as billed per turn
+  for Claude chats (VS Code's `session.db`), estimated from the prices for Codex chats (shown with
+  `~`).
 - **Unknown prices:** if a model isn't in the sheet, Cache Keeper shows no costs and never acts on
   its own.
 - **Cache lifetimes** vary by model and aren't in the price sheet. In order:
   1. `cacheKeeper.ttlSeconds`, per model id, if you set it.
-  2. **Copilot SDK chats:** the chat's own log, which states each call's cache expiry exactly.
+  2. **Copilot SDK and Claude chats:** the chat's own log. Copilot SDK logs state each call's cache
+     expiry exactly; Claude logs say which cache tier each call wrote (5 minutes or 1 hour).
   3. **Copilot CLI and Copilot SDK logs:** `cacheTtlSeconds` in `~/.copilot/session-state/*/events.jsonl`
      (logged on every model call and at each idle checkpoint), on Windows and on the window's remote
      side (newest 30 sessions, rechecked every 30 min). These are exact values from Copilot's
@@ -152,7 +169,7 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
      wins (by the event's own time), even when it is shorter. Values older than
      60 days are dropped, since Copilot can change a lifetime
      server side.
-  4. **Measured in your Local chats:** Local chat logs don't state lifetimes, but a call that still
+  4. **Measured in your Local and Codex chats:** their logs don't state lifetimes, but a call that still
      hit the cache after a pause of N seconds proves it lasts at least N. Only proofs where the
      cache covered the chat's own conversation count (not just the shared system prompt, which
      another chat may keep warm), timed from the previous call of that model of any kind (title and
@@ -195,52 +212,79 @@ See [Local and Copilot SDK chats](#local-and-copilot-sdk-chats).
 - **No settings changes:** it never changes mode or model, since either would invalidate the
   cache.
 
-## Local and Copilot SDK chats
+## Supported chat harnesses
 
-VS Code offers several harnesses in the Chat view. Cache Keeper handles two of them:
+VS Code offers several harnesses in the Chat view. Cache Keeper handles the four that can spend
+Copilot credits:
 
 - **Local**: VS Code's own agent. Its chats are logged per workspace in the Agent Debug Log
   (`workspaceStorage/<id>/GitHub.copilot-chat/debug-logs/<chat>/`).
-- **Copilot** (Copilot SDK, "runs in the Agent Host"): these chats don't write the Agent Debug Log.
-  Each one has a folder `~/.copilot/session-state/<id>/` (`events.jsonl`, `workspace.yaml` with
-  `client_name: vscode-agent-host`) on the machine the window runs on: the WSL distro, SSH host or
-  container for a remote window, Windows for a local one. Copilot CLI sessions share that folder
-  and are left out.
+- **Copilot** (Copilot SDK): `~/.copilot/session-state/<id>/` (`events.jsonl`, `workspace.yaml`
+  with `client_name: vscode-agent-host`). Copilot CLI sessions share that folder and are left out.
+- **Claude** (Claude Agent SDK, "uses your existing Copilot subscription"):
+  `~/.claude/projects/<folder>/<id>.jsonl`.
+- **Codex** (routed through Copilot, or your own OpenAI account): `~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<thread>.jsonl`.
 
-Claude and Codex harness chats are not tracked (they don't run through Copilot's billing).
+The last three run in VS Code's Agent Host, on the machine the window runs on: the WSL distro, SSH
+host or container for a remote window, Windows for a local one.
 
-| Feature | Local | Copilot SDK |
-|---|---|---|
-| Found and listed | Agent Debug Log of this workspace | `~/.copilot/session-state` on the window's side, chats whose folder is open in this window (see below) |
-| Countdown | last call's start + lifetime | the chat's own log gives the exact expiry |
-| Cache lifetime | setting, else Copilot CLI/SDK logs, else measured, else default | setting, else the chat's own log |
-| Costs (keep-alive, expiry, summary, new chat) | price sheet (`models.json`), write price calibrated from billed calls | per-token prices Copilot billed this chat (`tokenDetails`), exact |
-| Credits spent so far | `copilotUsageNanoAiu` per call | `totalNanoAiu` per call |
-| "Agent working" (never sends then) | open turns in the log | open assistant turns, a waiting message, or the few ms between two turns |
-| Warnings, Keep warm, Auto keep warm, Summarize, Ignore | yes | yes |
-| Sending into the right chat | `vscode-chat-session://local/<id>` | `agent-host-copilotcli:/<VS Code id>`, looked up in `agent-host.db` |
-| Checking the message landed, tab cleanup | yes | yes |
-| Handoff summary, New chat from handoff | yes | yes (the new chat opens in the harness the Chat view is set to) |
-| Language of keep-alives and summaries | yes | yes |
-| Lifetime evidence for other chats | measured lower bound | exact value, also used for Local chats of the same model |
+| Feature | Local | Copilot SDK | Claude | Codex |
+|---|---|---|---|---|
+| Found and listed | Agent Debug Log of this workspace | `~/.copilot/session-state` | VS Code's chat list (`agent-host.db`), then its log | same |
+| Countdown starts | last call's start | exact expiry in the log | when the request was sent | when the request's last input arrived |
+| Cache lifetime | setting, Copilot logs, measured, default | setting, the chat's log | setting, the chat's log (cache tier) | setting, Copilot logs, measured, default |
+| Prices | price sheet, calibrated | billed per token, exact | Copilot price sheet | Copilot price sheet |
+| Credits spent | billed | billed | billed per turn | estimated |
+| "Agent working" (never sends then) | open turns | open turns, waiting message, the ms between steps | turn not ended (`end_turn`), queued message | task started, not complete |
+| Warnings, Keep warm, Auto keep warm, Summarize, Ignore, handoff | yes | yes | yes | yes |
+| Opened by | `vscode-chat-session://local/<id>` | `agent-host-copilotcli:/<VS Code id>` | `agent-host-claude:/<VS Code id>` | `agent-host-codex:/<VS Code id>` |
+| Your unsent text and attachments kept | yes | yes | yes | yes |
+| Language of our messages | yes | yes | yes | yes |
 
-**Which window acts on an SDK chat.** Local chats are stored per workspace, so only their window
-sees them. SDK chats are stored per machine, so every window on that machine reads all of them:
+**How it is built.** Each harness has a small translator (`harnesses.js`) that turns its log into
+one shared list of events: your messages, model calls (tokens, cache read and write, cost and cache
+lifetime when the log says), turns starting and ending, tools running, replies, edited files,
+compactions. Everything else (countdown, costs, busy detection, warnings, keep-alives, summaries)
+works on that list, identically for every harness. A log format that changes makes that
+harness's chats disappear from the list; it never sends into a chat it can't read.
+
+**Which chats are read.** Claude and Codex chats are found through VS Code's own databases, the
+same way for both: `agent-host.db` lists the chats, and each chat's
+`agentSessionData/<VS Code id>/session.db` says where its log is (Claude `sdkSessionId`, Codex
+`codex.threadId`), its folder, how it is billed (`@provider=copilot:` or `vscode-proxy:` = through
+Copilot) and, for Claude, the credits Copilot billed per turn. Left alone:
+
+- **Your own Claude Code sessions.** The Claude harness also lists the Claude Code sessions it
+  finds in `~/.claude` (registered as "discovered"), and their transcripts sit in the same folders.
+  They are billed by Anthropic, not Copilot: only chats VS Code created are read.
+- **Chats billed to your own Anthropic or OpenAI account.**
+- **Chats of another folder** (see below).
+
+The diagnostics command lists each of them with the reason.
+
+**Which window acts on an Agent Host chat.** Local chats are stored per workspace, so only their
+window sees them. Agent Host chats are stored per machine, so every window on that machine reads all
+of them:
 
 - A chat started in a folder belongs to the window that has that folder open (its working folder
   or git root is the folder or inside it). Other windows leave it alone.
-- A chat started without a folder (`~/.copilot/chats/<id>`) can be opened from any window on that
-  machine. The first window to see it takes it, with a small claim file in Cache Keeper's global
-  storage that it refreshes every 5 s. If that window closes, another takes over 20 s later.
+- A chat started without a folder can be opened from any window on that machine. The first window
+  to see it takes it, with a small claim file in Cache Keeper's global storage that it refreshes
+  every 5 s. If that window closes, another takes over 20 s later.
 
-**How an SDK chat is opened.** Its log folder id is not the id VS Code opens it by. The link is in
-VS Code's `agent-host.db` (`chats_v2`: `owner_session_uri` `copilotcli:/<VS Code id>`,
-`provider_data.sdkSessionId` = the log folder id), next to the window's side `globalStorage`
-(`%APPDATA%\Code\User\globalStorage` locally, `~/.vscode-server/data/User/globalStorage` in WSL
-or SSH). Cache Keeper reads it with a small built-in SQLite reader (read-only, including the
-`-wal` file) only when it needs to send. If the chat isn't there yet, nothing is sent and the
-output log says why. Tested live with VS Code 1.142: the opened tab is the right chat, the message
-lands in its log, and the cache is hit (33,461 of 33,531 tokens).
+**How an Agent Host chat is opened.** Its log id is not the id VS Code opens it by. For Copilot SDK
+chats the link is in `agent-host.db` (`chats_v2`: `owner_session_uri` `copilotcli:/<VS Code id>`,
+`provider_data.sdkSessionId` = the log folder id); for Claude and Codex VS Code's chat list gives the
+id directly. Both databases sit next to the window's side `globalStorage`
+(`%APPDATA%\Code\User\globalStorage` locally, `~/.vscode-server/data/User/globalStorage` in WSL or
+SSH) and are read with a small built-in SQLite reader (read-only, including the `-wal` file).
+
+**Tested live** with VS Code 1.142 in a WSL window, one new chat per harness, keep-alives sent by
+Cache Keeper itself: every message landed in the intended chat, with the cache hit (Local 21,654 of
+22,150 tokens, Copilot SDK 23,410 of 23,503, Claude 21,219 of 21,295, Codex 34,253 of 35,229). One
+harness quirk: right after a chat's very first message, Claude and Codex rebuild part of their
+prompt, so a keep-alive sent as the chat's second turn gets a partial hit (Claude 74%) or none
+(Codex). From the third turn on, keep-alives hit like any other message.
 
 ## Install
 
@@ -333,10 +377,13 @@ above the previous one, so it installs over it. (VS Code needs semver, so no 4-p
 - **Smoke test** (`.github/workflows/ci.yml`, on pull requests and pushes to `main`): syntax
   check, `node test/smoke.js`, and a check of the built `.vsix`. The `.vsix` is uploaded as the
   run's `copilot-cache-keeper-vsix` artifact, versioned as a dev build (see *Build from
-  source*), to try a pull request's build. `test/smoke.js` tests the cost and
-  timing logic on a synthetic Copilot log, and the extension itself with a stand-in for the
-  VS Code API, sending a keep-alive before the cache expires. Run it locally with
-  `node test/smoke.js`.
+  source*), to try a pull request's build. `test/smoke.js` tests, for each of the four harnesses,
+  the same features on a synthetic log in that harness's format (countdown, lifetime and its
+  source, prices, credits, keep-alive cost, busy detection, language, summary sizing, measured
+  lifetimes), and the extension itself with a stand-in for the VS Code API and VS Code's databases
+  (`test/fixtures`): keep-alives, summaries, status bar, expiry notice, which window acts, your
+  unsent text, diagnostics. Run it locally with `node test/smoke.js`, or only some checks with
+  `ONLY="<part of a check name>" node test/smoke.js`.
 - **Release** (`.github/workflows/release.yml`): GitHub → *Actions* → **Release** →
   **Run workflow**. It runs the smoke test first, then:
   - **Existing tag:** pick it in *Use workflow from*, and leave "tag" empty.
