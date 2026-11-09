@@ -162,7 +162,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const logName = { sdk: "events.jsonl", local: "main.jsonl", claude: "claude-sdk-1.jsonl", codex: "rollout-2026-11-03T13-19-13-thread-1.jsonl" }[kind];
   const cwd = sdkCwd || tmp;
   let clock = now;
-  const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [];
+  const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [];
   let status;
   const fakeFs = {
     stat: async u => { const st = fs.statSync(u.fsPath); return { mtime: st.mtimeMs, size: st.size }; },
@@ -206,7 +206,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       createQuickPick: () => { const qp = { items: [], activeItems: [], selectedItems: [], dispose() {},
         onDidAccept: f => { qp.accept = f; }, onDidHide() {},
         show() { lists.push(qp.items); qp.selectedItems = [qp.items[0]]; setImmediate(() => qp.accept()); } }; return qp; },
-      tabGroups: { all: [{ tabs: [] }], get activeTabGroup() { return this.all[0]; }, close: async () => {} },
+      tabGroups: { all: [{ tabs: [] }], get activeTabGroup() { return this.all[0]; }, close: async t => { closed.push(t); } },
     },
     commands: {
       registerCommand: (id, f) => { commands[id] = f; return { dispose() {} }; },
@@ -278,7 +278,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
-    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits,
+    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits, closed,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
@@ -1649,6 +1649,119 @@ const never = () => new Promise(() => {});
       assert.ok(h.sent[0].text.startsWith("[summary]"));
       assert.ok(!h.warnings.some(w => /already expired/.test(w.msg)));
     } finally { h.close(); }
+  });
+
+  // ---------------------------------------------------------------- fixes from the 2026-11 review
+
+  const kinds = sent => sent.map(x => core.isKeepAlive(x.text) ? "keep-alive" : x.text.startsWith("[summary]") ? "summary" : x.text.slice(0, 20));
+
+  await check("Keep warm once, then Back to default: the closing summary is cancelled", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : "Back to default" });
+    try {
+      await h.run(700);
+      assert.deepStrictEqual(kinds(h.sent), ["keep-alive"]);
+    } finally { h.close(); }
+  });
+
+  await check("Keep warm once, next warning unanswered: it says a summary follows, and one does", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
+    try {
+      await h.run(700);
+      assert.deepStrictEqual(kinds(h.sent), ["keep-alive", "summary"]);
+      assert.ok(/handoff summary .* is written first/.test(h.warnings[1].msg), h.warnings[1].msg);
+    } finally { h.close(); }
+  });
+
+  await check("Keep warm once, then Stop keeping warm: no closing summary, and Stop says what it did", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
+    try {
+      await h.run(320);
+      assert.deepStrictEqual(kinds(h.sent), ["keep-alive"]);
+      await h.commands["cacheKeeper.stop"]();
+      assert.ok(/stopped keeping 1 chat/.test(h.infos.at(-1)), h.infos.at(-1));
+      await h.run(400);
+      assert.deepStrictEqual(kinds(h.sent), ["keep-alive"]);
+    } finally { h.close(); }
+  });
+
+  await check("late click: Keep warm on a warning whose cache expired asks about the cost, arms nothing for later", async () => {
+    let click;
+    const late = new Promise(r => { click = r; });
+    const h = await harness({ answer: (m, b, n) => n === 1 ? late : never() });
+    try {
+      await h.run(320);                                  // expired, warning still in the notification center
+      assert.strictEqual(h.sent.length, 0);
+      click("Keep warm");
+      await h.run(3);
+      assert.ok(h.warnings.some(w => /already expired/.test(w.msg)), "asked first, with the cost");
+      h.userTypes();
+      await h.run(320);
+      assert.strictEqual(h.sent.length, 0, "no keep-alive in the window after your next message");
+    } finally { h.close(); }
+  });
+
+  await check("late click: Auto keep warm on a warning from an earlier cache window does nothing", async () => {
+    let click;
+    const late = new Promise(r => { click = r; });
+    const h = await harness({ answer: (m, b, n) => n === 1 ? late : never() });
+    try {
+      await h.run(320);
+      h.userTypes();
+      await h.run(10);
+      click("Auto keep warm");
+      await h.run(320);
+      assert.strictEqual(h.sent.length, 0);
+      assert.ok(h.infos.some(m => /cache window that is over/.test(m)), h.infos.join(" | "));
+    } finally { h.close(); }
+  });
+
+  await check("list on an expired chat: Keep warm now (asks first) instead of arming Keep warm / Auto", async () => {
+    let offered;
+    const h = await harness({ answer: () => undefined, menu: items => { offered = items.map(i => i.label); return items.find(i => i.label === "Keep warm now"); } });
+    try {
+      await h.run(320);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(2);
+      assert.ok(offered.includes("Keep warm now") && !offered.includes("Keep warm") && !offered.includes("Auto keep warm"), offered.join(", "));
+      assert.ok(h.warnings.some(w => /already expired/.test(w.msg)), "cost question");
+      assert.strictEqual(h.sent.length, 0, "declined: nothing sent");
+    } finally { h.close(); }
+  });
+
+  await check("no price: the list doesn't offer Auto keep warm", async () => {
+    let offered;
+    const h = await harness({ kind: "claude", noPrices: true, ctx: 150000, answer: never, menu: items => { offered = items.map(i => i.label); } });
+    try {
+      await h.run(3);
+      await h.commands["cacheKeeper.options"]();
+      assert.ok(offered.includes("Keep warm") && !offered.includes("Auto keep warm"), offered.join(", "));
+    } finally { h.close(); }
+  });
+
+  await check("a summary that takes more than 90 s: its tab is left alone until the agent is done", async () => {
+    const h = await harness({ ctx: 40000, answer: never,
+                              menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(1, () => h.sent.length > 0);
+      assert.strictEqual(h.sent.length, 1);
+      h.append([{ type: "turn_start", ts: h.clock + 700 }]);     // still writing the summary
+      await h.run(150);
+      assert.strictEqual(h.closed.length, 0, "tab not closed while it works");
+      h.append([{ type: "turn_end", ts: h.clock }]);
+      await h.run(5);
+      assert.strictEqual(h.closed.length, 1, "closed once done");
+    } finally { h.close(); }
+  });
+
+  await check("parsed logs are reused while the text is unchanged", () => {
+    let n = 0;
+    const tr = t => { n++; return { events: [], t }; };
+    const a = core.cachedTrace("k", "text-1", tr), b = core.cachedTrace("k", "text-1", tr);
+    assert.strictEqual(a, b);
+    core.cachedTrace("k", "text-2", tr);
+    assert.strictEqual(n, 2);
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

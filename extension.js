@@ -13,6 +13,8 @@ const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
 const SUMMARY_LEAD = 15;       // seconds before expiry for an automatic summary
 const QUEUED_AFTER_MS = 8000;  // our message not in the log by then: it was queued
+const NOT_LANDED_MS = 90000;   // our message still not in the log: stop waiting for it
+const REPLY_MAX_MS = 30 * 60000; // landed, but the reply never logged its end: clean up anyway
 // Automatic actions only for chats seen active since this window started: after a reload the
 // Chat view may show another chat, and a brand-new chat leaves no trace in the logs.
 const startedAt = Date.now();
@@ -24,7 +26,8 @@ const sessions = new Map();    // id -> per-chat state
 function cfg(key) { return vscode.workspace.getConfiguration("cacheKeeper").get(key); }
 function lead() {
   // configured lead, plus a margin while the clock offset to the remote machine is still unknown
-  return Math.max(2, cfg("keepAliveLeadSeconds") || 5) + (clockOffset === null ? UNMEASURED_MARGIN : 0);
+  // (a local window reads its logs on the same clock: no margin needed)
+  return Math.max(2, cfg("keepAliveLeadSeconds") || 5) + (clockOffset === null && remote ? UNMEASURED_MARGIN : 0);
 }
 
 function stateFor(id) {
@@ -96,6 +99,9 @@ function setMode(st, s, mode) {
     if (!st.warmSince || (mode === "auto" && !warmFits(st, s))) st.warmSince = Date.now();
   } else st.warmSince = null;
   st.mode = mode;
+  // any new choice replaces the summary still due after an earlier Keep warm once (Back to default,
+  // Ignore, Summarize, Stop: no summary you didn't ask for; Keep warm again: due after that one)
+  st.summaryDueFor = undefined;
   if (mode === "auto") { st.spent = 0; st.cap = core.autoCap(s, capPercent()); }
 }
 
@@ -246,7 +252,9 @@ let sdkLoc = null;             // { home, db } for this window's Copilot SDK cha
 function lookbackMs() { return Math.max(1, Number(cfg("lookbackHours")) || 48) * 3600 * 1000; }
 
 async function readAll(context) {
-  if (!logRootPath || !sdkLoc || Date.now() - locatedAt > RELOCATE_MS) {
+  // once a minute, also while nothing is found yet (a remote window with no Local chat): each look
+  // lists home and server folders on the remote side
+  if (!locatedAt || Date.now() - locatedAt > RELOCATE_MS) {
     locatedAt = Date.now();
     const found = await locateLogs(context);
     if (found && found !== logRootPath) {
@@ -337,9 +345,16 @@ const AGENT_HARNESSES = {
     model: m => (jsonOr(m["claude.model"], {}) || {}).id,
     cwd: m => uriPath((jsonOr(m["claude.workingDirectories"], []) || [])[0]),
     translate: harnesses.claudeTrace,
-    // ~/.claude/projects/<folder>/<link>.jsonl: which folder isn't recorded, so look in each
-    async locate(home, link) {
+    // ~/.claude/projects/<folder>/<link>.jsonl: which folder isn't recorded. Claude names it after
+    // the working folder (every character but letters and digits becomes "-"): look there first,
+    // then (`wide`) in each folder.
+    async locate(home, link, startedAt, cwd, wide) {
       const root = io.join(home, ".claude", "projects");
+      if (cwd) {
+        const f = io.join(root, String(cwd).replace(/[^a-zA-Z0-9]/g, "-"), `${link}.jsonl`);
+        if (await io.stat(f)) return f;
+      }
+      if (!wide) return null;
       for (const d of await io.list(root)) {
         const f = io.join(root, d, `${link}.jsonl`);
         if (await io.stat(f)) return f;
@@ -354,11 +369,13 @@ const AGENT_HARNESSES = {
     cwd: m => uriPath(m["codex.cwd"]),
     translate: harnesses.codexTrace,
     // ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<link>.jsonl, dated from the chat's start (UTC or local)
-    async locate(home, link, startedAt) {
+    async locate(home, link, startedAt, cwd, wide) {
       const root = io.join(home, ".codex", "sessions"), seen = new Set(), now = Date.now();
-      // the log stays in the folder of the day the chat started (never later than today, at most 400 days back)
+      // the log stays in the folder of the day the chat started: that day and its neighbours first,
+      // then (`wide`) every day since (never later than today, at most 400 days back)
       const from = Math.max(Math.min(startedAt || now, now), now - 400 * 86400000);
-      for (let t = from - 86400000; t <= now + 86400000; t += 86400000) {
+      const to = wide ? now + 86400000 : Math.min(from + 86400000, now + 86400000);
+      for (let t = from - 86400000; t <= to; t += 86400000) {
         for (const d of [new Date(t)]) {
           for (const [y, mo, da] of [[d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()], [d.getFullYear(), d.getMonth() + 1, d.getDate()]]) {
             const dir = io.join(root, String(y), String(mo).padStart(2, "0"), String(da).padStart(2, "0"));
@@ -405,6 +422,9 @@ async function chatMeta(vscId) {
 }
 
 const logPaths = new Map();    // "<harness>:<link>" -> log path (found once)
+const logMisses = new Map();   // "<harness>:<link>" -> { first, last }: when the wide search failed
+const WIDE_SEARCH_MS = 60000;  // a log still not found after a while: the wide search (many folders) at most this often
+const WIDE_EAGER_MS = 120000;  // ... but on every read in the first minutes (a new chat's log may just be late)
 
 /**
  * Claude and Codex chats VS Code created on this window's side, active within the lookback, as
@@ -438,11 +458,17 @@ async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null)
   const key = `${kind}:${link}`;
   let file = logPaths.get(key);
   if (!file || !(await io.stat(file))) {
-    file = await h.locate(sdkLoc.home, link, Number(row.start_time) || 0);
-    if (!file) return why(`its log (${link.slice(0, 8)}) was not found`);
+    const miss = logMisses.get(key), t = Date.now();
+    const wide = !miss || t - miss.first < WIDE_EAGER_MS || t - miss.last >= WIDE_SEARCH_MS;
+    file = await h.locate(sdkLoc.home, link, Number(row.start_time) || 0, h.cwd(cm.meta), wide);
+    if (!file) {
+      if (wide) logMisses.set(key, { first: miss ? miss.first : t, last: t });
+      return why(`its log (${link.slice(0, 8)}) was not found`);
+    }
+    logMisses.delete(key);
     logPaths.set(key, file);
   }
-  const s = core.analyzeTrace(kind, file, h.translate(await io.readText(file)), {
+  const s = core.analyzeTrace(kind, file, core.cachedTrace(`${kind}|${file}`, await io.readText(file), h.translate), {
     now, ttlOverrides: cfg("ttlSeconds") || {}, priceFor, credits: cm.credits === null ? undefined : cm.credits });
   if (!s) return why("no model call yet");
   return Object.assign(s, { id: vscId, vscId, logPath: file, cwd: h.cwd(cm.meta) || s.cwd,
@@ -453,7 +479,8 @@ async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null)
 // Local chats carry Copilot's price sheet (models.json); Claude and Codex logs carry no prices. The
 // newest models.json of this window's side serves them (same sheet for every chat), re-found every
 // 30 min: this workspace's Local chats first, else the most recently used workspaces.
-let priceBook = { text: null, at: 0, from: "" };
+let priceBook = { text: null, at: 0, from: "", wideAt: 0 };
+const PRICE_WIDE_MS = 60000;   // no price sheet yet: other workspaces are searched at most this often
 async function refreshPrices(context) {
   if (Date.now() - priceBook.at < 30 * 60 * 1000 && priceBook.text) return;
   priceBook.at = Date.now();
@@ -469,7 +496,9 @@ async function refreshPrices(context) {
     return best;
   };
   let best = logRootPath ? await newest([logRootPath]) : null;
-  if (!best) {
+  // other workspaces: every workspaceStorage folder, so not on every read while none has prices
+  if (!best && Date.now() - priceBook.wideAt >= PRICE_WIDE_MS) {
+    priceBook.wideAt = Date.now();
     const ws = remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
       : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
     if (ws) {
@@ -484,7 +513,7 @@ async function refreshPrices(context) {
   }
   if (best) {
     const text = await io.readText(best.f);
-    if (text) { priceBook = { text, at: priceBook.at, from: best.f }; }
+    if (text) { priceBook = { ...priceBook, text, from: best.f }; }
   }
 }
 function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook.text, model) : null; }
@@ -893,8 +922,11 @@ async function finishTab(p) {
       await sleep(400);
       await vscode.commands.executeCommand("workbench.action.chat.openInSidebar");
       await sleep(400);
-      const still = vscode.window.tabGroups.all.flatMap(g => g.tabs).find(t => t.label === p.tab.label);
-      if (still) await vscode.window.tabGroups.close(still, true);
+      // a tab left behind with the chat's title: closed only if it is the only one (two chats can
+      // share a title, and closing the other one would be wrong)
+      const same = vscode.window.tabGroups.all.flatMap(g => g.tabs).filter(t => t.label === p.tab.label);
+      if (same.length === 1) await vscode.window.tabGroups.close(same[0], true);
+      else if (same.length > 1) logx(`tab cleanup: ${same.length} tabs named "${p.tab.label}", none closed`);
       logx(`moved ${p.sessionId.slice(0, 8)} back into the Chat view`);
     } else {
       await vscode.window.tabGroups.close(p.tab, true);
@@ -933,7 +965,11 @@ async function verifyPending() {
         (p.miss ? ` (~${core.fmt(p.miss)} cr extra)` : "") + ". Remove it from the chat's queue if you don't want that.");
     }
     const done = p.landed && !(pool.find(x => x.id === p.landed) || {}).busy;
-    if (done || Date.now() - p.sentAt > 90000) {
+    // Not landed after 90 s: give up. Landed: wait for the reply, however long (a handoff summary on
+    // a large context can take minutes), so its tab is not closed or moved while the agent writes;
+    // the busy cap still ends a turn that never logs its end.
+    const age = Date.now() - p.sentAt;
+    if (done || (!p.landed && age > NOT_LANDED_MS) || age > REPLY_MAX_MS) {
       if (!p.landed && !p.queuedWarned) vscode.window.showWarningMessage(`Cache Keeper: could not confirm the ${p.label} was sent.`);
       if (p.tab || p.draft) withUi(async () => { await restoreDraft(p); if (p.tab) await finishTab(p); });
       st.pending = null;
@@ -970,12 +1006,38 @@ async function findHandoff(st) {
   return false;
 }
 
-/** Keep handoff files out of git without touching the repo's .gitignore. */
+/**
+ * The git folder whose info/exclude applies to a workspace folder: .git itself, or for a worktree or
+ * submodule (.git is a file, "gitdir: <path>") the folder it points to, and from a worktree's own
+ * folder its main repository's (commondir). Null if not a git repository.
+ */
+async function gitDirOf(folderUri) {
+  const dotGit = vscode.Uri.joinPath(folderUri, ".git");
+  if (!(await exists(dotGit))) return null;
+  const read = async u => { try { return Buffer.from(await vscode.workspace.fs.readFile(u)).toString("utf8").trim(); } catch { return null; } };
+  const text = await read(dotGit);           // a folder can't be read as a file
+  if (text === null) return dotGit;
+  const m = /^gitdir:\s*(.+)$/m.exec(text);
+  if (!m) return null;
+  const resolve = (base, p) => p.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(p)
+    ? folderUri.with({ path: (/^[a-zA-Z]:/.test(p) ? "/" : "") + p.replace(/\\/g, "/") })
+    : vscode.Uri.joinPath(base, p);
+  const gitDir = resolve(folderUri, m[1]);
+  const common = await read(vscode.Uri.joinPath(gitDir, "commondir"));
+  return common ? resolve(gitDir, common) : gitDir;
+}
+
+/** Keep handoff files out of git without touching the repos' .gitignore, in every workspace folder. */
 async function excludeFromGit() {
-  const folder = vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0];
-  if (!folder || !(await exists(vscode.Uri.joinPath(folder.uri, ".git", "info")))) return;
-  const exclude = vscode.Uri.joinPath(folder.uri, ".git", "info", "exclude");
+  for (const folder of vscode.workspace.workspaceFolders || []) {
+    const gitDir = await gitDirOf(folder.uri);
+    if (gitDir) await excludeIn(gitDir);
+  }
+}
+async function excludeIn(gitDir) {
+  const exclude = vscode.Uri.joinPath(gitDir, "info", "exclude");
   try {
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(gitDir, "info"));
     let text = "";
     try { text = Buffer.from(await vscode.workspace.fs.readFile(exclude)).toString("utf8"); } catch { /* new file */ }
     if (!text.includes(".copilot-handoff/")) {
@@ -1057,7 +1119,9 @@ async function summaryNow(context, s) {
 const CHOICES = {
   "Keep warm": "once", "Auto keep warm": "auto", "Summarize": "summarize", "Ignore": "ignore",
 };
+const KEEP_WARM_MODES = ["once", "auto"];
 const DEFAULT_CHOICE = "Back to default";
+const KEEP_WARM_NOW = "Keep warm now";
 const NEW_FROM_HANDOFF = "New chat from handoff";
 
 async function choose(context, s, pick) {
@@ -1066,6 +1130,21 @@ async function choose(context, s, pick) {
   // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
   // the next decision tick (within a second), or once the agent is done (decide()).
   if (CHOICES[pick] === "summarize" && !s.busy && live(s) <= 0) { setMode(st, s, "ask"); await summaryNow(context, s); return; }
+  // Keeping warm is for a warm cache: on an expired one, Keep warm is a cold keep-alive now (asks,
+  // with the cost), never one armed for the window after your next message.
+  if (KEEP_WARM_MODES.includes(CHOICES[pick]) && !s.busy && live(s) <= 0) {
+    setMode(st, s, "ask");
+    if (CHOICES[pick] === "once") await keepWarmNow(context, s);
+    else vscode.window.showInformationMessage("Cache Keeper: the cache has already expired, so there is nothing to keep warm. " +
+      "Write in the chat (or use Keep warm now) and choose Auto keep warm while it is warm.");
+    return;
+  }
+  // Auto keep warm needs a price for its spending cap
+  if (CHOICES[pick] === "auto" && !s.cost) {
+    vscode.window.showInformationMessage("Cache Keeper: no price for this model in Copilot's price sheet, so Auto keep warm " +
+      "can't set its spending cap. Use Keep warm instead.");
+    return;
+  }
   setMode(st, s, CHOICES[pick] || "ask");      // DEFAULT_CHOICE -> "ask"
   if (st.mode === "once" || st.mode === "auto") {
     const extra = Math.round(core.keepAliveJitter(s.ttl, jitterPercent(), () => 1));
@@ -1089,6 +1168,11 @@ function capText(st, s) {
  */
 function closingSummary(s) { return cfg("summaryAfterKeepWarm") !== false && core.summaryPays(s); }
 
+/** The closing summary of an earlier Keep warm once is due before this expiry (no message from you since). */
+function summaryDue(st, s) {
+  return closingSummary(s) && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
+}
+
 async function offer(context, s) {
   const st = stateFor(s.id);
   // One warning per cache window. An older one still open counts as not answered (VS Code cannot
@@ -1096,11 +1180,14 @@ async function offer(context, s) {
   const o = st.offer = { for: s.cacheFrom, answered: false, timedOut: false };
   const c = s.cost;
   const autoSum = aboveThreshold(s) && cfg("autoSummary") && seenLive(s) && core.summaryPays(s);
+  const afterOnce = summaryDue(st, s);
   const head = `Copilot cache expires in ${Math.max(0, Math.round(live(s)))}s (${describe(s)}). `;
   const msg = !c
     ? head + "No price for this model in Copilot's price sheet: nothing happens automatically."
     : head + `Keep warm: ~${core.fmt(c.heartbeat)} cr. Letting it expire adds ~${core.fmt(c.missExtra)} cr to your next message. ` +
-      (autoSum ? `If you don't click, it expires and a handoff summary (~${core.fmt(c.summary)} cr) is written first.`
+      (afterOnce ? `If you don't click, it expires and a handoff summary (~${core.fmt(c.summary)} cr) is written first, ` +
+        "since keeping warm ends here (Back to default cancels it)."
+       : autoSum ? `If you don't click, it expires and a handoff summary (~${core.fmt(c.summary)} cr) is written first.`
        : !seenLive(s) ? "If you don't click, it just expires (last active before VS Code restarted, so nothing automatic)."
        : aboveThreshold(s) && cfg("autoSummary") ? "If you don't click, it just expires (a new chat from a handoff summary would cost about as much as continuing this one)."
        : "If you don't click, it just expires (below your summary threshold).");
@@ -1112,7 +1199,17 @@ async function offer(context, s) {
   // notification center is not closed: it stays unanswered, see decide().)
   if (!pick) { goQuiet(st, s, "warning closed"); setMode(st, s, "ignore"); return; }
   st.quietFor = undefined;
-  await choose(context, s, pick);
+  // Clicked late, from the notification center: the warning's cache window may be over. A keep-warm
+  // click then must not arm a later window you never chose it for.
+  const cur = all.find(x => x.id === s.id) || s;
+  if (KEEP_WARM_MODES.includes(CHOICES[pick]) && (cur.cacheFrom !== o.for || (!cur.busy && live(cur) <= 0))) {
+    if (cur.cacheFrom === o.for && CHOICES[pick] === "once") { await keepWarmNow(context, cur); return; }   // asks, with the cost
+    logx(`late "${pick}" for ${s.id.slice(0, 8)} ignored: that warning's cache window is over`);
+    vscode.window.showInformationMessage(`Cache Keeper: that warning was for a cache window that is over ` +
+      `(${describe(cur)}), so nothing was armed. Click the status bar to choose for this chat now.`);
+    return;
+  }
+  await choose(context, cur, pick);
 }
 
 /**
@@ -1125,7 +1222,7 @@ async function offerAtCap(context, s) {
   const fresh = core.autoCap(s, capPercent());
   const timeUp = !warmFits(st, s);
   const msg = `Auto keep warm reached its ${autoLimit(st, s) || `${capPercent()}% cap`}: kept warm ${fmtDuration(warmMs(st))}, ` +
-    `${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr spent ` +
+    `${core.fmt(st.spent)} of ${st.cap === null ? "?" : core.fmt(st.cap)} cr spent ` +
     `(${describe(s)}). Cache expires in ${Math.max(0, Math.round(live(s)))}s; letting it expire adds ~${core.fmt(c.missExtra)} cr ` +
     `to your next message. Keep warm: one more keep-alive (~${core.fmt(c.heartbeat)} cr). ` +
     `Auto keep warm: start again with a new cap of ~${core.fmt(fresh)} cr` +
@@ -1200,17 +1297,24 @@ async function pickChat(context) {
   const handoff = await findHandoff(st) ? [{ label: NEW_FROM_HANDOFF,
     detail: `Open a new chat with ${path.posix.basename(st.handoff.path)} attached` +
       (chat.s.cost ? ` (first message ≈ ${core.fmt(chat.s.cost.restart)} cr)` : "") }] : [];
+  const cs = all.find(x => x.id === chat.s.id) || chat.s;   // the latest state: the list may have been open a while
+  const expired = !cs.busy && live(cs) <= 0;
+  const keepItems = expired
+    ? [{ label: KEEP_WARM_NOW, detail: "The cache has expired: one keep-alive now re-sends the whole context" +
+        (cs.cost ? ` (~${core.fmt(cs.cost.heartbeat + cs.cost.missExtra)} cr); asks first` : "; asks first") }]
+    : [{ label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
+       ...(cs.cost ? [{ label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent` +
+         ` or ${fmtDuration(maxWarmMs())} of keep-warm time, then summary` }] : [])];
   const pick = await vscode.window.showQuickPick([
     ...handoff,
-    { label: "Keep warm", detail: `One keep-alive ${lead()}s before expiry` },
-    { label: "Auto keep warm", detail: `Keep-alives before each expiry until ${capPercent()}% of what an expiry would add is spent` +
-      ` or ${fmtDuration(maxWarmMs())} of keep-warm time, then summary` },
+    ...keepItems,
     { label: "Summarize", detail: "Write the handoff summary now (asks first if the cache expired: it re-sends the whole context)" },
     { label: "Ignore", detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, detail: "Warn before expiry; if no click, it expires (after a summary if above your threshold)" },
   ], { placeHolder: `${describe(chat.s)}: what should happen before its cache expires?` });
   if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff, st.handoffLang);
-  else if (pick) await choose(context, chat.s, pick.label);
+  else if (pick && pick.label === KEEP_WARM_NOW) { setMode(st, cs, "ask"); await keepWarmNow(context, all.find(x => x.id === cs.id) || cs); }
+  else if (pick) await choose(context, all.find(x => x.id === cs.id) || cs, pick.label);
 }
 
 function modeLabel(m) {
@@ -1244,6 +1348,8 @@ async function decide(context) {
         st.warmSince = ["once", "auto"].includes(st.mode) ? Date.now() : null;
       }
     }
+    // auto keep warm started before the price was known: its cap is set once there is one
+    if (st.mode === "auto" && st.cap === null && s.cost) st.cap = core.autoCap(s, capPercent());
     const r = live(s);
     const actOnce = st.actedFor !== s.cacheFrom;
     // Several chats expiring within seconds of each other: the one expiring first goes earlier
@@ -1274,7 +1380,7 @@ async function decide(context) {
       offerAtCap(context, s);    // not awaited, like the expiry warning
     }
     const summaryRule = cfg("autoSummary") && aboveThreshold(s) && seenLive(s) && core.summaryPays(s);
-    const afterOnce = closingSummary(s) && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
+    const afterOnce = summaryDue(st, s);
 
     if (st.mode === "summarize" && r <= 0) {
       // asked for while the agent worked, and the cache expired meanwhile: ask about the cost now
@@ -1319,6 +1425,12 @@ async function decide(context) {
       if (fresh && fresh.cacheFrom !== s.cacheFrom) { all = all.map(x => x.id === fresh.id ? fresh : x); continue; }
       st.expiredFor = s.cacheFrom;
       st.warmSince = null;       // keeping warm ended: keep-warm time starts over next time
+      // a keep-warm choice that could not keep it warm (agent working, too late) ends here: it must
+      // not send a keep-alive in the window after your next message without a new click
+      if (KEEP_WARM_MODES.includes(st.mode)) {
+        logx(`${modeLabel(st.mode)} for ${s.id.slice(0, 8)} ended: the cache expired`);
+        st.mode = "ask";
+      }
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
       const actions = await findHandoff(st) ? [NEW_FROM_HANDOFF] : [];
       vscode.window.showInformationMessage(
@@ -1399,6 +1511,16 @@ function updateStatus(context) {
 }
 
 
+/** `fn` (returning a promise) as a timer callback that skips its turn while the previous run is going. */
+const runningTicks = new Set();
+function noOverlap(name, fn) {
+  return () => {
+    if (runningTicks.has(name)) return;
+    runningTicks.add(name);
+    Promise.resolve().then(fn).finally(() => runningTicks.delete(name));
+  };
+}
+
 let ctxRef;                    // for tests
 function activate(context) {
   ctxRef = context;
@@ -1422,15 +1544,23 @@ function activate(context) {
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = shownOrNewest(); if (s) await summaryNow(context, s); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {
+      let n = 0;
       for (const st of sessions.values()) {
+        if (st.mode === "auto" || st.mode === "once" || st.summaryDueFor !== undefined) n++;
         if (st.mode === "auto" || st.mode === "once") st.mode = "ask";
         st.warmSince = null;
+        st.summaryDueFor = undefined;   // the summary that follows Keep warm once is part of keeping warm
       }
+      vscode.window.showInformationMessage(n ? `Cache Keeper: stopped keeping ${n} chat(s) warm.`
+        : "Cache Keeper: no chat was being kept warm.");
     }),
   );
+  // A tick that takes longer than its interval (slow remote reads, a send in progress) is not
+  // overlapped by the next one: two decide() at once could show the same notice twice or clean up
+  // the same tab twice, and an older read finishing late would replace a newer one.
   const timers = [
-    setInterval(() => { readAll(context).then(setAll).catch(e => logx("read error: " + e.message)); }, READ_MS),
-    setInterval(() => decide(context).catch(e => console.error("cache-keeper", e)), DECIDE_MS),
+    setInterval(noOverlap("read", () => readAll(context).then(setAll).catch(e => logx("read error: " + e.message))), READ_MS),
+    setInterval(noOverlap("decide", () => decide(context).catch(e => console.error("cache-keeper", e))), DECIDE_MS),
     setInterval(() => { if (logRootPath || sdkLoc) learnLifetimes(); }, 30 * 60 * 1000),
   ];
   readAll(context).then(setAll).catch(e => logx("read error: " + e.message));

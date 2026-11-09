@@ -49,8 +49,13 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     fixed, bot-like beat, each keep-alive goes out a random bit earlier: up to 10% of
     the cache lifetime ahead of that, so
     5 to 35 s before expiry for a 5 min cache. Never later than the 5 s lead. The next
-    timeout warns you again. If you don't keep it warm again, a handoff summary is written before
-    that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default).
+    timeout warns you again (and says the summary is coming). If you don't keep it warm again, a handoff summary is written before
+    that expiry (`cacheKeeper.summaryAfterKeepWarm`, on by default). Back to default, Ignore,
+    Summarize or *Stop keeping warm* cancel that summary.
+    Keeping warm needs a warm cache: clicked on a warning whose cache has already expired (it can
+    sit in the notification center), Keep warm asks first, with the cost, like *Keep warm now*,
+    and Auto keep warm does nothing. Neither is ever left armed for the cache window after your
+    next message; a keep-warm choice that could not send (agent working, too late) ends at expiry.
   - **Auto keep warm:** does that before each expiry, up to a cap: `cacheKeeper.autoKeepWarmCapPercent`
     (default 50%) of what letting the cache expire would add, priced when auto keep warm starts.
     It also stops at a time limit: no keep-alive goes out that would keep the chat warm past 2 h
@@ -90,7 +95,9 @@ See [Supported chat harnesses](#supported-chat-harnesses).
   (`cacheKeeper.expiredChats`, default 5) and any with a handoff summary ready. Only chats active
   within `cacheKeeper.lookbackHours` (default 48) are read at all, so older ones are never listed.
 - **Status-bar list:** also offers **Back to default**, to undo a choice (for example to cancel
-  Auto keep warm), and **New chat from handoff** on a chat with a handoff summary.
+  Auto keep warm), and **New chat from handoff** on a chat with a handoff summary. On an expired
+  chat it offers **Keep warm now** (asks first, with the cost) instead of Keep warm and Auto keep
+  warm. Auto keep warm is only offered when the model's price is known, since its cap is in credits.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
   from the handoff file. That notice can slide into the notification center while you are away;
   the same action stays in the status-bar list.

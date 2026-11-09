@@ -541,9 +541,26 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   };
 }
 
+// Logs are read every few seconds and most have not changed: the same text gives the same trace, so
+// the last trace of each log is kept instead of parsing every line again. One entry per log (the
+// text is already held by the file reader's cache); a cached trace is shared, so it is never changed.
+const traceCache = new Map();  // log path -> { text, extra, trace }
+const TRACE_CACHE_MAX = 500;
+/** translate(text, extra), or the trace of the same text of the same log from last time. */
+function cachedTrace(key, text, translate, extra) {
+  const ex = extra === undefined ? "" : JSON.stringify(extra);
+  const hit = traceCache.get(key);
+  if (hit && hit.text === text && hit.extra === ex) return hit.trace;
+  const trace = translate(text, extra);
+  traceCache.delete(key);
+  traceCache.set(key, { text, extra: ex, trace });
+  if (traceCache.size > TRACE_CACHE_MAX) traceCache.delete(traceCache.keys().next().value);
+  return trace;
+}
+
 /** State of one Local chat from its Agent Debug Log (main.jsonl + models.json). */
 function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
-  return analyzeTrace("local", dir, harnesses.localTrace(mainText),
+  return analyzeTrace("local", dir, cachedTrace("local|" + dir, mainText, harnesses.localTrace),
     { now, ttlOverrides, priceFor: m => modelsText ? priceSheetFrom(modelsText, m) : null });
 }
 
@@ -613,7 +630,7 @@ function parseYamlFlat(text) {
 
 /** State of one Copilot SDK chat from its events.jsonl, same shape as analyze(). Null without a call. */
 function analyzeSdk(dir, eventsText, yaml = {}, now = Date.now(), ttlOverrides = {}) {
-  return analyzeTrace("sdk", dir, harnesses.sdkTrace(eventsText, yaml), { now, ttlOverrides });
+  return analyzeTrace("sdk", dir, cachedTrace("sdk|" + dir, eventsText, harnesses.sdkTrace, yaml), { now, ttlOverrides });
 }
 
 async function readSdkSession(io, dir, now = Date.now(), ttlOverrides = {}) {
@@ -719,5 +736,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace,
+  analyzeTrace, cachedTrace,
 };
