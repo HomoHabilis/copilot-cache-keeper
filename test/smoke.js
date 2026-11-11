@@ -233,6 +233,12 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
           // preserveInput: only the given text is sent, the input box (text, attachments) is left alone;
           // otherwise (or a VS Code that ignores the option) the box is filled, sent and emptied
           if (ignorePreserve || !(a.acceptInputOptions && a.acceptInputOptions.preserveInput)) { setText(chatInput, a.inputValue); setText(chatInput, ""); }
+          // Local /compact: no message in the log, only the summarizing call (an aux request, warm)
+          if (kind === "local" && /^\/compact\b/.test(a.inputValue || "")) {
+            append([{ type: "llm_request", ts: clock + 10, dur: 3000, attrs: { debugName: "summarizeConversationHistory-full",
+              model: "claude-opus-5.5", inputTokens: lastCtx, cachedTokens: lastCtx - 700, outputTokens: 900 } }]);
+            return;
+          }
           lastCtx += 700;
           if (kind === "sdk") append(sdkTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4, dur: 500 }));
           else if (kind === "claude") append(claudeTurn(clock, a.inputValue, { input: lastCtx, read: lastCtx - 700, out: 4, cwd }));
@@ -684,6 +690,161 @@ const never = () => new Promise(() => {});
     try {
       await h.run(700);
       assert.strictEqual(h.sent.length, 1, "only the keep-alive");
+    } finally { h.close(); }
+  });
+
+  await check("compact: prompt is /compact with what to keep, in the chat's language; it is not your message", () => {
+    for (const lang of ["en", "it", "fr", "es", "de", "xx"]) {
+      const t = core.compactPrompt(lang);
+      assert.ok(t.startsWith("/compact "), t);
+      assert.ok(core.isOwnMessage(t), "recognised as Cache Keeper's (or a command), not a real message");
+    }
+    assert.ok(core.compactPrompt("it").includes("Conserva"));
+    assert.strictEqual(core.compactPrompt("xx"), core.compactPrompt("en"));
+  });
+
+  await check("compactPays: pays on a large chat, not on one barely bigger than a new chat", () => {
+    const big = core.analyze("/logs/a", chatLog(now - 60000, { ctx: 150000 }), MODELS, now);
+    assert.strictEqual(core.compactPays(big), true, JSON.stringify(big.cost));
+    assert.ok(big.cost.compacted < 60000 && big.cost.compacted > 20000, `compacted ${big.cost.compacted}`);
+    const small = core.analyze("/logs/b", chatLog(now - 60000, { ctx: 30000, first: 25000 }), MODELS, now);
+    assert.strictEqual(core.compactPays(small), false, JSON.stringify(small.cost));
+    assert.ok(small.cost.compacted <= 30000, "never more than the chat holds");
+    assert.strictEqual(core.compactPays({ cost: null }), false);
+  });
+
+  await check("compacted since the last call: the next message is priced on the compacted size", () => {
+    const base = chatLog(now - 60000, { ctx: 150000 });
+    const before = core.analyze("/logs/c", base, MODELS, now);
+    const after = core.analyze("/logs/c2", base + JSON.stringify({ type: "llm_request", ts: now - 30000, dur: 3000,
+      attrs: { debugName: "summarizeConversationHistory-full", model: "claude-opus-5.5", inputTokens: 150000, cachedTokens: 149000 } }) + "\n", MODELS, now);
+    assert.strictEqual(before.compactedIdle, false);
+    assert.strictEqual(after.compactedIdle, true);
+    assert.strictEqual(after.ctx, before.cost.compacted);
+    assert.ok(after.cost.missExtra < before.cost.missExtra / 2, `${after.cost.missExtra} vs ${before.cost.missExtra}`);
+    assert.strictEqual(after.cacheFrom, before.cacheFrom, "the countdown is unchanged");
+  });
+
+  await check("Compact button: on the warning of a Local chat, sends /compact without your draft, confirmed by the log", async () => {
+    let buttons = [];
+    const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return b.find(x => x.startsWith("Compact")); } return never(); },
+                              draft: "my unsent text" });
+    try {
+      await h.run(300);
+      assert.ok(buttons.some(b => /^Compact \(~[\d.]+ cr\)$/.test(b)), buttons.join(" | "));
+      assert.deepStrictEqual(buttons.map(b => b.replace(/ \(.*$/, "")), ["Keep warm", "Auto keep warm", "Summarize", "Compact", "Ignore"]);
+      assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text).join(" | "));
+      assert.ok(h.sent[0].text.startsWith("/compact "), h.sent[0].text);
+      assert.ok(h.submits[0].acceptInputOptions.preserveInput, "sent like VS Code sends /compact itself");
+      assert.strictEqual(h.chatInput.getText(), "my unsent text");
+      assert.ok(!h.warnings.some(w => /could not confirm|did not start/.test(w.msg)), h.warnings.map(w => w.msg).join(" | "));
+      assert.ok(h.closed.length >= 1, "its tab closed once the compaction was in the log");
+      assert.ok(h.infos.some(m => /compacting .* go on in the same chat/.test(m)), h.infos.join(" | "));
+    } finally { h.close(); }
+  });
+
+  await check("Compact: not offered for chats of other harnesses (not tested there yet), unless set", async () => {
+    for (const kind of ["sdk", "claude", "codex"]) {
+      let buttons = [];
+      const h = await harness({ kind, answer: (m, b, n) => { if (n === 1) buttons = b; return never(); },
+                                settings: { ttlSeconds: { "gpt-6.1-sol": 300 } } });
+      try {
+        await h.run(320, () => buttons.length > 0);
+        assert.ok(buttons.length && !buttons.some(b => b.startsWith("Compact")), `${kind}: ${buttons.join(" | ")}`);
+      } finally { h.close(); }
+    }
+    let buttons = [];
+    const h = await harness({ kind: "sdk", settings: { compactHarnesses: ["local", "sdk"] }, answer: (m, b, n) => { if (n === 1) buttons = b; return never(); } });
+    try {
+      await h.run(260);
+      assert.ok(buttons.some(b => b.startsWith("Compact")), buttons.join(" | "));
+    } finally { h.close(); }
+  });
+
+  await check("autoAction compact: no click on a large Local chat compacts it before expiry, no summary", async () => {
+    const h = await harness({ answer: never, ctx: 150000, settings: { autoAction: "compact" } });
+    try {
+      await h.run(310);
+      assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text.slice(0, 40)).join(" | "));
+      assert.ok(h.sent[0].text.startsWith("/compact "), h.sent[0].text);
+      const left = (h.cacheFrom + 300000 - h.sent[0].at) / 1000;
+      assert.ok(left > 0 && left <= 16, `sent ${left}s before expiry`);
+      assert.ok(/No click: a compaction \(~[\d.]+ cr\)/.test(h.warnings[0].msg), h.warnings[0].msg);
+      assert.ok(!fs.existsSync(path.join(h.dir, ".copilot-handoff")), "no handoff file");
+    } finally { h.close(); }
+  });
+
+  await check("autoAction compact: once compacted, nothing more until you write again (and the expiry notice is smaller)", async () => {
+    const h = await harness({ answer: never, ctx: 150000, settings: { autoAction: "compact" } });
+    try {
+      await h.run(330);
+      assert.strictEqual(h.sent.length, 1);
+      const notice = h.infos.find(m => /Copilot cache expired/.test(m)) || "";
+      const extra = Number((/~([\d.]+) extra credits/.exec(notice) || [])[1]);
+      assert.ok(extra > 0 && extra < 30, `expiry adds ${extra} cr after compacting (about 60 for 150k uncompacted): ${notice}`);
+      await h.run(400);
+      assert.strictEqual(h.sent.length, 1, "no second compaction or summary");
+    } finally { h.close(); }
+  });
+
+  await check("autoAction compact on a harness without Compact: the summary, as before", async () => {
+    const h = await harness({ kind: "sdk", answer: never, ctx: 150000, settings: { autoAction: "compact" } });
+    try {
+      await h.run(310);
+      assert.strictEqual(h.sent.length, 1);
+      assert.ok(h.sent[0].text.includes("handoff summary"), h.sent[0].text);
+    } finally { h.close(); }
+  });
+
+  await check("autoAction off, or an old autoSummary false: nothing automatic; autoAction set wins over autoSummary", async () => {
+    for (const settings of [{ autoAction: "off" }, { autoSummary: false }]) {
+      const h = await harness({ answer: never, ctx: 150000, settings });
+      try {
+        await h.run(310);
+        assert.strictEqual(h.sent.length, 0, JSON.stringify(settings));
+        assert.ok(/No click: it expires/.test(h.warnings[0].msg), h.warnings[0].msg);
+      } finally { h.close(); }
+    }
+    const h = await harness({ answer: never, ctx: 150000, settings: { autoSummary: false, autoAction: "summary" } });
+    try {
+      await h.run(310);
+      assert.strictEqual(h.sent.length, 1);
+      assert.ok(h.sent[0].text.includes("handoff summary"));
+    } finally { h.close(); }
+  });
+
+  await check("autoAction compact: Keep warm once ends with a compaction instead of a summary", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), ctx: 150000, settings: { autoAction: "compact" } });
+    try {
+      await h.run(700);
+      assert.strictEqual(h.sent.length, 2, h.sent.map(x => x.text.slice(0, 40)).join(" | "));
+      assert.ok(core.isKeepAlive(h.sent[0].text) && h.sent[1].text.startsWith("/compact "));
+    } finally { h.close(); }
+  });
+
+  await check("Compact on an expired chat asks first (cost); declined: nothing sent, back to default", async () => {
+    for (const reply of ["Compact anyway", undefined]) {
+      let asked = "";
+      const h = await harness({ answer: (msg) => { if (/already expired/.test(msg)) { asked = msg; return reply; } return never(); } });
+      try {
+        await h.run(320);                                    // expired
+        await h.commands["cacheKeeper.compactNow"]();
+        assert.ok(/compaction re-sends the whole context: ~[\d.]+ cr/.test(asked), asked);
+        await h.run(5);
+        assert.strictEqual(h.sent.length, reply ? 1 : 0, String(reply));
+        if (reply) assert.ok(h.sent[0].text.startsWith("/compact "));
+      } finally { h.close(); }
+    }
+  });
+
+  await check("menu: Compact listed for a Local chat with its cost and what it does", async () => {
+    let items = [];
+    const h = await harness({ answer: never, menu: it => { if (it.some(i => i.label === "Compact")) items = it; return undefined; } });
+    try {
+      await h.run(20);
+      await h.commands["cacheKeeper.options"]();
+      const c = items.find(i => i.label === "Compact");
+      assert.ok(c && /\/compact\) \(~[\d.]+ cr\); your next message then re-sends ~\d+k tokens instead of \d+k\. Changes the chat in place, no undo/.test(c.detail), c && c.detail);
     } finally { h.close(); }
   });
 

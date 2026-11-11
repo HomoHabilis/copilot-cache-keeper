@@ -87,7 +87,7 @@ function warmFits(st, s) { return !st.warmSince || warmMs(st) + s.ttl * 1000 <= 
 /** What stops auto keep warm before the next keep-alive: its time limit or its spending cap; null if neither. */
 function autoLimit(st, s) {
   if (!warmFits(st, s)) return `${fmtDuration(maxWarmMs())} limit`;
-  if (!core.canAffordHeartbeat(s, st.spent, st.cap, closingSummary(s))) return `${capPercent()}% cap`;
+  if (!core.canAffordHeartbeat(s, st.spent, st.cap, closing(s) ? closingCost(s) : 0)) return `${capPercent()}% cap`;
   return null;
 }
 
@@ -863,6 +863,8 @@ async function sendNow(context, s, text, label, opts = {}) {
     const restore = !!opened && s.lastRealUserTs === latestReal;
     // remember each chat's last message time (remote clock) to recognise ours when it lands
     const lastMsgs = new Map(all.map(x => [x.id, x.lastUserTs || 0]));
+    // a /compact may not be logged as a message, only as the compaction it runs
+    const lastCompactions = new Map(all.map(x => [x.id, x.compactedAt || 0]));
     // opening the tab took time: check again right before submitting
     const late = await unsafeToSend(s, opts);
     if (late) {
@@ -871,6 +873,7 @@ async function sendNow(context, s, text, label, opts = {}) {
       return false;
     }
     st.pending = { sentAt: decidedAt, label, expectId: s.id, tab: opened, restore, sessionId: s.id, uri, before: lastMsgs,
+                   beforeCompaction: lastCompactions,
                    miss: s.cost ? s.cost.missExtra : null };
     // No mode or model change: either would invalidate the cache we are trying to keep.
     st.pending.draft = await submitKeepingDraft(text);
@@ -969,10 +972,16 @@ async function verifyPending() {
     const pool = freshTarget ? [freshTarget, ...all.filter(x => x.id !== p.expectId)] : all;
     if (freshTarget) all = all.map(x => x.id === freshTarget.id ? freshTarget : x);   // don't wait for the next full read
     // landed = a new Cache Keeper message in some chat since we sent (no clock comparison needed)
-    const landed = pool.find(x => x.lastUserTs > (p.before.get(x.id) || 0) && core.isOwnMessage(x.lastUserText));
+    let landed = pool.find(x => x.lastUserTs > (p.before.get(x.id) || 0) && core.isOwnMessage(x.lastUserText));
+    let landedAt = landed && landed.lastUserTs;
+    if (!landed && p.label === "compaction" && p.beforeCompaction) {
+      // only the target chat: another chat may compact on its own meanwhile
+      landed = pool.find(x => x.id === p.expectId && (x.compactedAt || 0) > (p.beforeCompaction.get(x.id) || 0));
+      landedAt = landed && landed.compactedAt;
+    }
     if (landed && !p.landed) {
       p.landed = landed.id;
-      noteOffset(landed.lastUserTs - p.sentAt);
+      if (p.label !== "compaction" || landedAt === landed.lastUserTs) noteOffset(landedAt - p.sentAt);
       if (landed.id !== p.expectId) {
         st.mode = "done";
         vscode.window.showErrorMessage(`Cache Keeper: the ${p.label} went to another chat than intended. ` +
@@ -1198,13 +1207,88 @@ async function summaryNow(context, s) {
   return summary(context, s, "on request");
 }
 
+// ---------------------------------------------------------------- compaction
+// Compact: the harness's own /compact command, with what to keep in the chat's language. It
+// summarizes the older turns in place and keeps the recent ones, so you just go on in the same chat,
+// and your next message re-sends only the compacted chat. It changes the chat and can't be undone,
+// which is why a summary file stays the default for what happens with no click
+// (cacheKeeper.autoAction).
+
+/** The harnesses whose /compact Cache Keeper uses: Local (VS Code's documented command) unless set. */
+function compactKinds() {
+  const v = cfg("compactHarnesses");
+  return Array.isArray(v) ? v : ["local"];
+}
+function canCompact(s) { return compactKinds().includes(s.kind); }
+
+/**
+ * What happens with no click, for a large chat: "summary" (default), "compact" or "off". An older
+ * cacheKeeper.autoSummary false, set before autoAction existed, still means off.
+ */
+function autoAction() {
+  const c = vscode.workspace.getConfiguration("cacheKeeper");
+  const i = c.inspect ? c.inspect("autoAction") || {} : { globalValue: c.get("autoAction") };
+  const set = [i.workspaceFolderValue, i.workspaceValue, i.globalValue].find(v => v !== undefined);
+  if (set === undefined && c.get("autoSummary") === false) return "off";
+  const v = set !== undefined ? set : c.get("autoAction");
+  return ["summary", "compact", "off"].includes(v) ? v : "summary";
+}
+
+/** The automatic action for this chat: compact when chosen and its harness supports it, else a summary. */
+function autoKind(s) { return autoAction() === "compact" && canCompact(s) ? "compact" : "summary"; }
+function autoCost(s) { return !s.cost ? 0 : autoKind(s) === "compact" ? s.cost.compact : s.cost.summary; }
+function autoPays(s) { return autoKind(s) === "compact" ? core.compactPays(s) : core.summaryPays(s); }
+/** "a handoff summary (~2.1 cr)" or "a compaction (~1.4 cr)", for what happens with no click. */
+function autoText(s) {
+  return `${autoKind(s) === "compact" ? "a compaction" : "a handoff summary"}` + (s.cost ? ` (~${core.fmt(autoCost(s))} cr)` : "");
+}
+/** Run the automatic action (summary or compaction) for this chat. */
+function autoRun(context, s, why) { return autoKind(s) === "compact" ? compact(context, s, why) : summary(context, s, why); }
+
+async function compact(context, s, why, opts = {}) {
+  const st = stateFor(s.id);
+  if (!canCompact(s)) {
+    logx(`compaction for ${s.id.slice(0, 8)} not sent: not used for ${KIND_LABEL[s.kind] || s.kind} chats (cacheKeeper.compactHarnesses)`);
+    return false;
+  }
+  if (s.compactedIdle) {         // already compacted since the last call: nothing left to gain
+    st.mode = "done";
+    vscode.window.showInformationMessage(`Cache Keeper: ${chatName(s)} is already compacted; nothing to do.`);
+    return true;
+  }
+  if (!(await trySend(context, s, core.compactPrompt(s.lang), "compaction", opts))) return false;
+  st.mode = "done";
+  vscode.window.showInformationMessage(`Cache Keeper: compacting ${chatName(s)} (${why}). You can go on in the same chat` +
+    (s.cost ? `; your next message there re-sends about ${Math.round(s.cost.compacted / 1000)}k tokens instead of ${Math.round(s.ctx / 1000)}k.` : "."));
+  return true;
+}
+
+/** Compact now, when you ask for it. On an expired cache, say what it costs first, like Summarize. */
+async function compactNow(context, s) {
+  const st = stateFor(s.id);
+  if (!canCompact(s)) {
+    vscode.window.showInformationMessage(`Cache Keeper: Compact is not used for ${KIND_LABEL[s.kind] || s.kind} chats yet ` +
+      "(not tested there). Use Summarize instead.");
+    return false;
+  }
+  if (!s.busy && live(s) <= 0) {
+    const price = s.cost ? ` The compaction re-sends the whole context: ~${core.fmt(s.cost.missExtra + s.cost.compact)} cr ` +
+      `instead of ~${core.fmt(s.cost.compact)} cr while the cache is warm.` : " The compaction re-sends the whole context at full price.";
+    const go = await vscode.window.showWarningMessage(`Cache Keeper: the cache has already expired (${describe(s)}).` + price,
+      { modal: true }, "Compact anyway");
+    if (go !== "Compact anyway") { setMode(st, s, "ask"); return false; }
+    return compact(context, s, "on request", { allowCold: true });
+  }
+  return compact(context, s, "on request");
+}
+
 // ---------------------------------------------------------------- choices
 
 // No click = nothing kept warm: the cache expires (after a handoff summary if the summary rule
 // applies), and warnings for that chat stop until you write in it again. Keeping warm, once or
 // auto, always takes a click: it is never on by default.
 const CHOICES = {
-  "Keep warm": "once", "Auto keep warm": "auto", "Summarize": "summarize", "Ignore": "ignore",
+  "Keep warm": "once", "Auto keep warm": "auto", "Summarize": "summarize", "Compact": "compact", "Ignore": "ignore",
 };
 const KEEP_WARM_MODES = ["once", "auto"];
 /** The choice a button or menu label stands for, without the cost it shows ("Keep warm (~1.1 cr)"). */
@@ -1222,6 +1306,7 @@ async function choose(context, s, pick) {
   // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
   // the next decision tick (within a second), or once the agent is done (decide()).
   if (CHOICES[pick] === "summarize" && !s.busy && live(s) <= 0) { setMode(st, s, "ask"); await summaryNow(context, s); return; }
+  if (CHOICES[pick] === "compact" && (!canCompact(s) || (!s.busy && live(s) <= 0))) { setMode(st, s, "ask"); await compactNow(context, s); return; }
   // Keeping warm is for a warm cache: on an expired one, Keep warm is a cold keep-alive now (asks,
   // with the cost), never one armed for the window after your next message.
   if (KEEP_WARM_MODES.includes(CHOICES[pick]) && !s.busy && live(s) <= 0) {
@@ -1243,7 +1328,7 @@ async function choose(context, s, pick) {
     vscode.window.showInformationMessage(`Cache Keeper: will send a keep-alive ` +
       (extra > 0 ? `${lead()} to ${lead() + extra}s (random)` : `${lead()}s`) + ` before the cache expires` +
       (st.mode === "auto" ? `, each time, ${capText(st, s)}.`
-       : closingSummary(s) ? ", then a handoff summary before the next expiry." : "."));
+       : closing(s) ? `, then ${autoKind(s) === "compact" ? "a compaction" : "a handoff summary"} before the next expiry.` : "."));
   }
 }
 
@@ -1251,28 +1336,33 @@ function capText(st, s) {
   const time = ` and for at most ${fmtDuration(maxWarmMs())} of keep-warm time`;
   return st.cap === null ? "while the price is known"
     : `until about ${core.fmt(st.cap)} cr is spent (${capPercent()}% of what an expiry would add when it started` +
-      (closingSummary(s) ? ", the closing handoff summary included)" : ")") + time;
+      (closing(s) ? `, the closing ${autoKind(s) === "compact" ? "compaction" : "handoff summary"} included)` : ")") + time;
 }
 
 /**
- * Write a handoff summary when keeping warm ends (after Keep warm once, or at auto's cap): when
- * cacheKeeper.summaryAfterKeepWarm is on and the summary pays off for this chat.
+ * When keeping warm ends (after Keep warm once, or at auto's cap), write a handoff summary, or
+ * compact with cacheKeeper.autoAction "compact": when cacheKeeper.summaryAfterKeepWarm is on and it
+ * pays off for this chat.
  */
-function closingSummary(s) { return cfg("summaryAfterKeepWarm") !== false && core.summaryPays(s); }
+function closing(s) { return cfg("summaryAfterKeepWarm") !== false && autoPays(s); }
+/** What the closing action costs: the summary, or the compaction. */
+function closingCost(s) { return autoCost(s); }
 
 /** The closing summary of an earlier Keep warm once is due before this expiry (no message from you since). */
 function summaryDue(st, s) {
-  return closingSummary(s) && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
+  return closing(s) && st.summaryDueFor !== undefined && st.summaryDueFor === s.lastRealUserTs;
 }
 
 /** What happens to a chat in the default mode if nobody clicks, in a few words. */
 function noClickText(st, s) {
   const c = s.cost;
   if (!c) return "it expires (no price for this model, so nothing automatic)";
-  if (summaryDue(st, s)) return `a handoff summary (~${core.fmt(c.summary)} cr) ends keeping warm, then it expires`;
-  if (aboveThreshold(s) && cfg("autoSummary") && seenLive(s) && core.summaryPays(s)) return `a handoff summary (~${core.fmt(c.summary)} cr), then it expires`;
+  const on = autoAction() !== "off";
+  if (summaryDue(st, s)) return `${autoText(s)} ends keeping warm, then it expires`;
+  if (aboveThreshold(s) && on && seenLive(s) && autoPays(s)) return `${autoText(s)}, then it expires`;
   if (!seenLive(s)) return "it expires (idle since before VS Code started: nothing automatic)";
-  if (aboveThreshold(s) && cfg("autoSummary")) return "it expires (a summary would not pay off here)";
+  if (s.compactedIdle) return "it expires (already compacted: your next message re-sends little)";
+  if (aboveThreshold(s) && on) return `it expires (a ${autoKind(s) === "compact" ? "compaction" : "summary"} would not pay off here)`;
   return "it expires (below your summary threshold)";
 }
 
@@ -1285,9 +1375,10 @@ function chatName(s) {
 /** Button labels with what each costs, when the price is known. */
 function costButtons(s, withAuto = true) {
   const c = s.cost;
-  if (!c) return ["Keep warm", "Summarize", "Ignore"];
+  const compactBtn = canCompact(s) && !s.compactedIdle ? [c ? `Compact (~${core.fmt(c.compact)} cr)` : "Compact"] : [];
+  if (!c) return ["Keep warm", "Summarize", ...compactBtn, "Ignore"];
   return [`Keep warm (~${core.fmt(c.heartbeat)} cr)`, ...(withAuto ? ["Auto keep warm"] : []),
-          `Summarize (~${core.fmt(c.summary)} cr)`, "Ignore"];
+          `Summarize (~${core.fmt(c.summary)} cr)`, ...compactBtn, "Ignore"];
 }
 
 async function offer(context, s) {
@@ -1332,10 +1423,10 @@ async function offerAtCap(context, s) {
   const msg = `Auto keep warm reached its ${autoLimit(st, s) || `${capPercent()}% cap`} for ${chatName(s)}: ` +
     `kept warm ${fmtDuration(warmMs(st))}, ${core.fmt(st.spent)} of ${st.cap === null ? "?" : core.fmt(st.cap)} cr spent. ` +
     `Expires in ${Math.max(0, Math.round(live(s)))}s; expiry adds ~${core.fmt(c.missExtra)} cr. ` +
-    `No click: ${closingSummary(s) ? `a handoff summary (~${core.fmt(c.summary)} cr), then it expires` : "it expires"}.`;
-  const [keep, , sum, ign] = costButtons(s);
+    `No click: ${closing(s) ? `${autoText(s)}, then it expires` : "it expires"}.`;
+  const [keep, ...rest] = costButtons(s, false);
   const again = `Auto keep warm (new cap ~${core.fmt(fresh)} cr${timeUp ? `, ${fmtDuration(maxWarmMs())}` : ""})`;
-  const pick = await vscode.window.showWarningMessage(msg, keep, again, sum, ign);
+  const pick = await vscode.window.showWarningMessage(msg, keep, again, ...rest);
   if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
 
@@ -1393,7 +1484,7 @@ function chatItem(s, cur = currentChat()) {
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") +
       (st.warmSince ? ` · kept warm ${fmtDuration(warmMs(st))} of ${fmtDuration(maxWarmMs())}` : "") + (s.cost ? ` · keep-alive ~${core.fmt(s.cost.heartbeat)} cr · spent ${core.fmt(s.credits)} cr` : "") +
-      (st.handoff ? " · handoff summary ready" : "") +
+      (st.handoff ? " · handoff summary ready" : "") + (s.compactedIdle ? " · compacted" : "") +
       (cur && cur.id === s.id ? " · where you last typed" : ""),
     s,
   };
@@ -1451,17 +1542,24 @@ function choiceItems(st, s) {
         (c ? ` (${cr(c.heartbeat + c.missExtra)}); asks first` : "; asks first") }]
     : [{ label: "Keep warm", description: mark("once"),
          detail: `One keep-alive ${when} before expiry` + (c ? ` (${cr(c.heartbeat)})` : "") +
-           (closingSummary(s) ? `, then a handoff summary (${cr(c.summary)}) before the next expiry` : "") },
+           (closing(s) ? `, then ${autoText(s)} before the next expiry` : "") },
        ...(c ? [{ label: "Auto keep warm", description: mark("auto"),
          detail: `A keep-alive (${cr(c.heartbeat)}) ${when} before each expiry, up to ${cr(cap)} ` +
            `(${capPercent()}% of the ${cr(c.missExtra)} an expiry adds) or ${fmtDuration(maxWarmMs())} of keep-warm time` +
-           (closingSummary(s) ? ", then a handoff summary" : "") }] : [])];
+           (closing(s) ? `, then ${autoKind(s) === "compact" ? "a compaction" : "a handoff summary"}` : "") }] : [])];
   return [
     ...keep,
     { label: "Summarize", description: mark("summarize"),
       detail: expired ? "Write the handoff summary now; the cache expired, so it re-sends the whole context" +
           (c ? ` (${cr(c.summary + c.missExtra)}); asks first` : "; asks first")
         : `Write the handoff summary now` + (c ? ` (${cr(c.summary)})` : "") + (s.busy ? ", once the agent is done" : "") },
+    ...(canCompact(s) ? [{ label: "Compact", description: mark("compact"),
+      detail: s.compactedIdle ? "Already compacted since the last message"
+        : (expired ? "Compact the chat now (/compact); the cache expired, so it re-sends the whole context" +
+            (c ? ` (${cr(c.compact + c.missExtra)}); asks first` : "; asks first")
+          : `Compact the chat now (/compact)` + (c ? ` (${cr(c.compact)})` : "") + (s.busy ? ", once the agent is done" : "")) +
+          (c ? `; your next message then re-sends ~${Math.round(c.compacted / 1000)}k tokens instead of ${Math.round(s.ctx / 1000)}k` : "") +
+          ". Changes the chat in place, no undo" }] : []),
     { label: "Ignore", description: mark("ignore"), detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, description: mark("ask"),
       detail: `Warn ${cfg("warnSeconds")} s before expiry; no click: ${noClickText(st, s)}` },
@@ -1469,7 +1567,7 @@ function choiceItems(st, s) {
 }
 
 function modeLabel(m) {
-  return { ask: "default", once: "keep warm once", auto: "auto keep warm", summarize: "summary waiting",
+  return { ask: "default", once: "keep warm once", auto: "auto keep warm", summarize: "summary waiting", compact: "compaction waiting",
            ignore: "ignored", done: "done" }[m] || m;
 }
 
@@ -1530,7 +1628,7 @@ async function decide(context) {
       st.capWarnFor = s.cacheFrom;
       offerAtCap(context, s);    // not awaited, like the expiry warning
     }
-    const summaryRule = cfg("autoSummary") && aboveThreshold(s) && seenLive(s) && core.summaryPays(s);
+    const autoRule = autoAction() !== "off" && aboveThreshold(s) && seenLive(s) && !s.compactedIdle && autoPays(s);
     const afterOnce = summaryDue(st, s);
 
     if (st.mode === "summarize" && r <= 0) {
@@ -1539,30 +1637,35 @@ async function decide(context) {
       summaryNow(context, s);    // not awaited: the question stays while we keep deciding
     } else if (st.mode === "summarize" && r > 0) {
       if (await summary(context, s, "on request")) st.actedFor = s.cacheFrom;
+    } else if (st.mode === "compact" && r <= 0) {
+      setMode(st, s, "ask");
+      compactNow(context, s);    // not awaited, like the summary above
+    } else if (st.mode === "compact" && r > 0) {
+      if (await compact(context, s, "on request")) st.actedFor = s.cacheFrom;
     } else if (st.mode === "once" && r > 0 && r <= dueAlive && actOnce) {
       if (await keepAlive(context, s)) {
         st.actedFor = s.cacheFrom; st.mode = "ask";
         // the summary follows before the next expiry, unless you write in the chat or keep it warm again
-        if (closingSummary(s)) st.summaryDueFor = s.lastRealUserTs;
+        if (closing(s)) st.summaryDueFor = s.lastRealUserTs;
       }
     } else if (st.mode === "auto" && r > 0 && r <= dueAlive && actOnce && seenLive(s)) {
       const limit = autoLimit(st, s);
       if (!limit) {
         if (await keepAlive(context, s)) st.actedFor = s.cacheFrom;
-      } else if (!closingSummary(s)) {
+      } else if (!closing(s)) {
         st.actedFor = s.cacheFrom; st.mode = "done";
         logx(`auto keep warm for ${s.id.slice(0, 8)} reached its ${limit} after ${fmtDuration(warmMs(st))}: stopped, no summary`);
         vscode.window.showInformationMessage(`Cache Keeper: auto keep warm reached its ${limit}; ` +
           `the cache now expires (${describe(s)}).`);
-      } else if (await summary(context, s, `auto keep warm reached its ${limit}`)) {
+      } else if (await autoRun(context, s, `auto keep warm reached its ${limit}`)) {
         st.actedFor = s.cacheFrom;
       }
     } else if (st.mode === "ask" && r > 0 && r <= SUMMARY_LEAD && actOnce && afterOnce) {
-      if (await summary(context, s, "end of keep warm once")) {
+      if (await autoRun(context, s, "end of keep warm once")) {
         st.actedFor = s.cacheFrom; st.summaryDueFor = undefined;
       }
-    } else if (st.mode === "ask" && r > 0 && r <= SUMMARY_LEAD && actOnce && summaryRule) {
-      if (await summary(context, s, "no answer before expiry")) {
+    } else if (st.mode === "ask" && r > 0 && r <= SUMMARY_LEAD && actOnce && autoRule) {
+      if (await autoRun(context, s, "no answer before expiry")) {
         st.actedFor = s.cacheFrom;
       }
     }
@@ -1738,6 +1841,7 @@ function activate(context) {
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = await target("Keep warm now"); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = await target("Write handoff summary now"); if (s) await summaryNow(context, s); }),
+    vscode.commands.registerCommand("cacheKeeper.compactNow", async () => { const s = await target("Compact now"); if (s) await compactNow(context, s); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {
       let n = 0;

@@ -26,6 +26,8 @@ for (const h of harnesses) {
              { wait: 8 }, { cmd: "cacheKeeper.keepWarmNow" }, { wait: reply + 5 }, { boxes: `${h} after` },
              // clear it: a new chat picks up what is left in the Chat view's input (VS Code 1.145)
              { draft: "" });
+  // --compact: then Cache Keeper compacts the chat (/compact) while its cache is warm
+  if (process.env.CK_COMPACT === "1") steps.push({ wait: 5 }, { cmd: "cacheKeeper.compactNow" }, { wait: 60 });
 }
 steps.push({ cmd: "cacheKeeper.diagnose" }, { wait: 5 });
 process.stdout.write(JSON.stringify({ openFolder: folder, close: true, runId, harnesses, steps }, null, 1));
