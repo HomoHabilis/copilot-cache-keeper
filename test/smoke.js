@@ -1441,6 +1441,57 @@ const never = () => new Promise(() => {});
     assert.ok(!/Warning/.test(md), "all priced");
   });
 
+  await check("spend report: every factor of the Python helper (effort, tier, MCP, compactions, subagents); SDK rates read, no NaN", () => {
+    const sheet = { batch_size: 1e6, base: { max_prompt_tokens: 272000, cache_read_price: 50, cache_write_price: 625, output_price: 2500 },
+                    long: { max_prompt_tokens: 1e6, cache_read_price: 100, cache_write_price: 1250, output_price: 5000 } };
+    const t0 = now - 3 * 3600000;
+    const local = { kind: "local", id: "l1", title: "Big", sheetFor: () => sheet, mcpFrac: 0.5, toolShares: [{ ts: t0, share: 0.4 }], events: [
+      { t: "user", ts: t0, text: "go" },
+      { t: "call", ts: t0 + 10, end: t0 + 1000, model: "m", input: 300000, cached: 290000, out: 1000, credits: 20, effort: "medium" },
+      { t: "call", ts: t0 + 2000, end: t0 + 3000, model: "m", input: 300000, cached: 299000, out: 9000, credits: 25, effort: "max" },
+      { t: "aux", ts: t0 + 4000, model: "m", input: 5000, cached: 0, out: 900, credits: 2, summary: true },
+      { t: "aux", ts: t0 + 5000, model: "m", input: 800, cached: 0, out: 10, credits: 0.1 }],
+      subEvents: [{ t: "call", ts: t0 + 6000, model: "m", input: 9000, cached: 0, out: 100, credits: 1.5 }] };
+    // a Copilot SDK chat priced from its own log (cache_read, cache_write, input, output): a miss mid-chat
+    const rates = { cache_read: 0.00005, cache_write: 0.000625, input: 0.0005, output: 0.0025 };
+    const sdk = { kind: "sdk", id: "s1", events: [
+      { t: "call", ts: t0, model: "x", input: 60000, cached: 0, out: 10, credits: 40, rates },
+      { t: "call", ts: t0 + 60000, model: "x", input: 61000, cached: 0, out: 10, credits: 40, rates },
+      { t: "compaction", ts: t0 + 70000 }] };
+    const a = report.analyzeSpend([local, sdk], { since: 0, now });
+    const f = n => a.factors.find(x => x.name.startsWith(n));
+    for (const x of a.factors) assert.ok(Number.isFinite(x.credits), `${x.name}: ${x.credits}`);
+    assert.ok(Math.abs(f("Other cache misses").credits - (61000 - 1000) * (0.000625 - 0.00005)) < 1e-9, "SDK miss priced from its log");
+    assert.ok(Math.abs(f("Max / xhigh").credits - 8000 * 2500 / 1e6) < 1e-9, String(f("Max / xhigh").credits));   // at the base price, like the Python helper
+    assert.ok(f("Long-context").credits > 0 && f("Long-context").count === 2);
+    assert.ok(Math.abs(f("MCP tool").credits - 2 * 300000 * 0.4 * 0.5 * 100 / 1e6) < 1e-9, String(f("MCP tool").credits));
+    assert.strictEqual(f("Compactions").credits, 2);
+    assert.strictEqual(f("Compactions").count, 2, "the Local summarizing call and the SDK compaction");
+    assert.ok(Math.abs(f("Subagents").credits - 1.6) < 1e-9);
+    assert.ok(Math.abs(a.total - (20 + 25 + 2 + 0.1 + 1.5 + 80)) < 1e-9, String(a.total));
+    assert.ok(/## Reasoning effort/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("spend report: a Copilot SDK session's billed total beyond its calls counts as its compaction", () => {
+    const t0 = now - 3600000;
+    const sdk = { kind: "sdk", id: "s1", billedTotal: 14, events: [
+      { t: "call", ts: t0, model: "gpt-6.1-sol", input: 20000, cached: 0, out: 10, credits: 4 },
+      { t: "call", ts: t0 + 60000, model: "gpt-6.1-sol", input: 21000, cached: 20000, out: 10, credits: 2 },
+      { t: "compaction", ts: t0 + 120000 }] };
+    const a = report.analyzeSpend([sdk], { since: 0, now });
+    assert.strictEqual(a.total, 14, "the session's billed total");
+    assert.strictEqual(a.factors.find(f => f.name === "Compactions").credits, 8);
+  });
+
+  await check("spend report: a Copilot SDK session with only a billed total (older SDK) still counts", () => {
+    const log = [JSON.stringify({ type: "user.message", timestamp: iso(now - 7200000), data: { content: "Help me" } }),
+                 JSON.stringify({ type: "session.usage_checkpoint", timestamp: iso(now - 7000000), data: { totalNanoAiu: 36e9 } })].join("\n");
+    const t = report.sdkSessionTotal(log);
+    assert.deepStrictEqual(t, { total: 36, lastTs: now - 7200000 });
+    const a = report.analyzeSpend([{ kind: "sdk", id: "old", events: [], billedTotal: t.total, lastTs: t.lastTs }], { since: 0, now });
+    assert.strictEqual(a.total, 36);
+  });
+
   await check("spend report: a call with no known price is warned about, not a crash", () => {
     const a = report.analyzeSpend([{ kind: "sdk", id: "s1", events: [
       { t: "call", ts: now - 1000, model: "mystery-1", input: 50000, cached: 0, out: 10 }] }], { since: 0, now });

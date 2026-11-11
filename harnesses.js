@@ -59,13 +59,16 @@ function localTrace(mainText) {
       ev.push({ t: "abort", ts }, { t: "user", ts, text: String(a.content || "") });
     } else if (e.type === "turn_start" || e.type === "turn_end") ev.push({ t: e.type, ts });
     else if (e.type === "llm_request") {
+      const credits = a.copilotUsageNanoAiu ? a.copilotUsageNanoAiu / 1e9 : undefined;
       if (String(a.debugName || "").startsWith("panel/") && "inputTokens" in a) {
         ev.push({ t: "call", ts, end: ts + (e.dur || 0), model: a.model || "?", input: a.inputTokens || 0,
-                  cached: a.cachedTokens || 0, out: a.outputTokens || 0,
-                  credits: a.copilotUsageNanoAiu ? a.copilotUsageNanoAiu / 1e9 : undefined });
+                  cached: a.cachedTokens || 0, out: a.outputTokens || 0, credits, effort: requestEffort(a) });
       } else {
-        ev.push({ t: "aux", ts, model: a.model });
-        if (/summarizeConversationHistory/.test(String(a.debugName || ""))) ev.push({ t: "compaction", ts });
+        // another call (title, summary, check): its tokens and credits for the spend report
+        const summary = /summarizeConversationHistory/.test(String(a.debugName || ""));
+        ev.push({ t: "aux", ts, model: a.model, input: a.inputTokens || 0, cached: a.cachedTokens || 0, out: a.outputTokens || 0,
+                  credits, summary });
+        if (summary) ev.push({ t: "compaction", ts });
       }
     } else if (e.type === "tool_call") {
       ev.push({ t: "activity", ts });
@@ -75,6 +78,14 @@ function localTrace(mainText) {
     }
   }
   return done(ev);
+}
+
+/** The reasoning effort a Local request asked for (requestOptions), or undefined. */
+function requestEffort(a) {
+  try {
+    const o = JSON.parse(a.requestOptions || "{}");
+    return (o.reasoning && o.reasoning.effort) || (o.output_config && o.output_config.effort) || undefined;
+  } catch { return undefined; }
 }
 
 // ---------------------------------------------------------------- Copilot SDK ("Copilot" harness)
@@ -93,8 +104,12 @@ function sdkRates(u) {
 
 function sdkTrace(eventsText, yaml = {}) {
   const ev = [];
+  let effort;                   // set at session start and on each model change
+  let billedTotal;              // the session's total as billed (checkpoints, shutdown): it includes calls with no usage record
   for (const e of entries(eventsText)) {
     const d = e.data || {}, ts = time(e.timestamp);
+    if (typeof d.reasoningEffort === "string") effort = d.reasoningEffort;
+    if (e.type !== "session.usage_record" && typeof d.totalNanoAiu === "number") billedTotal = Math.max(billedTotal || 0, d.totalNanoAiu / 1e9);
     switch (e.type) {
       // a message sent while the agent works gets a <reminder> appended
       case "user.message": ev.push({ t: "user", ts, text: String(d.content || "").replace(/\n*<reminder>[\s\S]*$/, "").trim() }); break;
@@ -115,7 +130,8 @@ function sdkTrace(eventsText, yaml = {}) {
         ev.push({ t: "call", ts: ts - (u.duration || 0), end: ts, model: u.model || "?", input: u.inputTokens,
                   cached: u.cacheReadTokens || 0, written: u.cacheWriteTokens, out: u.outputTokens || 0,
                   credits: u.copilotUsage && u.copilotUsage.totalNanoAiu !== undefined ? u.copilotUsage.totalNanoAiu / 1e9 : undefined,
-                  ttl, expiresAt: time(u.cacheExpiresAt) || undefined, rates: sdkRates(u) });
+                  ttl, expiresAt: time(u.cacheExpiresAt) || undefined, rates: sdkRates(u), effort,
+                  side: u.initiator !== undefined && u.initiator !== "user" && u.initiator !== "agent" });
         break;
       }
       default:
@@ -126,7 +142,7 @@ function sdkTrace(eventsText, yaml = {}) {
   }
   // An SDK request is several turns (one per model call and its tools), with a few ms between them.
   return done(ev, { cwd: yaml.cwd || "", gitRoot: yaml.git_root || "", stepTurns: true,
-                    compactions: Number(yaml.summary_count) || 0 });
+                    compactions: Number(yaml.summary_count) || 0, billedTotal });
 }
 
 // ---------------------------------------------------------------- Claude harness (Claude Agent SDK)

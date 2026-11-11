@@ -308,6 +308,12 @@ function setMeasuredTtls(gaps) {
   return { ...measuredTtls };
 }
 
+/** The built-in lifetime of a model whose lifetime is known (Claude, Sol 6.1), else null: no guess. */
+function knownTtl(model) {
+  const hit = DEFAULT_TTLS.find(([prefix]) => (model || "").startsWith(prefix));
+  return hit ? hit[1] : null;
+}
+
 function defaultTtl(model) {
   const hit = DEFAULT_TTLS.find(([prefix]) => (model || "").startsWith(prefix));
   return hit ? hit[1] : UNKNOWN_TTL;
@@ -847,5 +853,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace, cachedTrace, parseGrowing, noteCompaction,
+  analyzeTrace, cachedTrace, parseGrowing, noteCompaction, knownTtl,
 };

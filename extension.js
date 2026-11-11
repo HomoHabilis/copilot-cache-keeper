@@ -679,7 +679,22 @@ async function gatherSpend(context, since, progress) {
           if (!trace) continue;
           const models = await fio.readText(fio.join(dir, "models.json"));
           const s = core.analyzeTrace("local", dir, trace, { priceFor });
-          chats.push({ kind: "local", id, title: s && s.title, workspace: label, events: trace.events,
+          // its subagents' logs (the other .jsonl files) and the MCP share of its tool definitions
+          const files = await fio.list(dir), subEvents = [];
+          for (const f of files.filter(x => x.endsWith(".jsonl") && x !== "main.jsonl"))
+            subEvents.push(...report.subagentCalls(await fio.readText(fio.join(dir, f))));
+          const toolsFile = files.filter(x => /^tools_\d+\.json$/.test(x)).sort()[0];
+          const mcpFrac = toolsFile ? report.mcpFraction(await fio.readText(fio.join(dir, toolsFile))) : null;
+          const prior = chats.find(x => x.kind === "local" && x.id === id);
+          if (prior) {
+            // the same chat's log in another workspace folder (VS Code moves it when the workspace
+            // changes): one chat, each call once
+            report.mergeChatEvents(prior, trace.events, subEvents);
+            if (prior.mcpFrac === undefined && mcpFrac !== null) prior.mcpFrac = mcpFrac;
+            continue;
+          }
+          chats.push({ kind: "local", id, title: s && s.title, workspace: label, events: trace.events, subEvents,
+                       mcpFrac: mcpFrac === null ? undefined : mcpFrac,
                        sheetFor: m => (models && core.priceSheetFrom(models, m)) || priceFor(m) });
           n++;
         }
@@ -696,11 +711,17 @@ async function gatherSpend(context, since, progress) {
         if (!st || st.mtime < since) continue;
         const yaml = core.parseYamlFlat(await fio.readText(fio.join(dir, "workspace.yaml")));
         if (yaml.client_name !== "vscode-agent-host") continue;
-        const trace = harnesses.sdkTrace(await fio.readText(fio.join(dir, "events.jsonl")), yaml);
-        if (!trace) continue;
+        const text = await fio.readText(fio.join(dir, "events.jsonl"));
+        const trace = harnesses.sdkTrace(text, yaml);
+        if (!trace) {
+          // no per-call record (older SDK versions): its billed total still counts
+          const st2 = report.sdkSessionTotal(text);
+          if (st2.total > 0) { chats.push({ kind: "sdk", id, title: yaml.name, workspace: "", events: [], billedTotal: st2.total, lastTs: st2.lastTs }); n++; }
+          continue;
+        }
         const s = core.analyzeTrace("sdk", dir, trace, { priceFor });
         chats.push({ kind: "sdk", id, title: s && s.title, workspace: String(yaml.cwd || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop(),
-                     events: trace.events, sheetFor: priceFor });
+                     events: trace.events, sheetFor: priceFor, billedTotal: trace.info && trace.info.billedTotal });
         n++;
       }
       where.push(`${at}Copilot SDK chats: ${n}, in ${root}`);
@@ -742,7 +763,6 @@ async function gatherSpend(context, since, progress) {
       const label = wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
       for (const f of files) {
         const id = f.slice(0, -".jsonl".length);
-        if (withLog.has(id)) continue;
         const st = await localIo.stat(path.join(cs, f));
         if (!st || st.mtime < since) continue;
         if (!copies.has(id)) copies.set(id, { texts: [], labels: [] });
@@ -750,14 +770,23 @@ async function gatherSpend(context, since, progress) {
         copies.get(id).labels.push(label);
       }
     }
+    let older = 0;
     for (const [id, c] of copies) {
       const { title, events } = report.chatFileMessages(c.texts);
+      const toolShares = events.filter(e => e.toolShare).map(e => ({ ts: e.ts, share: e.toolShare }));
+      // a chat that has a debug log: only its tool-definition share is taken from here
+      if (withLog.has(id)) {
+        const ch = chats.find(x => x.kind === "local" && x.id === id);
+        if (ch) ch.toolShares = toolShares;
+        continue;
+      }
       if (!events.length) continue;
+      older++;
       // named after a plain folder when one copy is (another may be a multi-folder workspace)
       const label = c.labels.find(l => !/\.code-workspace$/.test(l)) || c.labels[0];
-      chats.push({ kind: "local-msg", id, title, workspace: label, events, sheetFor: priceFor });
+      chats.push({ kind: "local-msg", id, title, workspace: label, events, toolShares, sheetFor: priceFor });
     }
-    where.push(`Older Local chats (no debug log left): ${copies.size}, from VS Code's chat files in ${ui.ws}`);
+    where.push(`Older Local chats (no debug log left): ${older}, from VS Code's chat files in ${ui.ws}`);
   }
   if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
   return { chats, where };
