@@ -140,7 +140,8 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  * submits land in the chat's log with a short reply, so each one starts a new cache window.
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
-                         kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false }) {
+                         kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
+                         writesHandoff = true, commandList = [] }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -162,14 +163,15 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const logName = { sdk: "events.jsonl", local: "main.jsonl", claude: "claude-sdk-1.jsonl", codex: "rollout-2026-11-03T13-19-13-thread-1.jsonl" }[kind];
   const cwd = sdkCwd || tmp;
   let clock = now;
-  const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [];
+  const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [], listed = [];
   let status;
   const fakeFs = {
     stat: async u => { const st = fs.statSync(u.fsPath); return { mtime: st.mtimeMs, size: st.size }; },
     readFile: async u => fs.readFileSync(u.fsPath),
     writeFile: async (u, b) => fs.writeFileSync(u.fsPath, b),
     createDirectory: async u => fs.mkdirSync(u.fsPath, { recursive: true }),
-    readDirectory: async u => fs.readdirSync(u.fsPath).map(n => [n, 1]),
+    readDirectory: async u => { listed.push(u.fsPath); return fs.readdirSync(u.fsPath).map(n => [n, 1]); },
+    delete: async u => fs.rmSync(u.fsPath),
   };
   const settings = { warnSeconds: 60, thresholdTokens: 100000, autoSummary: true, minCredits: 5, ttlSeconds: {},
                      keepAliveLeadSeconds: 5, keepAliveJitterPercent: 0, afterSend: "closeTab",
@@ -193,7 +195,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                  // more folders = a multi-root workspace: tmp, tmp/repo2, ...
                  workspaceFolders: Array.from({ length: folders }, (_, i) => {
                    const f = i ? path.join(tmp, `repo${i + 1}`) : tmp;
-                   return { uri: { scheme: "file", fsPath: f, path: f } };
+                   return { uri: { scheme: "file", fsPath: f, path: f, with(o) { return { ...this, ...o, fsPath: o.path || this.fsPath }; } } };
                  }) },
     window: {
       createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
@@ -210,6 +212,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
     },
     commands: {
       registerCommand: (id, f) => { commands[id] = f; return { dispose() {} }; },
+      getCommands: async () => commandList,
       executeCommand: async (id, a) => {
         ran.push({ id, a });
         if (id === "workbench.action.chat.openSessionInEditorGroup") {
@@ -220,6 +223,12 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
         }
         if (id === "workbench.action.chat.submit") {
           sent.push({ at: clock, text: a.inputValue });
+          // the agent does what a summary request asks: it writes the file named in it
+          const asked = /`([^`]+\.md)`/.exec(a.inputValue || "");
+          if (writesHandoff && asked && core.isOwnMessage(a.inputValue)) {
+            fs.mkdirSync(path.dirname(asked[1]), { recursive: true });
+            fs.writeFileSync(asked[1], "# handoff\n");
+          }
           submits.push(a);
           // preserveInput: only the given text is sent, the input box (text, attachments) is left alone;
           // otherwise (or a VS Code that ignores the option) the box is filled, sent and emptied
@@ -242,9 +251,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
     ThemeColor: class { constructor(id) { this.id = id; } },
     Range: class { constructor(...a) { this.a = a; } },
     WorkspaceEdit: class { constructor() { this.edits = []; } replace(uri, range, text) { this.edits.push([uri, text]); } },
-    Uri: { file: f => ({ scheme: "file", fsPath: f, path: f }),
+    Uri: { file: f => ({ scheme: "file", fsPath: f, path: f, with(o) { return { ...this, ...o, fsPath: o.path || this.fsPath }; } }),
            from: o => ({ ...o, toString: () => `${o.scheme}://${o.authority}${o.path}` }),
-           joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return { scheme: "file", fsPath: f, path: f }; } },
+           joinPath: (b, ...p) => { const f = path.join(b.fsPath, ...p); return vscode.Uri.file(f); } },
   };
   const load = Module._load;
   Module._load = function (req, ...rest) { return req === "vscode" ? vscode : load.call(this, req, ...rest); };
@@ -278,7 +287,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
-    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits, closed,
+    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
@@ -824,7 +833,7 @@ const never = () => new Promise(() => {});
       try {
         await h.run(400);
         assert.strictEqual(h.sent.length, 0);
-        assert.ok(h.status.text.includes("cache expired"), h.status.text);
+        assert.ok(h.status.text.includes("expired · +"), h.status.text);
         const bg = (h.status.backgroundColor || {}).id;
         assert.strictEqual(bg === "statusBarItem.warningBackground", orange, `threshold ${threshold}: ${bg}`);
         assert.strictEqual(h.status.text.includes("$(warning)"), orange, h.status.text);
@@ -866,14 +875,14 @@ const never = () => new Promise(() => {});
     try {
       await h.run(900);
       assert.ok(h.sent.some(x => x.text.includes("handoff summary")), "summary written");
-      assert.ok(h.status.text.includes("cache expired"), h.status.text);
+      assert.ok(h.status.text.includes("expired · +"), h.status.text);
       assert.ok(/Handoff summary ready: a new chat from it ≈ [\d.]+ cr/.test(h.status.tooltip.value), h.status.tooltip);
     } finally { h.close(); }
   });
 
   await check("status-bar list offers New chat from handoff once a summary file exists", async () => {
     let offered;
-    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 },
+    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 }, writesHandoff: false,
       menu: items => { offered = items.map(i => i.label); return items.find(i => i.label === "New chat from handoff"); } });
     try {
       await h.run(900);
@@ -891,7 +900,7 @@ const never = () => new Promise(() => {});
 
   await check("multi-root workspace: summary asked at a full path, found in another folder too", async () => {
     let offered;
-    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 }, folders: 2,
+    const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 }, folders: 2, writesHandoff: false,
       menu: items => { offered = items.map(i => i.label); return undefined; } });
     try {
       await h.run(900);
@@ -1522,7 +1531,7 @@ const never = () => new Promise(() => {});
         assert.ok(/\.copilot-handoff\/.*\.md/.test(h.sent[0].text), kind);
         const open = h.ran.find(r => r.id === "workbench.action.chat.openSessionInEditorGroup");
         assert.strictEqual(open.a.resource.scheme, URI[kind], kind);
-        assert.ok(h.infos.some(m => /writing handoff summary/.test(m)), kind);
+        assert.ok(h.infos.some(m => /writing the handoff summary/.test(m)), kind);
       } finally { h.close(); }
     }
   });
@@ -1533,7 +1542,7 @@ const never = () => new Promise(() => {});
       const h = await harness({ kind, answer: never, settings, ctx: 150000 });
       try {
         await h.run(3);
-        assert.ok(/cache \d:\d\d/.test(h.status.text), `${kind}: ${h.status.text}`);
+        assert.ok(/^\$\(flame\) \d:\d\d$/.test(h.status.text), `${kind}: ${h.status.text}`);
         const tip = String(h.status.tooltip.value);
         assert.ok(tip.includes(`cache lifetime 300 s (${from[kind]})`), `${kind}: ${tip.split("\n")[1]}`);
         assert.ok(/Expiry adds \| ~\d+ cr/.test(tip) && /Keep-alive \| ~/.test(tip) && /Handoff summary \| ~/.test(tip), kind);
@@ -1668,7 +1677,7 @@ const never = () => new Promise(() => {});
     try {
       await h.run(700);
       assert.deepStrictEqual(kinds(h.sent), ["keep-alive", "summary"]);
-      assert.ok(/handoff summary .* is written first/.test(h.warnings[1].msg), h.warnings[1].msg);
+      assert.ok(/No click: a handoff summary .* ends keeping warm/.test(h.warnings[1].msg), h.warnings[1].msg);
     } finally { h.close(); }
   });
 
@@ -1762,6 +1771,220 @@ const never = () => new Promise(() => {});
     assert.strictEqual(a, b);
     core.cachedTrace("k", "text-2", tr);
     assert.strictEqual(n, 2);
+  });
+
+  // ---------------------------------------------------------------- review bugs not covered above, and the UI/mechanics follow-up
+
+  await check("no price sheet anywhere: other workspaces are searched about once a minute, not on every read", async () => {
+    const h = await harness({ kind: "claude", noPrices: true, ctx: 150000, answer: never });
+    try {
+      await h.run(120);
+      const ws = path.join(h.dir, "workspaceStorage");
+      const n = h.listed.filter(d => d === ws).length;
+      assert.ok(n >= 1 && n <= 3, `workspaceStorage listed ${n} times in 2 min`);
+    } finally { h.close(); }
+  });
+
+  await check("timer ticks don't overlap: a tick still running makes the next one skip", async () => {
+    const h = await harness({ answer: never });
+    try {
+      let runs = 0, release;
+      const tick = h.ext._noOverlap("t", () => { runs++; return new Promise(r => { release = r; }); });
+      tick(); await new Promise(r => setImmediate(r));
+      tick(); await new Promise(r => setImmediate(r));
+      assert.strictEqual(runs, 1, "second tick skipped while the first runs");
+      release(); await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+      tick(); await new Promise(r => setImmediate(r));
+      assert.strictEqual(runs, 2, "runs again once the first is done");
+    } finally { h.close(); }
+  });
+
+  await check("tab cleanup: two tabs with the chat's title, none closed", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), settings: { afterSend: "restoreLastTyped" } });
+    try {
+      h.vscode.window.tabGroups.all.push({ tabs: [{ label: "chat", input: {} }] });   // another chat with the same title
+      await h.run(320);
+      await new Promise(r => setTimeout(r, 1500));      // moving the chat back waits on real timers
+      assert.ok(core.isKeepAlive((h.sent[0] || {}).text || ""), "keep-alive sent");
+      assert.ok(h.ran.some(r => r.id === "workbench.action.chat.openInSidebar"), "moved back into the Chat view");
+      assert.strictEqual(h.closed.length, 0, "the same-named tabs are left alone");
+    } finally { h.close(); }
+  });
+
+  await check("handoff folder kept out of git in a worktree (.git is a file pointing to the main repository)", async () => {
+    const h = await harness({ ctx: 40000, answer: never, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      const main = path.join(h.dir, "main", ".git");
+      fs.mkdirSync(path.join(main, "worktrees", "wt"), { recursive: true });
+      fs.writeFileSync(path.join(main, "worktrees", "wt", "commondir"), "../..\n");
+      fs.writeFileSync(path.join(h.dir, ".git"), `gitdir: ${path.join(main, "worktrees", "wt")}\n`);
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(2);
+      assert.ok(fs.readFileSync(path.join(main, "info", "exclude"), "utf8").includes(".copilot-handoff/"));
+    } finally { h.close(); }
+  });
+
+  await check("local window: no unmeasured-clock margin on the lead", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
+    try {
+      await h.run(250);
+      assert.ok(h.infos.some(m => /will send a keep-alive 5s before/.test(m)), h.infos.join(" | "));
+    } finally { h.close(); }
+  });
+
+  await check("warning: short, what no click does, costs on the buttons; a cost button works", async () => {
+    let buttons;
+    const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return b[0]; } return never(); } });
+    try {
+      await h.run(320);
+      const msg = h.warnings[0].msg;
+      assert.ok(msg.length < 200 && /^Cache for ".+" expires in \d+s\. Expiry adds ~[\d.]+ cr to your next message\. No click: /.test(msg), msg);
+      assert.ok(/^Keep warm \(~[\d.]+ cr\)$/.test(buttons[0]) && buttons[1] === "Auto keep warm" && /^Summarize \(~[\d.]+ cr\)$/.test(buttons[2]), buttons.join(" | "));
+      assert.ok(core.isKeepAlive(h.sent[0].text), "Keep warm (~x cr) chose Keep warm");
+    } finally { h.close(); }
+  });
+
+  await check("chat menu: the current choice is marked, each choice shows its cost for this chat", async () => {
+    let k = 0, offered;
+    const h = await harness({ answer: never, menu: items => { if (k++ === 0) return items.find(i => i.label === "Keep warm"); offered = items; } });
+    try {
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      await h.commands["cacheKeeper.options"]();
+      const by = l => offered.find(i => i.label === l);
+      assert.ok(/current/.test(by("Keep warm").description || ""), "Keep warm marked");
+      assert.ok(!by("Back to default").description, "only the current one");
+      assert.ok(/\(~[\d.]+ cr\)/.test(by("Keep warm").detail) && /up to ~[\d.]+ cr/.test(by("Auto keep warm").detail) &&
+        /\(~[\d.]+ cr\)/.test(by("Summarize").detail), offered.map(i => i.detail).join(" | "));
+      assert.ok(/no click: /.test(by("Back to default").detail), by("Back to default").detail);
+    } finally { h.close(); }
+  });
+
+  await check("Keep warm now: names the chat; with several chats it asks which one", async () => {
+    let offered;
+    const h = await harness({ answer: never, menu: items => { offered = items; return undefined; } });
+    try {
+      await h.run(10);
+      await h.commands["cacheKeeper.keepWarmNow"]();
+      assert.ok(h.infos.some(m => /keep-alive sent to "Refactor the parser"/.test(m)), h.infos.join(" | "));
+      // a second chat in the workspace
+      const two = path.join(h.logs, "sess-2");
+      fs.cpSync(path.join(h.logs, "sess-1"), two, { recursive: true });
+      await h.run(6);
+      const n = h.sent.length;
+      await h.commands["cacheKeeper.keepWarmNow"]();
+      assert.ok(offered && offered.length === 2, "asked which chat");
+      assert.strictEqual(h.sent.length, n, "cancelled: nothing sent");
+    } finally { h.close(); }
+  });
+
+  await check("status bar: short texts, red while auto keep warm runs, armed after Keep warm", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never() });
+    try {
+      await h.run(250);
+      assert.ok(/^\$\(zap\) \d:\d\d · [\d.]+\/[\d.]+ cr$/.test(h.status.text), h.status.text);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.errorBackground");
+    } finally { h.close(); }
+    const k = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never() });
+    try {
+      await k.run(250);
+      assert.ok(/^\$\(flame\) \d:\d\d · armed$/.test(k.status.text), k.status.text);
+    } finally { k.close(); }
+  });
+
+  await check("last chance: an unanswered warning makes the status bar ask; answering from the list counts", async () => {
+    const h = await harness({ answer: never, menu: items => items.find(i => i.label === "Keep warm") });
+    try {
+      await h.run(272);                                   // warned at 60 s, now under 30 s left, no answer
+      assert.ok(/^\$\(bell\) .* \d:\d\d · click to choose$/.test(h.status.text), h.status.text);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.warningBackground");
+      await h.commands["cacheKeeper.options"]();
+      await h.run(30);
+      assert.ok(h.sent.length && core.isKeepAlive(h.sent[0].text), "kept warm from the list");
+      assert.ok(!/click to choose/.test(h.status.text), h.status.text);
+    } finally { h.close(); }
+  });
+
+  await check("New chat from handoff: in the same harness when VS Code has a command for it, else Local and says so", async () => {
+    for (const commandList of [["workbench.action.chat.openNewSessionSidebar.agent-host-claude"], []]) {
+      const h = await harness({ kind: "claude", ctx: 150000, commandList, answer: () => "Summarize",
+        menu: items => items.find(i => i.label === "New chat from handoff") });
+      try {
+        await h.run(900);
+        await h.commands["cacheKeeper.options"]();
+        const ids = h.ran.map(r => r.id);
+        if (commandList.length) assert.ok(ids.includes(commandList[0]) && !ids.includes("workbench.action.chat.newChat"), ids.join(", "));
+        else {
+          assert.ok(ids.includes("workbench.action.chat.newChat"), ids.join(", "));
+          assert.ok(h.infos.some(m => /no command to start a new Claude chat/.test(m)), h.infos.join(" | "));
+        }
+        assert.ok(ids.includes("workbench.action.chat.open"), "handoff attached");
+      } finally { h.close(); }
+    }
+  });
+
+  await check("cache hit logged after each message; diagnostics count Cache Keeper's warm and cold ones", async () => {
+    const log = path.join(os.tmpdir(), `ck-hit-${process.pid}.log`);
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Keep warm" : never(), settings: { debugLogFile: log } });
+    try {
+      await h.run(320);
+      await h.commands["cacheKeeper.diagnose"]();
+      const text = fs.readFileSync(log, "utf8");
+      assert.ok(/cache hit for Cache Keeper's message in sess-1: \d+% cached .* s after the previous call started \(\d+ s after it ended\)/.test(text), text.slice(-1500));
+      assert.ok(/own messages since this window started: 1 landed warm, 0 cold/.test(text));
+    } finally { h.close(); fs.rmSync(log, { force: true }); }
+  });
+
+  await check("agent working past the cache lifetime: 'possibly expired', not a confident 'expired'", async () => {
+    const h = await harness({ answer: never });
+    try {
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Run the long tests" } }, { type: "turn_start", ts: h.clock + 5 }]);
+      await h.run(320);
+      assert.ok(/^\$\(sync~spin\) working · possibly expired/.test(h.status.text), h.status.text);
+      assert.ok(String(h.status.tooltip.value).includes("possibly expired"));
+    } finally { h.close(); }
+  });
+
+  await check("summary request answered without the file: you are told", async () => {
+    const h = await harness({ ctx: 40000, answer: never, writesHandoff: false, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();
+      await h.run(5);
+      assert.ok(h.warnings.some(w => /did not write .*\.md/.test(w.msg)), h.warnings.map(w => w.msg).join(" | "));
+    } finally { h.close(); }
+  });
+
+  await check("handoff cleanup: newest 5 always kept, older ones past 7 days deleted, other files untouched", async () => {
+    const h = await harness({ ctx: 40000, answer: never, menu: items => items.find(i => i.label === "Summarize") });
+    try {
+      const dir = path.join(h.dir, ".copilot-handoff");
+      fs.mkdirSync(dir, { recursive: true });
+      const put = (name, days) => { const f = path.join(dir, name); fs.writeFileSync(f, "x"); const t = (h.clock - days * 86400000) / 1000; fs.utimesSync(f, t, t); };
+      [1, 2, 3].forEach(d => put(`2026110${d}-1000-recent${d}.md`, d));
+      [10, 11, 12, 13, 14].forEach(d => put(`202610${d}-1000-old${d}.md`, d));
+      put("notes.md", 30);
+      await h.run(10);
+      await h.commands["cacheKeeper.options"]();         // writes a new summary, then cleans up
+      await h.run(5);
+      const left = fs.readdirSync(dir).sort();
+      assert.ok(left.includes("notes.md") && left.includes("20261010-1000-old10.md"), left.join(", "));
+      assert.ok(!left.some(n => /old1[1-4]/.test(n)), left.join(", "));
+      assert.strictEqual(left.filter(n => /^\d{8}-\d{4}-/.test(n)).length, 5, left.join(", "));
+    } finally { h.close(); }
+  });
+
+  await check("incremental parse: a grown log reuses its parsed lines and equals a full parse", () => {
+    const a = JSON.stringify({ n: 1 }) + "\n" + JSON.stringify({ n: 2 }) + "\n" + '{"n":';
+    const p1 = core.parseGrowing(null, a);
+    assert.deepStrictEqual(p1.all.map(x => x.n), [1, 2], "unfinished last line left out");
+    const b = a + "3}\n" + JSON.stringify({ n: 4 }) + "\n";
+    const p2 = core.parseGrowing({ text: a, done: p1.done, lines: p1.lines }, b);
+    assert.deepStrictEqual(p2.all.map(x => x.n), [1, 2, 3, 4]);
+    assert.strictEqual(p2.lines[0], p1.lines[0], "earlier lines not parsed again");
+    const c = JSON.stringify({ n: 9 }) + "\n";        // rewritten, not grown: parsed in full
+    assert.deepStrictEqual(core.parseGrowing({ text: b, done: p2.done, lines: p2.lines }, c).all.map(x => x.n), [9]);
   });
 
   console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

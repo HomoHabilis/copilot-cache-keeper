@@ -17,7 +17,7 @@
 //   { t: "reply", ts, text }      the agent's answer (for the language of our messages)
 //   { t: "edit", ts, files }      files the agent edited (for the summary length)
 //   { t: "compaction", ts }       the history was summarized
-// Each translator returns { events, info } (info: cwd, gitRoot, stepTurns, compactions) or
+// Each translator takes the log's text, or its lines already parsed (an array), and returns { events, info } (info: cwd, gitRoot, stepTurns, compactions) or
 // null when the log has no model call yet.
 "use strict";
 
@@ -29,6 +29,8 @@ function parseJsonl(text) {
   }
   return out;
 }
+/** A log's lines as objects: from its text, or already parsed (core.cachedTrace parses only what was appended). */
+function entries(log) { return Array.isArray(log) ? log : parseJsonl(log); }
 const time = s => Date.parse(s || "") || 0;
 const byTime = list => list.sort((a, b) => a.ts - b.ts);
 const done = (events, info = {}) => events.some(e => e.t === "call") ? { events: byTime(events), info } : null;
@@ -49,7 +51,7 @@ const LOCAL_EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edi
 
 function localTrace(mainText) {
   const ev = [];
-  for (const e of parseJsonl(mainText)) {
+  for (const e of entries(mainText)) {
     const a = e.attrs || {}, ts = e.ts || 0;
     if (e.type === "user_message") {
       // Copilot leaves a turn open, with no turn_end, when the request is stopped or when you send a
@@ -91,7 +93,7 @@ function sdkRates(u) {
 
 function sdkTrace(eventsText, yaml = {}) {
   const ev = [];
-  for (const e of parseJsonl(eventsText)) {
+  for (const e of entries(eventsText)) {
     const d = e.data || {}, ts = time(e.timestamp);
     switch (e.type) {
       // a message sent while the agent works gets a <reminder> appended
@@ -138,7 +140,7 @@ const CLAUDE_TURN_DONE = /^(end_turn|stop_sequence|max_tokens|refusal)$/;
 function claudeTrace(text) {
   const ev = [], starts = new Map(), calls = new Map();
   let cwd = "";
-  for (const e of parseJsonl(text)) {
+  for (const e of entries(text)) {
     const ts = time(e.timestamp), m = e.message && typeof e.message === "object" ? e.message : {};
     if (e.isSidechain) { if (ts) ev.push({ t: "activity", ts }); continue; }   // a subagent: alive, other cache
     if (e.cwd) cwd = e.cwd;
@@ -186,7 +188,7 @@ function codexText(content) {
 function codexTrace(text) {
   const ev = [];
   let model = "?", cwd = "", lastInput = 0;
-  for (const e of parseJsonl(text)) {
+  for (const e of entries(text)) {
     const p = e.payload || {}, ts = time(e.timestamp);
     if (e.type === "session_meta") { cwd = p.cwd || cwd; continue; }
     if (e.type === "turn_context") { model = p.model || model; cwd = p.cwd || cwd; continue; }

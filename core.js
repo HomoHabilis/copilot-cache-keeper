@@ -488,6 +488,18 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     pairs.push({ input: calls[i].input || 0, cached: calls[i].cached || 0, prevOut: calls[i - 1].out || 0 });
   }
   const heartbeatNew = keepAliveFixedPart(pairs) + (last.out || 0);
+  // The model call that answered the last message in the chat (yours or Cache Keeper's), with how
+  // much of it was cached and how long after the previous call: whether the cache was still warm.
+  let lastMsgCall = null;
+  const lastMsg = users[users.length - 1];
+  if (lastMsg) {
+    const i = calls.findIndex(c => c.ts >= lastMsg.ts - slack);
+    if (i > 0) {
+      const c = calls[i], p = calls[i - 1];
+      lastMsgCall = { at: lastMsg.ts, own: isOurs(lastMsg), input: c.input || 0, cached: c.cached || 0,
+                      sinceStart: Math.round((c.ts - p.ts) / 1000), sinceEnd: Math.round((c.ts - (p.end || p.ts)) / 1000) };
+    }
+  }
   // Prices: what the log says this chat was billed per token (exact), else Copilot's price sheet,
   // with the write price corrected from what calls with a known cost were billed. Observed on Local
   // chats: a cold call is billed near the input price, below the sheet's cache_write_price, so the
@@ -534,6 +546,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     remaining: ttl - (now - cacheFrom) / 1000,
     lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,
+    lastMsgCall,
     title: title.length > 50 ? title.slice(0, 47) + "..." : title,   // which chat a warning is about
     // Last message you typed yourself (not one of ours): tells whether a handoff is still current.
     lastRealUserTs: Math.max(0, ...real.map(u => u.ts || 0)),
@@ -544,16 +557,41 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
 // Logs are read every few seconds and most have not changed: the same text gives the same trace, so
 // the last trace of each log is kept instead of parsing every line again. One entry per log (the
 // text is already held by the file reader's cache); a cached trace is shared, so it is never changed.
-const traceCache = new Map();  // log path -> { text, extra, trace }
+// A log that grew (they are append-only) is parsed only from where the last parse stopped: the
+// whole lines already read keep their parsed objects. A log that changed otherwise (rewritten,
+// truncated) is parsed again in full.
+const traceCache = new Map();  // log path -> { text, extra, trace, done, lines }
 const TRACE_CACHE_MAX = 500;
+const GROWING_KEPT = 10;       // logs whose parsed lines are kept for an incremental parse
+/** The log's complete lines as objects, reusing what an earlier parse of the same log read. */
+function parseGrowing(prev, text) {
+  text = String(text || "");
+  const end = text.lastIndexOf("\n") + 1;              // a last line without "\n" may still be written
+  let lines, from = 0;
+  if (prev && prev.lines && prev.done <= end && text.startsWith(prev.text.slice(0, prev.done))) { lines = prev.lines.slice(); from = prev.done; }
+  else lines = [];
+  for (const line of text.slice(from, end).split("\n")) {
+    if (!line.trim()) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* not JSON */ }
+  }
+  const rest = text.slice(end).trim();                  // the unfinished last line, if it already parses
+  let tail = null;
+  if (rest) { try { tail = JSON.parse(rest); } catch { /* still being written */ } }
+  return { lines, done: end, all: tail ? [...lines, tail] : lines };
+}
 /** translate(text, extra), or the trace of the same text of the same log from last time. */
 function cachedTrace(key, text, translate, extra) {
   const ex = extra === undefined ? "" : JSON.stringify(extra);
   const hit = traceCache.get(key);
   if (hit && hit.text === text && hit.extra === ex) return hit.trace;
-  const trace = translate(text, extra);
+  const parsed = parseGrowing(hit, text);
+  const trace = translate(parsed.all, extra);
   traceCache.delete(key);
-  traceCache.set(key, { text, extra: ex, trace });
+  traceCache.set(key, { text, extra: ex, trace, done: parsed.done, lines: parsed.lines });
+  // parsed lines only for the logs that changed most recently (the ones still growing): the others
+  // keep just their trace, and are parsed in full if they ever change again
+  let n = 0;
+  for (const v of [...traceCache.values()].reverse()) if (v.lines && ++n > GROWING_KEPT) { v.lines = null; v.done = 0; }
   if (traceCache.size > TRACE_CACHE_MAX) traceCache.delete(traceCache.keys().next().value);
   return trace;
 }
@@ -736,5 +774,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace, cachedTrace,
+  analyzeTrace, cachedTrace, parseGrowing,
 };

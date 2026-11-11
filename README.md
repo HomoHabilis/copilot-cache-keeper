@@ -13,26 +13,36 @@ See [Supported chat harnesses](#supported-chat-harnesses).
 
 ## What it does
 
-- **Status bar:** the countdown for the chat where you last typed, for example `cache 3:12 +1`
-  (`+1` = one more chat managed in this window). Click it to see the chats in the window (all
+- **Status bar:** the countdown for the chat where you last typed, kept short, for example
+  `🔥 3:12 +1` (`+1` = one more chat managed in this window); the tooltip has the details. With
+  Keep warm once chosen it reads `🔥 3:12 · armed`; with Auto keep warm `⚡ 3:12 · 1.2/10 cr`
+  (spent / cap) and the bar is red, since that spends credits on its own (`· ⚡×2` = auto keep warm
+  on in two other chats). Click it to see the chats in the window (all
   warm ones plus the most recently expired, `cacheKeeper.expiredChats`, default 5), each marked
   Local or Copilot SDK, with its live countdown, model,
   context, cost if it expires and spend so far. Pick one to choose what happens to it.
   - **While the agent works** (including subagents and long terminal commands), it shows
-    `agent working · cache 2:41` and never sends anything into that chat: a message would be
-    queued and could run after the cache expired.
+    `working · 2:41` and never sends anything into that chat: a message would be
+    queued and could run after the cache expired. Once the agent has worked past the cache
+    lifetime it says `working · possibly expired`: the countdown runs from the last model call's
+    start, and a long answer can still leave the cache warm.
   - **Expired and large:** when that chat's cache has expired and its context is at least
     `cacheKeeper.thresholdTokens` (default 100k tokens), the status bar turns orange:
-    `⚠ cache expired: next msg +72 cr`. Coming back to an old chat, this tells you before you type
+    `⚠ expired · +72 cr`. Coming back to an old chat, this tells you before you type
     that your next message re-sends all of it. The threshold is in tokens because a cold send
     costs about context × the model's input price, so one value fits Haiku and Opus alike; the
     label still shows credits. If a handoff summary was written, the tooltip says what a new chat
     from it would cost instead.
   - **While Cache Keeper sends** a keep-alive or summary, it shows
-    `Cache Keeper sending… wait before typing`: for those seconds the target chat is focused, so
+    `sending… don't type`: for those seconds the target chat is focused, so
     something you type would land there.
-- **60 s before expiry**, one notification per chat. It says what happens if you don't click,
-  and has four buttons:
+  - **Last chance:** a warning still unanswered in the last 30 s before expiry (it may have slid
+    into the notification center unseen) turns the bar into `🔔 Refactor the parser 0:22 · click
+    to choose`, for whichever chat it is. That chat is first in the list; a choice there counts
+    as answering the warning.
+- **60 s before expiry**, one short notification per chat: `Cache for "Refactor the parser"
+  expires in 59s. Expiry adds ~20 cr to your next message. No click: …`. The buttons carry their
+  cost (`Keep warm (~1.1 cr)`, `Auto keep warm`, `Summarize (~2.5 cr)`, `Ignore`):
   - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
     takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
     tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
@@ -80,7 +90,12 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     default. On a warm chat it is written right away; while the agent works, once it's done. It asks the agent, in the chat's language and starting with `[summary]` (or
     `[riepilogo]`, `[résumé]`, `[resumen]`, `[Zusammenfassung]`), to write
     `.copilot-handoff/<time>-<session>.md` now
-    (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude`.
+    (goal, state, decisions, files, next steps). The folder is added to `.git/info/exclude` of
+    every workspace folder's repository (worktrees and submodules included). Once the agent is
+    done, Cache Keeper checks the file is there; written elsewhere in the workspace, it is used
+    from there; not written at all, you are told. Old summaries are cleaned up: in each
+    `.copilot-handoff/`, the newest 5 always stay (`cacheKeeper.handoffKeep`) and older ones past
+    7 days go to the trash (`cacheKeeper.handoffMaxAgeDays`, 0 = never).
     Its length fits the chat: 120 words + 2 per 1k tokens of context + 30 per message of yours +
     150 per compaction + 10 per edited file, between 150 and 1500. A one-question chat gets
     about 200 words; a long session with compactions gets up to 1500. Since the summary is
@@ -98,15 +113,25 @@ See [Supported chat harnesses](#supported-chat-harnesses).
   Auto keep warm), and **New chat from handoff** on a chat with a handoff summary. On an expired
   chat it offers **Keep warm now** (asks first, with the cost) instead of Keep warm and Auto keep
   warm. Auto keep warm is only offered when the model's price is known, since its cap is in credits.
+  Each choice shows what it does and costs for that chat right now, and the current one is marked.
+- **New chat from handoff** opens the new chat in the same harness as the old one (Claude, Codex,
+  Copilot SDK) when VS Code has a "new session" command for it; otherwise in a Local chat, and it
+  tells you so.
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
   from the handoff file. That notice can slide into the notification center while you are away;
   the same action stays in the status-bar list.
-- **Keep warm now** (command) on a chat whose cache already expired asks first, with the cost,
-  since that message re-sends the whole context.
+- **Keep warm now** and **Write handoff summary now** (commands) ask which chat when there are
+  several, and name the chat in what they report. On a chat whose cache already expired they ask
+  first, with the cost, since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
   it found, for every harness (last 7 days), and why each one is or isn't in the list. For an Agent
   Host chat it also shows the URI it would be opened by, and for Claude and Codex where the log is
-  and where the prices come from. Start there when a chat gets no warning.
+  and where the prices come from. Start there when a chat gets no warning. It also counts how
+  many of Cache Keeper's own messages landed on a warm cache.
+- **Cache hits:** for every message (yours or Cache Keeper's), the Output panel logs how much of
+  the call that answered it was cached, and how long after the previous call (from its start and
+  from its end): `cache hit for Cache Keeper's message in 1a2b3c4d: 98% cached (148k of 151k),
+  287 s after the previous call started (12 s after it ended)`.
 - **Every new cache window** (each time you or the agent sends something) brings the warning back,
   as long as you answered the last one. After Ignore, a summary, or a warning you closed or left
   unanswered, it comes back only once you send a real message yourself.
@@ -366,6 +391,8 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
 | `cacheKeeper.expiredChats` | 5 | How many expired chats the status-bar list keeps (most recent first) |
 | `cacheKeeper.lookbackHours` | 48 | Read chats whose log changed within this many hours; older ones are never listed |
+| `cacheKeeper.handoffMaxAgeDays` | 7 | Delete handoff summaries older than this (to the trash where possible), except the newest `handoffKeep`; 0 = never |
+| `cacheKeeper.handoffKeep` | 5 | How many of the newest handoff summaries per folder always stay |
 
 Fixed values, not shown in the Settings UI: 5 s keep-alive lead, 5% keep-alive jitter, 60-day
 maximum age for learned cache lifetimes. They can still be overridden in `settings.json`

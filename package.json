@@ -130,6 +130,18 @@
           "minimum": 1,
           "maximum": 168,
           "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."
+        },
+        "cacheKeeper.handoffMaxAgeDays": {
+          "type": "number",
+          "default": 7,
+          "minimum": 0,
+          "description": "Delete handoff summaries in .copilot-handoff/ older than this many days, except the newest cacheKeeper.handoffKeep ones, which always stay. 0 = never delete. Deleted files go to the trash where possible."
+        },
+        "cacheKeeper.handoffKeep": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "How many of the newest handoff summaries in each .copilot-handoff/ folder are always kept, however old (see cacheKeeper.handoffMaxAgeDays)."
         }
       }
     }
