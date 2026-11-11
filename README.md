@@ -42,11 +42,13 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     as answering the warning.
 - **60 s before expiry**, one short notification per chat: `Cache for "Refactor the parser"
   expires in 59s. Expiry adds ~20 cr to your next message. No click: …`. The buttons carry their
-  cost (`Keep warm (~1.1 cr)`, `Auto keep warm`, `Summarize (~2.5 cr)`, `Ignore`):
+  cost (`Keep warm (~1.1 cr)`, `Auto keep warm`, `Summarize (~2.5 cr)`, `Compact (~1.4 cr)` on Local
+  chats, `Ignore`):
   - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
     takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
     tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
-    first. Below that, or when the model's price is unknown, it just expires. An
+    first (or the chat is compacted, with `cacheKeeper.autoAction` set to `compact`; see
+    **Compact** below). Below that, or when the model's price is unknown, it just expires. An
     unanswered warning means no more warnings for that chat until you write in it again.
   - **Closing the warning (X):** same as Ignore below: nothing automatic, nothing spent.
   - **Keep warm:** sends one tiny keep-alive **5 s before expiry**, for every model. Its wording
@@ -84,7 +86,9 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     warm once, at the auto cap) write a summary only if the summary plus the first message of a new
     chat built from it cost at most 75% of continuing this chat cold. On a small context, a new
     chat's own setup (system prompt, tools) costs about as much as continuing, so the cache just
-    expires instead. **Summarize** (clicked) always writes one.
+    expires instead. **Summarize** (clicked) always writes one. With `cacheKeeper.autoAction` set
+    to `compact`, the same three cases compact the chat instead, by the same rule (the compaction
+    plus your next message on the compacted chat).
   - **Summarize:** on a chat whose cache has already expired, asks first, with the cost (the
     request re-sends the whole context), like *Keep warm now*; declined, the chat is back to the
     default. On a warm chat it is written right away; while the agent works, once it's done. It asks the agent, in the chat's language and starting with `[summary]` (or
@@ -103,6 +107,21 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     the summary costs at most a third of what an expiry would add (it matters only for a small
     context with a long history, for example after several compactions). The cost estimate uses
     the same length.
+  - **Compact** (Local chats): sends VS Code's own `/compact` command into the chat, with what to
+    keep in the chat's language ("I'm pausing. Keep: the goal, what is done, current state,
+    decisions and why, files changed, open problems, failed approaches to avoid, exact next
+    steps."). VS Code summarizes the older turns in place and keeps the recent ones as they are,
+    with a link to the full transcript, so when you are back you just go on in the same chat, and
+    your next message re-sends only the compacted chat (the menu shows about how many tokens,
+    estimated as a new chat's first prompt + the summary + 15k of recent turns). Unlike a summary
+    file it changes the chat and can't be undone, and there is no file to read or edit. Warm, it
+    goes out right away (once the agent is done); on an expired chat it asks first, with the cost,
+    like Summarize. Once a chat is compacted, nothing more happens until you write in it again. It
+    is sent like a keep-alive (your unsent text and attachments stay), and confirmed by the
+    compaction in the chat's log. Other harnesses (Copilot SDK, Claude, Codex) have their own
+    `/compact`, but it isn't offered there until a live test shows it works through VS Code
+    (`test/live/run.sh --compact`; the hidden `cacheKeeper.compactHarnesses` setting lists where it
+    is used, `["local"]` by default).
   - **Ignore:** leave this chat alone. No summary, no warnings and no expiry notice until you
     write in it again.
 - **Status-bar list order:** the chat where you last typed first (marked "where you last
@@ -120,7 +139,7 @@ See [Supported chat harnesses](#supported-chat-harnesses).
 - **At expiry:** tells you what the next message will cost, with a button to start a new chat
   from the handoff file. That notice can slide into the notification center while you are away;
   the same action stays in the status-bar list.
-- **Keep warm now** and **Write handoff summary now** (commands) ask which chat when there are
+- **Keep warm now**, **Write handoff summary now** and **Compact chat now** (commands) ask which chat when there are
   several, and name the chat in what they report. On a chat whose cache already expired they ask
   first, with the cost, since that message re-sends the whole context.
 - **Diagnostics:** *Cache Keeper: Show which chats are tracked (diagnostics)* lists every chat log
@@ -382,10 +401,10 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 |---|---|---|
 | `cacheKeeper.warnSeconds` | 60 | Warn this long before expiry |
 | `cacheKeeper.thresholdTokens` | 100000 | From this context size a chat is expensive to let expire: write the summary if you don't answer, and show it in orange once expired |
-| `cacheKeeper.autoSummary` | true | Turn the automatic summary off |
+| `cacheKeeper.autoAction` | summary | What happens with no click above the threshold, and when keeping warm ends: `summary` (a handoff file, the chat left as it is), `compact` (the chat compacted in place; Local chats only for now, others get a summary) or `off`. An older `cacheKeeper.autoSummary: false` still means `off` until this is set |
 | `cacheKeeper.autoKeepWarmCapPercent` | 50 | Auto keep warm stops at this share (25/50/75/100%) of the expiry cost at its start, summary included |
 | `cacheKeeper.autoKeepWarmMaxMinutes` | 120 | Auto keep warm stops after this much keep-warm time (Keep warm once included); 1 to 120, never more |
-| `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary when keeping warm ends (after Keep warm once, or at the auto cap) |
+| `cacheKeeper.summaryAfterKeepWarm` | true | Write a handoff summary (or compact, with `autoAction` `compact`) when keeping warm ends (after Keep warm once, or at the auto cap) |
 | `cacheKeeper.minCredits` | 5 | Ignore chats where an expiry would add less than this, for everything |
 | `cacheKeeper.afterSend` | restoreLastTyped | What happens to the chat tab after a keep-alive or summary (see above) |
 | `cacheKeeper.ttlSeconds` | {} | Cache lifetime per model id, if you need to override it |
@@ -397,6 +416,7 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 Fixed values, not shown in the Settings UI: 5 s keep-alive lead, 5% keep-alive jitter, 60-day
 maximum age for learned cache lifetimes. They can still be overridden in `settings.json`
 (`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
+Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where Compact is used.
 
 ## Build from source
 

@@ -36,7 +36,16 @@ From WSL, in the repository:
 test/live/run.sh                 # all four harnesses
 test/live/run.sh claude codex    # only some
 test/live/run.sh --yes --keep    # no cost prompt; keep the scratch folder and logs
+test/live/run.sh --compact local # also compact each chat with Cache Keeper's /compact
 ```
+
+**`--compact`:** after the keep-alive, Cache Keeper compacts each chat (*Compact chat now*, enabled
+for all four harnesses in the test folder). The table gets two more columns: **compacted** (the
+`/compact` was sent and a compaction shows in the chat's own log after it) and **compact hit %**
+(Local: the cache hit of VS Code's summarizing call, at least 90% to pass; other harnesses' logs
+don't record it, shown `?`). A harness that passes can be added to Cache Keeper's default
+`compactHarnesses`. The chats are tiny, so if a harness refuses to compact a two-message chat it
+shows as not compacted: try again on a longer chat before concluding.
 
 A VS Code window opens and closes itself when done (a few minutes per harness). Don't type in it.
 **The first time,** VS Code asks whether you trust the test folder `~/ck-live-ws`: click **Trust**

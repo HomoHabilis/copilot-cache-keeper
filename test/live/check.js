@@ -4,6 +4,9 @@
 //   - the call that answered it hit the cache (>= 90% of the prompt),
 //   - the attachment typed but not sent did not go out with it,
 //   - the unsent text was still in the chat's input box afterwards.
+// With CK_COMPACT=1 (run.sh --compact), also:
+//   - Cache Keeper's /compact compacted that chat (a compaction in its log after the keep-alive),
+//   - Local: the summarizing call hit the cache (>= 90%); other harnesses' logs don't say, shown "?".
 // node test/live/check.js <cache keeper log> <driver result> <runId> <harness...>
 "use strict";
 const fs = require("fs"), path = require("path"), os = require("os");
@@ -53,10 +56,11 @@ function chatLog(h, id8) {
 }
 const translate = { local: harnesses.localTrace, sdk: t => harnesses.sdkTrace(t, {}), claude: harnesses.claudeTrace, codex: harnesses.codexTrace };
 
+const COMPACT = process.env.CK_COMPACT === "1";
 const rows = [];
 let failed = 0;
 for (const h of wanted) {
-  const r = { harness: h, sent: false, landed: false, cache: "?", noAttachment: "?", draftKept: false };
+  const r = { harness: h, sent: false, landed: false, cache: "?", noAttachment: "?", draftKept: false, compacted: "-", compactCache: "-" };
   rows.push(r);
   // "keep-alive sent to <id8> ("ck-live <h> <runId>...", model, ...)"
   const m = new RegExp(`keep-alive sent to (\\S+) \\("ck-live ${h} ${runId}`).exec(ckLog);
@@ -77,16 +81,29 @@ for (const h of wanted) {
       const from = lines.findIndex(l => l.includes(JSON.stringify(ka.text).slice(1, -1)));
       const to = lines.findIndex((l, i) => i > from && /llm_request|usage_record|token_usage_record|"usage"/.test(l));
       r.noAttachment = from >= 0 ? !lines.slice(from, to < 0 ? undefined : to + 1).some(l => l.includes(MARKER)) : "?";
+      if (COMPACT) {
+        r.compacted = new RegExp(`compaction sent to ${m[1]}`).test(ckLog) && ev.slice(kaIdx).some(e => e.t === "compaction");
+        r.compactCache = "?";
+        if (h === "local") {         // the summarizing call is in the Agent Debug Log with its tokens
+          const req = lines.map(l => { try { return JSON.parse(l); } catch { return null; } })
+            .filter(e => e && e.type === "llm_request" && /summarizeConversationHistory/.test((e.attrs || {}).debugName || "")).pop();
+          if (req && req.attrs.inputTokens) r.compactCache = Math.round(100 * (req.attrs.cachedTokens || 0) / req.attrs.inputTokens);
+        }
+      }
     }
   }
-  r.ok = r.sent && r.landed && r.cache !== "?" && r.cache >= 90 && r.noAttachment === true && r.draftKept;
+  r.ok = r.sent && r.landed && r.cache !== "?" && r.cache >= 90 && r.noAttachment === true && r.draftKept &&
+    (!COMPACT || (r.compacted === true && (r.compactCache === "?" || r.compactCache >= 90)));
   if (!r.ok) failed++;
 }
 const pad = (v, n) => String(v).padEnd(n);
-console.log("\n" + ["harness", "keep-alive sent", "landed", "cache hit %", "attachment not sent", "draft kept", "result"].map((x, i) => pad(x, [9, 16, 7, 12, 20, 11, 6][i])).join(""));
+const heads = ["harness", "keep-alive sent", "landed", "cache hit %", "attachment not sent", "draft kept",
+  ...(COMPACT ? ["compacted", "compact hit %"] : []), "result"];
+const widths = [9, 16, 7, 12, 20, 11, ...(COMPACT ? [10, 14] : []), 6];
+console.log("\n" + heads.map((x, i) => pad(x, widths[i])).join(""));
 for (const r of rows) {
-  console.log([r.harness, r.sent, r.landed, r.cache, r.noAttachment, r.draftKept, r.ok ? "PASS" : "FAIL"]
-    .map((x, i) => pad(x, [9, 16, 7, 12, 20, 11, 6][i])).join(""));
+  console.log([r.harness, r.sent, r.landed, r.cache, r.noAttachment, r.draftKept, ...(COMPACT ? [r.compacted, r.compactCache] : []),
+    r.ok ? "PASS" : "FAIL"].map((x, i) => pad(x, widths[i])).join(""));
 }
 console.log(failed ? `\n${failed} harness(es) failed` : "\nall harnesses passed");
 process.exit(failed ? 1 : 0);

@@ -108,7 +108,10 @@ function isKeepAlive(text) { return KEEPALIVE_SET.has(String(text || "").trim())
 // The handoff summary request varies (file name, sizes), so it can't be matched exactly: it starts
 // with a short tag in the chat's language instead. Only add tags, for the same reason as above.
 const SUMMARY_TAGS = { en: "[summary]", it: "[riepilogo]", fr: "[résumé]", es: "[resumen]", de: "[Zusammenfassung]" };
-const OWN_PREFIXES = [MARKER, ...Object.values(SUMMARY_TAGS)];
+// A compaction is VS Code's (or the harness's) own /compact command, with what to keep in the chat's
+// language. Typed by you or sent by Cache Keeper, it is not a message to the agent.
+const COMPACT_COMMAND = "/compact";
+const OWN_PREFIXES = [MARKER, ...Object.values(SUMMARY_TAGS), COMPACT_COMMAND];
 
 /**
  * The handoff summary request, in `lang` (English if not covered). `x`: { rel, turns, compactions,
@@ -150,6 +153,27 @@ function summaryPrompt(lang, x) {
   return t[lang] || t.en;
 }
 
+/**
+ * The compaction request, in `lang` (English if not covered): /compact with what the summary must
+ * keep, so the chat can go on after the pause. The harness decides how long the summary is and keeps
+ * the most recent turns as they are.
+ */
+function compactPrompt(lang) {
+  const focus = {
+    en: "I'm pausing. Keep: the goal, what is done, current state, decisions and why, files changed, " +
+      "open problems, failed approaches to avoid, exact next steps.",
+    it: "Faccio una pausa. Conserva: obiettivo, cosa è fatto, stato attuale, decisioni e motivi, file modificati, " +
+      "problemi aperti, approcci falliti da evitare, prossimi passi precisi.",
+    fr: "Je fais une pause. Garde : l'objectif, ce qui est fait, l'état actuel, les décisions et pourquoi, les fichiers modifiés, " +
+      "les problèmes ouverts, les approches qui ont échoué, les prochaines étapes précises.",
+    es: "Hago una pausa. Conserva: el objetivo, qué está hecho, el estado actual, las decisiones y por qué, los archivos cambiados, " +
+      "los problemas abiertos, los enfoques fallidos a evitar, los próximos pasos exactos.",
+    de: "Ich mache eine Pause. Behalte: das Ziel, was erledigt ist, den aktuellen Stand, Entscheidungen und Gründe, geänderte Dateien, " +
+      "offene Probleme, gescheiterte Ansätze, die genauen nächsten Schritte.",
+  };
+  return `${COMPACT_COMMAND} ${focus[lang] || focus.en}`;
+}
+
 /** The first message of a new chat from a handoff file (you finish and send it), in `lang`. */
 function handoffStart(lang) {
   return { en: "Continue from the attached handoff summary. ", it: "Continua dal riepilogo di passaggio allegato. ",
@@ -180,6 +204,10 @@ const SUMMARY_MAX_SHARE = 1 / 3;
 // Only write one automatically when it, plus starting a new chat from it, costs at most this share
 // of continuing the chat cold: the margin pays for the cases where you continue the old chat anyway.
 const SUMMARY_PAYS_SHARE = 0.75;
+// A compaction keeps the most recent turns as they are (VS Code: recent rounds, tool results capped).
+// Their size isn't known before it runs: assume this many tokens, at most what the chat holds beyond
+// a fresh chat's first prompt. Once it has run, the log tells (the next call's prompt).
+const COMPACT_TAIL = 15000;
 
 /** Local disk access, for tests and command-line use. */
 const nodeIo = (() => {
@@ -396,6 +424,7 @@ function priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats) {
   const missExtra = ctx * r.write - hit;
   const perWord = TOKENS_PER_WORD * (r.out + r.write);
   if (perWord > 0) words = summaryWords(stats, (SUMMARY_MAX_SHARE * missExtra - SUMMARY_CALLS * hit) / perWord);
+  const compacted = compactedSize(ctx, firstCtx, stats);
   return {
     words,
     cost: {
@@ -403,8 +432,22 @@ function priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats) {
       missExtra,                                     // what letting the cache expire adds to the next message
       summary: SUMMARY_CALLS * hit + words * perWord,
       restart: (firstCtx + words * TOKENS_PER_WORD) * fresh.write, // first message of a new chat built from the summary
+      // compaction: one call reads the warm context and writes the summary; your next message then
+      // re-sends the compacted chat (system prompt, summary, recent turns) uncached
+      compact: hit + summaryWords(stats) * TOKENS_PER_WORD * r.out,
+      compactResume: compacted * fresh.write,
+      compacted,
     },
   };
+}
+
+/**
+ * Estimated prompt size of a chat after a compaction: a fresh chat's first prompt, the summary
+ * (sized like a handoff summary) and the recent turns it keeps. Never more than the chat holds now.
+ */
+function compactedSize(ctx, firstCtx, stats) {
+  const kept = Math.min(COMPACT_TAIL, Math.max(0, ctx - firstCtx));
+  return Math.round(Math.min(ctx, firstCtx + summaryWords(stats) * TOKENS_PER_WORD + kept));
 }
 
 /**
@@ -439,7 +482,13 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   if (!calls.length) return null;
   const last = calls[calls.length - 1];
   const model = last.model || "?";
-  const ctx = last.input;                            // after any compaction: what a miss re-sends
+  // Compacted since the last call (the /compact command, or an idle compaction): the next message
+  // re-sends the compacted chat, not what the last call read. Its size is known only once a call
+  // has run on it, so until then it is estimated.
+  const compactions_ = events.filter(e => e.t === "compaction");
+  const compactedAt = compactions_.length ? compactions_[compactions_.length - 1].ts : 0;
+  const compactedIdle = compactedAt > (last.end || last.ts);
+  let ctx = last.input;                              // after any compaction: what a miss re-sends
   // Size of a fresh chat's first prompt: about the chat's first call, minus any big attachments in
   // that first message (capped).
   const firstCtx = Math.min(calls[0].input, 40000);
@@ -475,6 +524,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const files = new Set(events.filter(e => e.t === "edit").flatMap(e => e.files || []));
   const compactions = Math.max(info.compactions || 0, events.filter(e => e.t === "compaction").length);
   const stats = { ctx, turns: real.length, compactions, files: files.size, calls: calls.length };
+  if (compactedIdle) ctx = stats.ctx = compactedSize(ctx, firstCtx, { ...stats, compactions: compactions - 1 });
   // Tokens a keep-alive adds uncached: measured on this chat's earlier keep-alives when there are
   // any (exact); otherwise VS Code's context block + our message + the agent's last reply, which is
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
@@ -539,7 +589,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom,
-    lastEnd: last.end || last.ts, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
+    lastEnd: last.end || last.ts, compactedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
@@ -752,6 +802,15 @@ function summaryPays(session) {
 }
 
 /**
+ * Whether a compaction is worth running automatically: by the same rule as a summary, it and your
+ * next message on the compacted chat cost clearly less than continuing this chat after expiry.
+ */
+function compactPays(session) {
+  const c = session.cost;
+  return !!c && c.compact + c.compactResume <= SUMMARY_PAYS_SHARE * c.missExtra;
+}
+
+/**
  * Order of the status-bar list: the chat you last typed in first (the one you are most likely
  * thinking about), then the other warm or working chats by soonest expiry (the next one to need a
  * decision; this order holds still while the countdowns run), then expired ones, newest first.
@@ -770,7 +829,7 @@ function fmt(credits) {
 }
 
 module.exports = {
-  summaryPays,
+  summaryPays, compactPays, compactPrompt, compactedSize, COMPACT_COMMAND,
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
