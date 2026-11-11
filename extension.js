@@ -8,6 +8,7 @@ const path = require("path");
 const core = require("./core");
 const sqlite = require("./sqlite");
 const harnesses = require("./harnesses");
+const report = require("./report");
 
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
@@ -501,8 +502,7 @@ async function refreshPrices(context) {
   // other workspaces: every workspaceStorage folder, so not on every read while none has prices
   if (!best && Date.now() - priceBook.wideAt >= PRICE_WIDE_MS) {
     priceBook.wideAt = Date.now();
-    const ws = remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
-      : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
+    const ws = workspaceStorageRoot(context);
     if (ws) {
       const dirs = [];
       for (const w of await io.list(ws)) {
@@ -519,6 +519,12 @@ async function refreshPrices(context) {
   }
 }
 function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook.text, model) : null; }
+
+/** VS Code's workspaceStorage folder on the window's side (every workspace's Local chat logs). */
+function workspaceStorageRoot(context) {
+  return remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
+    : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
+}
 
 // ---------------------------------------------------------------- cache lifetimes
 
@@ -625,6 +631,105 @@ function unmanagedWhy(s) {
 }
 
 /** Output panel: every chat folder of this workspace and whether it is tracked. */
+// ---------------------------------------------------------------- spend report
+// Every chat on this window's side over the last N days (not just this window's, not just the
+// lookback): Local chats of every workspace, and the Copilot SDK, Claude and Codex chats VS Code
+// created. Analysed by report.js, opened as a Markdown preview.
+
+async function gatherSpend(context, since, progress) {
+  const chats = [], where = [];
+  const step = m => progress && progress.report({ message: m });
+  // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json)
+  const ws = workspaceStorageRoot(context);
+  let nLocal = 0;
+  if (ws) {
+    step("Local chats");
+    for (const w of await io.list(ws)) {
+      const dl = io.join(ws, w, "GitHub.copilot-chat", "debug-logs");
+      const dirs = await io.list(dl);
+      if (!dirs.length) continue;
+      const wsInfo = jsonOr(await io.readText(io.join(ws, w, "workspace.json")), {}) || {};
+      const label = decodeURIComponent(String(wsInfo.folder || wsInfo.workspace || "").replace(/\/+$/, "").split("/").pop() || w.slice(0, 8));
+      for (const n of dirs) {
+        const dir = io.join(dl, n), st = await io.stat(io.join(dir, "main.jsonl"));
+        if (!st || st.mtime < since) continue;
+        const trace = harnesses.localTrace(await io.readText(io.join(dir, "main.jsonl")));
+        if (!trace) continue;
+        const models = await io.readText(io.join(dir, "models.json"));
+        const s = core.analyzeTrace("local", dir, trace, { priceFor });
+        chats.push({ kind: "local", id: n, title: s && s.title, workspace: label, events: trace.events,
+                     sheetFor: m => (models && core.priceSheetFrom(models, m)) || priceFor(m) });
+        nLocal++;
+      }
+    }
+    where.push(`Local chats: ${nLocal}, in ${remote ? remote.authority + ":" : ""}${ws}`);
+  }
+  if (sdkLoc) {
+    // Copilot SDK: ~/.copilot/session-state/<id>/events.jsonl, VS Code's own (workspace.yaml)
+    step("Copilot SDK chats");
+    let nSdk = 0;
+    const root = io.join(sdkLoc.home, ".copilot", "session-state");
+    for (const n of await io.list(root)) {
+      const dir = io.join(root, n), st = await io.stat(io.join(dir, "events.jsonl"));
+      if (!st || st.mtime < since) continue;
+      const yaml = core.parseYamlFlat(await io.readText(io.join(dir, "workspace.yaml")));
+      if (yaml.client_name !== "vscode-agent-host") continue;
+      const trace = harnesses.sdkTrace(await io.readText(io.join(dir, "events.jsonl")), yaml);
+      if (!trace) continue;
+      const s = core.analyzeTrace("sdk", dir, trace, { priceFor });
+      chats.push({ kind: "sdk", id: n, title: s && s.title, workspace: path.posix.basename(String(yaml.cwd || "")), events: trace.events, sheetFor: priceFor });
+      nSdk++;
+    }
+    where.push(`Copilot SDK chats: ${nSdk}, in ${root}`);
+    // Claude and Codex: the chats VS Code created (agent-host.db), billed through Copilot
+    step("Claude and Codex chats");
+    const counts = { claude: 0, codex: 0 };
+    for (const row of (sdkLoc.db && await dbTable(sdkLoc.db, "sessions")) || []) {
+      const m = /^([a-z]+):\/+([^/?#]+)$/.exec(String(row.session_uri || ""));
+      const h = m && AGENT_HARNESSES[m[1]];
+      if (!h || row.registration_source !== "explicit" || Number(row.modified_time || 0) < since) continue;
+      const cm = await chatMeta(m[2]);
+      if (!cm) continue;
+      const route = /^@provider=([^:]+):/.exec(h.model(cm.meta) || "");
+      if (route && !["copilot", "vscode-proxy"].includes(route[1])) continue;   // billed to your own account
+      const link = h.link(cm.meta);
+      const file = link && await h.locate(sdkLoc.home, link, Number(row.start_time) || 0, h.cwd(cm.meta), true);
+      const trace = file && h.translate(await io.readText(file));
+      if (!trace) continue;
+      const s = core.analyzeTrace(m[1], file, trace, { priceFor });
+      chats.push({ kind: m[1], id: m[2], title: (s && s.title) || cm.meta.customTitle, workspace: path.posix.basename(uriPath(h.cwd(cm.meta)) || ""),
+                   events: trace.events, sheetFor: priceFor, billed: cm.credits || undefined });
+      counts[m[1]]++;
+    }
+    where.push(`Claude chats: ${counts.claude}, Codex chats: ${counts.codex}, listed in ${sdkLoc.db}`);
+  }
+  if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
+  return { chats, where };
+}
+
+async function spendReport(context, daysArg) {
+  let days = Number(daysArg);
+  if (!(days > 0)) {
+    const v = await vscode.window.showInputBox({ title: "Cache Keeper: Spend report", prompt: "Days to analyze", value: "60",
+      validateInput: x => /^\d+$/.test(x.trim()) && Number(x) >= 1 && Number(x) <= 365 ? null : "A number of days, 1 to 365" });
+    if (!v) return;
+    days = Number(v);
+  }
+  const since = Date.now() - days * 86400000;
+  const text = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Cache Keeper: reading chat logs" },
+    async progress => {
+      await refreshPrices(context);
+      const { chats, where } = await gatherSpend(context, since, progress);
+      const a = report.analyzeSpend(chats, { since, ttlOverrides: cfg("ttlSeconds") || {} });
+      logx(`spend report, ${days} days: ${core.fmt(a.total)} cr, ${a.calls} calls in ${a.chats} chats` +
+        (a.unpriced ? `, ${a.unpriced} calls without a price` : ""));
+      return report.spendMarkdown(a, { days, where });
+    });
+  const doc = await vscode.workspace.openTextDocument({ language: "markdown", content: text });
+  await vscode.window.showTextDocument(doc, { preview: false });
+  await vscode.commands.executeCommand("markdown.showPreview", doc.uri);
+}
+
 async function diagnose(context) {
   out.show(true);
   const where = p => (remote ? remote.authority + ":" : "") + p;
@@ -1863,6 +1968,10 @@ function activate(context) {
   };
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
+    vscode.commands.registerCommand("cacheKeeper.spendReport", days => spendReport(context, days).catch(e => {
+      logx("spend report: " + (e.stack || e.message));
+      vscode.window.showErrorMessage("Cache Keeper: spend report failed: " + e.message);
+    })),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = await target("Keep warm now"); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = await target("Write handoff summary now"); if (s) await summaryNow(context, s); }),

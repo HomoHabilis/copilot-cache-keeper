@@ -163,6 +163,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const logName = { sdk: "events.jsonl", local: "main.jsonl", claude: "claude-sdk-1.jsonl", codex: "rollout-2026-11-03T13-19-13-thread-1.jsonl" }[kind];
   const cwd = sdkCwd || tmp;
   let clock = now;
+  const opened = [];
   const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [], listed = [];
   let status;
   const fakeFs = {
@@ -189,6 +190,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const vscode = {
     env: { remoteName: undefined },
     workspace: { getConfiguration: () => ({ get: k => settings[k] }), fs: fakeFs,
+                 openTextDocument: async o => { opened.push(o.content); return { uri: { scheme: "untitled" } }; },
                  textDocuments: [chatInput, otherInput],
                  onDidChangeTextDocument: f => { changeListeners.push(f); return { dispose() { changeListeners.splice(changeListeners.indexOf(f), 1); } }; },
                  applyEdit: async e => { for (const [u, t] of e.edits) setText([chatInput, otherInput].find(d => d.uri.toString() === u.toString()), t); return true; },
@@ -204,6 +206,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       showInformationMessage: async m => { infos.push(m); return undefined; },
       showErrorMessage: async m => { throw new Error("unexpected error message: " + m); },
       showQuickPick: async items => menu(items),
+      showTextDocument: async () => undefined,
+      showInputBox: async o => o.value,
+      withProgress: async (o, f) => f({ report() {} }),
       // the status-bar list: picks the first chat
       createQuickPick: () => { const qp = { items: [], activeItems: [], selectedItems: [], dispose() {},
         onDidAccept: f => { qp.accept = f; }, onDidHide() {},
@@ -254,6 +259,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       },
     },
     StatusBarAlignment: { Right: 2 },
+    ProgressLocation: { Notification: 15 },
     MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
     ThemeColor: class { constructor(id) { this.id = id; } },
     Range: class { constructor(...a) { this.a = a; } },
@@ -294,7 +300,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
-    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
+    memento, globalStorage, sdkRoot, lists, logs, opened, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
@@ -1405,6 +1411,54 @@ const never = () => new Promise(() => {});
     }
   });
 
+
+  // ---------------------------------------------------------------- spend report
+  const report = require("../report");
+  await check("spend report: billed credits, Claude scaled to its bill, Codex priced, an expired cache found and costed", () => {
+    const sheet = { batch_size: 1e6, default: { cache_read_price: 50, cache_write_price: 625, input_price: 500, output_price: 2500 } };
+    const t0 = now - 3 * 3600000;
+    const local = { kind: "local", id: "l1", title: "Refactor", workspace: "app", sheetFor: () => sheet, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "claude-opus-5.5", input: 120000, cached: 0, out: 500, credits: 50 },
+      // 20 min later: the 300 s cache has expired, the whole prompt is sent again
+      { t: "call", ts: t0 + 1200000, end: t0 + 1201000, model: "claude-opus-5.5", input: 121000, cached: 0, out: 500, credits: 51 }] };
+    const claude = { kind: "claude", id: "c1", title: "Fix tests", sheetFor: () => sheet, billed: 3, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "claude-haiku-5.5", input: 20000, cached: 0, out: 100 },
+      { t: "call", ts: t0 + 60000, end: t0 + 61000, model: "claude-haiku-5.5", input: 21000, cached: 20000, out: 100 }] };
+    const codex = { kind: "codex", id: "x1", title: "Port", sheetFor: () => sheet, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "gpt-6.1-sol", input: 10000, cached: 0, out: 100 }] };
+    const old = { kind: "local", id: "l0", sheetFor: () => sheet, events: [{ t: "call", ts: now - 90 * 86400000, model: "m", input: 1, credits: 999 }] };
+    const a = report.analyzeSpend([local, claude, codex, old], { since: now - 60 * 86400000, now });
+    const codexCr = 10000 * 625 / 1e6 + 100 * 2500 / 1e6;
+    assert.ok(Math.abs(a.total - (101 + 3 + codexCr)) < 1e-6, String(a.total));
+    assert.strictEqual(a.calls, 5, "the 90-day-old call is outside 60 days");
+    const exp = a.factors.find(f => /Expired/.test(f.name));
+    assert.strictEqual(exp.count, 1);
+    assert.ok(Math.abs(exp.credits - (121000 - 1000) * (625 - 50) / 1e6) < 1e-6, String(exp.credits));
+    assert.strictEqual(a.topMisses[0].chat, "Refactor");
+    const md = report.spendMarkdown(a, { days: 60, where: ["Local chats: 2"] });
+    for (const h2 of ["# Copilot spend, last 60 days", "## What drove it", "## By harness and model", "## Costliest cache misses", "## Costliest chats"])
+      assert.ok(md.includes(h2), h2);
+    assert.ok(!/Warning/.test(md), "all priced");
+  });
+
+  await check("spend report: a call with no known price is warned about, not a crash", () => {
+    const a = report.analyzeSpend([{ kind: "sdk", id: "s1", events: [
+      { t: "call", ts: now - 1000, model: "mystery-1", input: 50000, cached: 0, out: 10 }] }], { since: 0, now });
+    assert.strictEqual(a.unpriced, 1);
+    assert.ok(/Warning:\*\* 1 model call\(s\) have no known price \(mystery-1\)/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("spend report command: asks the days (60), reads this side's chats, opens the Markdown", async () => {
+    const h = await harness({ answer: never });
+    try {
+      await h.run(5);
+      await h.commands["cacheKeeper.spendReport"]();
+      const md = h.opened[0] || "";
+      assert.ok(/^# Copilot spend, last 60 days/.test(md), md.slice(0, 200));
+      assert.ok(/\| Local \| claude-opus-5\.5 \|/.test(md), md);
+      assert.ok(/Local chats: 1, in /.test(md), "where it read");
+    } finally { h.close(); }
+  });
 
   // ---------------------------------------------------------------- Claude and Codex harnesses
   const harnesses = require("../harnesses");

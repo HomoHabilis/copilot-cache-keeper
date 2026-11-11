@@ -419,12 +419,20 @@ maximum age for learned cache lifetimes. They can still be overridden in `settin
 (`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where Compact is used.
 
-## Spend report (helper)
+## Spend report
 
-[`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
+**Cache Keeper: Spend report (last N days)** (Command Palette) asks how many days to look back
+(60 by default) and opens a Markdown report of what your Copilot chats cost and what drove it:
+totals by harness and model, expired caches after pauses and other cache misses with what they
+added, context re-read above 100k, and the costliest misses and chats. It reads every chat on the
+window's side (Windows, WSL, SSH host or container), not just this window's: Local chats of every
+workspace, and the Copilot SDK, Claude and Codex chats VS Code created. Credits are as billed where
+the log says, else from Copilot's price sheet; calls with no known price are flagged.
+
+For a deeper look, [`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
 only, not part of the extension) that reads weeks of logs from every harness, Local, Copilot SDK,
-Claude, Codex, plus Copilot CLI and OpenCode, and ranks what drove your Copilot spend: expired
-caches after pauses, large contexts, reasoning effort, tool definitions and more.
+Claude, Codex, plus Copilot CLI, OpenCode and older chats, and adds reasoning effort, tool
+definitions, compactions and context-size settings to the analysis.
 
 ```bash
 python3 tools/spend-analyzer/analyze_spend.py --days 60
