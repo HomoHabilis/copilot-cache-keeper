@@ -351,16 +351,16 @@ const AGENT_HARNESSES = {
     // ~/.claude/projects/<folder>/<link>.jsonl: which folder isn't recorded. Claude names it after
     // the working folder (every character but letters and digits becomes "-"): look there first,
     // then (`wide`) in each folder.
-    async locate(home, link, startedAt, cwd, wide) {
-      const root = io.join(home, ".claude", "projects");
+    async locate(home, link, startedAt, cwd, wide, fsio = io) {
+      const root = fsio.join(home, ".claude", "projects");
       if (cwd) {
-        const f = io.join(root, String(cwd).replace(/[^a-zA-Z0-9]/g, "-"), `${link}.jsonl`);
-        if (await io.stat(f)) return f;
+        const f = fsio.join(root, String(cwd).replace(/[^a-zA-Z0-9]/g, "-"), `${link}.jsonl`);
+        if (await fsio.stat(f)) return f;
       }
       if (!wide) return null;
-      for (const d of await io.list(root)) {
-        const f = io.join(root, d, `${link}.jsonl`);
-        if (await io.stat(f)) return f;
+      for (const d of await fsio.list(root)) {
+        const f = fsio.join(root, d, `${link}.jsonl`);
+        if (await fsio.stat(f)) return f;
       }
       return null;
     },
@@ -372,8 +372,8 @@ const AGENT_HARNESSES = {
     cwd: m => uriPath(m["codex.cwd"]),
     translate: harnesses.codexTrace,
     // ~/.codex/sessions/YYYY/MM/DD/rollout-<time>-<link>.jsonl, dated from the chat's start (UTC or local)
-    async locate(home, link, startedAt, cwd, wide) {
-      const root = io.join(home, ".codex", "sessions"), seen = new Set(), now = Date.now();
+    async locate(home, link, startedAt, cwd, wide, fsio = io) {
+      const root = fsio.join(home, ".codex", "sessions"), seen = new Set(), now = Date.now();
       // the log stays in the folder of the day the chat started: that day and its neighbours first,
       // then (`wide`) every day since (never later than today, at most 400 days back)
       const from = Math.max(Math.min(startedAt || now, now), now - 400 * 86400000);
@@ -381,11 +381,11 @@ const AGENT_HARNESSES = {
       for (let t = from - 86400000; t <= to; t += 86400000) {
         for (const d of [new Date(t)]) {
           for (const [y, mo, da] of [[d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()], [d.getFullYear(), d.getMonth() + 1, d.getDate()]]) {
-            const dir = io.join(root, String(y), String(mo).padStart(2, "0"), String(da).padStart(2, "0"));
+            const dir = fsio.join(root, String(y), String(mo).padStart(2, "0"), String(da).padStart(2, "0"));
             if (seen.has(dir)) continue;
             seen.add(dir);
-            const n = (await io.list(dir)).find(x => x.endsWith(`-${link}.jsonl`));
-            if (n) return io.join(dir, n);
+            const n = (await fsio.list(dir)).find(x => x.endsWith(`-${link}.jsonl`));
+            if (n) return fsio.join(dir, n);
           }
         }
       }
@@ -397,13 +397,13 @@ const KIND_LABEL = { local: "Local", sdk: "Copilot SDK", claude: "Claude", codex
 
 /** Rows of a table in an SQLite file on the window's side, re-read only when the file changes. */
 const dbCache = new Map();     // path -> { key, tables }
-async function dbTable(file, table) {
-  const [a, b] = [await io.stat(file), await io.stat(file + "-wal")];
+async function dbTable(file, table, fsio = io) {
+  const [a, b] = [await fsio.stat(file), await fsio.stat(file + "-wal")];
   if (!a) return null;
   const key = `${a.mtime}|${a.size}|${b && b.mtime}|${b && b.size}`;
   let hit = dbCache.get(file);
   if (!hit || hit.key !== key) {
-    hit = { key, tables: {}, db: await io.readBytes(file), wal: b ? await io.readBytes(file + "-wal") : null };
+    hit = { key, tables: {}, db: await fsio.readBytes(file), wal: b ? await fsio.readBytes(file + "-wal") : null };
     dbCache.set(file, hit);
   }
   if (!(table in hit.tables)) hit.tables[table] = hit.db ? sqlite.readTable(hit.db, hit.wal, table) : null;
@@ -411,13 +411,14 @@ async function dbTable(file, table) {
 }
 
 /** A harness chat's session.db: metadata (key -> value) and credits Copilot billed (null if unknown). */
-async function chatMeta(vscId) {
-  const f = io.join(sdkLoc.data, "agentSessionData", vscId, "session.db");
-  const rows = await dbTable(f, "session_metadata");
+/** `side`: { io, data } of another side (the spend report reads both); default this window's. */
+async function chatMeta(vscId, side = { io, data: sdkLoc && sdkLoc.data }) {
+  const f = side.io.join(side.data, "agentSessionData", vscId, "session.db");
+  const rows = await dbTable(f, "session_metadata", side.io);
   if (!rows) return null;
   const meta = Object.fromEntries(rows.map(r => [r.key, r.value]));
   let credits = null;
-  for (const r of (await dbTable(f, "turn_usage")) || []) {
+  for (const r of (await dbTable(f, "turn_usage", side.io)) || []) {
     const nano = (((jsonOr(r.usage, {}) || {})._meta || {}).copilotUsage || {}).totalNanoAiu;
     if (typeof nano === "number") credits = (credits || 0) + nano / 1e9;
   }
@@ -636,72 +637,127 @@ function unmanagedWhy(s) {
 // lookback): Local chats of every workspace, and the Copilot SDK, Claude and Codex chats VS Code
 // created. Analysed by report.js, opened as a Markdown preview.
 
+/**
+ * Where to read on each side: this window's side (WSL, SSH host, container, or Windows for a local
+ * window) and, for a remote window, Windows too (its own Local, Copilot SDK and harness chats, and
+ * VS Code's chat files, which stay on Windows for every window).
+ */
+function spendSides(context) {
+  const user = context.globalStorageUri ? path.dirname(path.dirname(context.globalStorageUri.fsPath)) : null;   // .../Code/User
+  const ui = user && { name: remote ? "this computer" : "", io: localIo,
+    ws: context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : path.join(user, "workspaceStorage"),
+    home: require("os").homedir(), data: path.dirname(user), db: path.join(user, "globalStorage", "agent-host.db") };
+  if (!remote) return { sides: ui ? [ui] : [], ui };
+  const win = { name: remote.authority, io, ws: workspaceStorageRoot(context), home: sdkLoc && sdkLoc.home,
+    data: sdkLoc && sdkLoc.data, db: sdkLoc && sdkLoc.db };
+  return { sides: [win, ...(ui ? [ui] : [])], ui };
+}
+
+const wsLabel = info => decodeURIComponent(String(info.folder || info.workspace || "").replace(/\/+$/, "").split("/").pop() || "");
+
 async function gatherSpend(context, since, progress) {
   const chats = [], where = [];
   const step = m => progress && progress.report({ message: m });
-  // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json)
-  const ws = workspaceStorageRoot(context);
-  let nLocal = 0;
-  if (ws) {
-    step("Local chats");
-    for (const w of await io.list(ws)) {
-      const dl = io.join(ws, w, "GitHub.copilot-chat", "debug-logs");
-      const dirs = await io.list(dl);
-      if (!dirs.length) continue;
-      const wsInfo = jsonOr(await io.readText(io.join(ws, w, "workspace.json")), {}) || {};
-      const label = decodeURIComponent(String(wsInfo.folder || wsInfo.workspace || "").replace(/\/+$/, "").split("/").pop() || w.slice(0, 8));
-      for (const n of dirs) {
-        const dir = io.join(dl, n), st = await io.stat(io.join(dir, "main.jsonl"));
+  const withLog = new Set();     // chats that have a debug log (any age): their chat file is not counted again
+  const { sides, ui } = spendSides(context);
+  for (const side of sides) {
+    const fio = side.io, at = side.name ? `${side.name}: ` : "";
+    // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json)
+    if (side.ws) {
+      step(`${at}Local chats`);
+      let n = 0;
+      for (const w of await fio.list(side.ws)) {
+        const dl = fio.join(side.ws, w, "GitHub.copilot-chat", "debug-logs");
+        const dirs = await fio.list(dl);
+        if (!dirs.length) continue;
+        const label = wsLabel(jsonOr(await fio.readText(fio.join(side.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
+        for (const id of dirs) {
+          withLog.add(id);
+          const dir = fio.join(dl, id), st = await fio.stat(fio.join(dir, "main.jsonl"));
+          if (!st || st.mtime < since) continue;
+          const trace = harnesses.localTrace(await fio.readText(fio.join(dir, "main.jsonl")));
+          if (!trace) continue;
+          const models = await fio.readText(fio.join(dir, "models.json"));
+          const s = core.analyzeTrace("local", dir, trace, { priceFor });
+          chats.push({ kind: "local", id, title: s && s.title, workspace: label, events: trace.events,
+                       sheetFor: m => (models && core.priceSheetFrom(models, m)) || priceFor(m) });
+          n++;
+        }
+      }
+      where.push(`${at}Local chats: ${n}, in ${side.ws}`);
+    }
+    if (side.home) {
+      // Copilot SDK: ~/.copilot/session-state/<id>/events.jsonl, VS Code's own (workspace.yaml)
+      step(`${at}Copilot SDK chats`);
+      let n = 0;
+      const root = fio.join(side.home, ".copilot", "session-state");
+      for (const id of await fio.list(root)) {
+        const dir = fio.join(root, id), st = await fio.stat(fio.join(dir, "events.jsonl"));
         if (!st || st.mtime < since) continue;
-        const trace = harnesses.localTrace(await io.readText(io.join(dir, "main.jsonl")));
+        const yaml = core.parseYamlFlat(await fio.readText(fio.join(dir, "workspace.yaml")));
+        if (yaml.client_name !== "vscode-agent-host") continue;
+        const trace = harnesses.sdkTrace(await fio.readText(fio.join(dir, "events.jsonl")), yaml);
         if (!trace) continue;
-        const models = await io.readText(io.join(dir, "models.json"));
-        const s = core.analyzeTrace("local", dir, trace, { priceFor });
-        chats.push({ kind: "local", id: n, title: s && s.title, workspace: label, events: trace.events,
-                     sheetFor: m => (models && core.priceSheetFrom(models, m)) || priceFor(m) });
-        nLocal++;
+        const s = core.analyzeTrace("sdk", dir, trace, { priceFor });
+        chats.push({ kind: "sdk", id, title: s && s.title, workspace: String(yaml.cwd || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop(),
+                     events: trace.events, sheetFor: priceFor });
+        n++;
+      }
+      where.push(`${at}Copilot SDK chats: ${n}, in ${root}`);
+    }
+    if (side.db && side.data && side.home) {
+      // Claude and Codex: the chats VS Code created (agent-host.db), billed through Copilot
+      step(`${at}Claude and Codex chats`);
+      const counts = { claude: 0, codex: 0 };
+      for (const row of (await dbTable(side.db, "sessions", fio)) || []) {
+        const m = /^([a-z]+):\/+([^/?#]+)$/.exec(String(row.session_uri || ""));
+        const h = m && AGENT_HARNESSES[m[1]];
+        if (!h || row.registration_source !== "explicit" || Number(row.modified_time || 0) < since) continue;
+        const cm = await chatMeta(m[2], { io: fio, data: side.data });
+        if (!cm) continue;
+        const route = /^@provider=([^:]+):/.exec(h.model(cm.meta) || "");
+        if (route && !["copilot", "vscode-proxy"].includes(route[1])) continue;   // billed to your own account
+        const link = h.link(cm.meta);
+        const file = link && await h.locate(side.home, link, Number(row.start_time) || 0, h.cwd(cm.meta), true, fio);
+        const trace = file && h.translate(await fio.readText(file));
+        if (!trace) continue;
+        const s = core.analyzeTrace(m[1], file, trace, { priceFor });
+        chats.push({ kind: m[1], id: m[2], title: (s && s.title) || cm.meta.customTitle,
+                     workspace: String(uriPath(h.cwd(cm.meta)) || "").replace(/[\\/]+$/, "").split(/[\\/]/).pop(),
+                     events: trace.events, sheetFor: priceFor, billed: cm.credits || undefined });
+        counts[m[1]]++;
+      }
+      where.push(`${at}Claude chats: ${counts.claude}, Codex chats: ${counts.codex}, listed in ${side.db}`);
+    }
+  }
+  // Older Local chats, whose debug log is gone: VS Code's own chat files, on the UI side (Windows for
+  // a WSL window), one record per message with its billed credits. Copies of a chat are merged.
+  if (ui) {
+    step("older Local chats");
+    const copies = new Map();
+    for (const w of await localIo.list(ui.ws)) {
+      const cs = path.join(ui.ws, w, "chatSessions");
+      const files = (await localIo.list(cs)).filter(f => f.endsWith(".jsonl"));
+      if (!files.length) continue;
+      const label = wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
+      for (const f of files) {
+        const id = f.slice(0, -".jsonl".length);
+        if (withLog.has(id)) continue;
+        const st = await localIo.stat(path.join(cs, f));
+        if (!st || st.mtime < since) continue;
+        if (!copies.has(id)) copies.set(id, { texts: [], labels: [] });
+        copies.get(id).texts.push(await localIo.readText(path.join(cs, f)));
+        copies.get(id).labels.push(label);
       }
     }
-    where.push(`Local chats: ${nLocal}, in ${remote ? remote.authority + ":" : ""}${ws}`);
-  }
-  if (sdkLoc) {
-    // Copilot SDK: ~/.copilot/session-state/<id>/events.jsonl, VS Code's own (workspace.yaml)
-    step("Copilot SDK chats");
-    let nSdk = 0;
-    const root = io.join(sdkLoc.home, ".copilot", "session-state");
-    for (const n of await io.list(root)) {
-      const dir = io.join(root, n), st = await io.stat(io.join(dir, "events.jsonl"));
-      if (!st || st.mtime < since) continue;
-      const yaml = core.parseYamlFlat(await io.readText(io.join(dir, "workspace.yaml")));
-      if (yaml.client_name !== "vscode-agent-host") continue;
-      const trace = harnesses.sdkTrace(await io.readText(io.join(dir, "events.jsonl")), yaml);
-      if (!trace) continue;
-      const s = core.analyzeTrace("sdk", dir, trace, { priceFor });
-      chats.push({ kind: "sdk", id: n, title: s && s.title, workspace: path.posix.basename(String(yaml.cwd || "")), events: trace.events, sheetFor: priceFor });
-      nSdk++;
+    for (const [id, c] of copies) {
+      const { title, events } = report.chatFileMessages(c.texts);
+      if (!events.length) continue;
+      // named after a plain folder when one copy is (another may be a multi-folder workspace)
+      const label = c.labels.find(l => !/\.code-workspace$/.test(l)) || c.labels[0];
+      chats.push({ kind: "local-msg", id, title, workspace: label, events, sheetFor: priceFor });
     }
-    where.push(`Copilot SDK chats: ${nSdk}, in ${root}`);
-    // Claude and Codex: the chats VS Code created (agent-host.db), billed through Copilot
-    step("Claude and Codex chats");
-    const counts = { claude: 0, codex: 0 };
-    for (const row of (sdkLoc.db && await dbTable(sdkLoc.db, "sessions")) || []) {
-      const m = /^([a-z]+):\/+([^/?#]+)$/.exec(String(row.session_uri || ""));
-      const h = m && AGENT_HARNESSES[m[1]];
-      if (!h || row.registration_source !== "explicit" || Number(row.modified_time || 0) < since) continue;
-      const cm = await chatMeta(m[2]);
-      if (!cm) continue;
-      const route = /^@provider=([^:]+):/.exec(h.model(cm.meta) || "");
-      if (route && !["copilot", "vscode-proxy"].includes(route[1])) continue;   // billed to your own account
-      const link = h.link(cm.meta);
-      const file = link && await h.locate(sdkLoc.home, link, Number(row.start_time) || 0, h.cwd(cm.meta), true);
-      const trace = file && h.translate(await io.readText(file));
-      if (!trace) continue;
-      const s = core.analyzeTrace(m[1], file, trace, { priceFor });
-      chats.push({ kind: m[1], id: m[2], title: (s && s.title) || cm.meta.customTitle, workspace: path.posix.basename(uriPath(h.cwd(cm.meta)) || ""),
-                   events: trace.events, sheetFor: priceFor, billed: cm.credits || undefined });
-      counts[m[1]]++;
-    }
-    where.push(`Claude chats: ${counts.claude}, Codex chats: ${counts.codex}, listed in ${sdkLoc.db}`);
+    where.push(`Older Local chats (no debug log left): ${copies.size}, from VS Code's chat files in ${ui.ws}`);
   }
   if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
   return { chats, where };
@@ -725,9 +781,18 @@ async function spendReport(context, daysArg) {
         (a.unpriced ? `, ${a.unpriced} calls without a price` : ""));
       return report.spendMarkdown(a, { days, where });
     });
-  const doc = await vscode.workspace.openTextDocument({ language: "markdown", content: text });
-  await vscode.window.showTextDocument(doc, { preview: false });
-  await vscode.commands.executeCommand("markdown.showPreview", doc.uri);
+  // saved as a file (Cache Keeper's storage, this machine) and shown as a preview only: nothing unsaved
+  const dir = vscode.Uri.joinPath(context.globalStorageUri, "spend-reports");
+  const d = new Date(), pad = n => String(n).padStart(2, "0");
+  const file = vscode.Uri.joinPath(dir, `spend-report-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${days}d.md`);
+  await vscode.workspace.fs.createDirectory(dir);
+  await vscode.workspace.fs.writeFile(file, Buffer.from(text, "utf8"));
+  await vscode.commands.executeCommand("markdown.showPreview", file);
+  // not awaited: the command is done once the preview is open, whether or not this is clicked
+  vscode.window.showInformationMessage(`Cache Keeper: spend report saved to ${file.fsPath}`, "Open as text", "Show in folder").then(pick => {
+    if (pick === "Open as text") return vscode.window.showTextDocument(file);
+    if (pick === "Show in folder") return vscode.commands.executeCommand("revealFileInOS", file);
+  }, () => undefined);
 }
 
 async function diagnose(context) {

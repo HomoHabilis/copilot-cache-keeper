@@ -1448,15 +1448,53 @@ const never = () => new Promise(() => {});
     assert.ok(/Warning:\*\* 1 model call\(s\) have no known price \(mystery-1\)/.test(report.spendMarkdown(a, { days: 60 })));
   });
 
-  await check("spend report command: asks the days (60), reads this side's chats, opens the Markdown", async () => {
+  // VS Code's chat file: the initial state, then a request appended, then a field set (its op log)
+  const chatFile = (t0, msgs) => [
+    JSON.stringify({ kind: 0, v: { requests: [] } }),
+    JSON.stringify({ kind: 2, k: ["requests"], v: msgs.map((m, i) => ({ timestamp: t0 + m.at * 1000, message: { text: m.text || `step ${i}` },
+      modelId: "copilot/claude-opus-5.5", promptTokens: m.prompt, completionTokens: 200 })) }),
+    ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "elapsedMs"], v: 20000 })),
+    ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "copilotCredits"], v: m.credits }))].join("\n") + "\n";
+
+  await check("chat files: replayed per message, copies merged, a pause past the lifetime is an expired cache", () => {
+    const t0 = now - 7200000;
+    const text = chatFile(t0, [{ at: 0, prompt: 90000, credits: 40, text: "Port the parser" }, { at: 60, prompt: 91000, credits: 6 },
+                               { at: 1800, prompt: 92000, credits: 45 }]);
+    const m = report.chatFileMessages([text, text]);
+    assert.strictEqual(m.title, "Port the parser");
+    assert.strictEqual(m.events.length, 3, "copies merged");
+    assert.strictEqual(m.events[2].gap, 1800 - 60 - 20, "pause since the previous message ended");
+    const sheet = { batch_size: 1e6, default: { cache_read_price: 50, cache_write_price: 625, output_price: 2500 } };
+    const a = report.analyzeSpend([{ kind: "local-msg", id: "old", title: m.title, events: m.events, sheetFor: () => sheet }], { since: 0, now });
+    assert.strictEqual(a.total, 91);
+    const exp = a.factors.find(f => /Expired/.test(f.name));
+    assert.strictEqual(exp.count, 1, "only the message after the long pause");
+    assert.ok(/\| Local, older chats \| claude-opus-5\.5 \| 3 msgs \|/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("spend report command: asks the days (60), reads Local logs and older chat files, saves the file, shows its preview", async () => {
     const h = await harness({ answer: never });
     try {
       await h.run(5);
-      await h.commands["cacheKeeper.spendReport"]();
-      const md = h.opened[0] || "";
+      // chat files on the UI side: an older chat (no debug log left), and the current one (has a log: not counted twice)
+      const cs = path.join(h.dir, "workspaceStorage", "ws1", "chatSessions");
+      fs.mkdirSync(cs, { recursive: true });
+      fs.writeFileSync(path.join(cs, "old-chat.jsonl"), chatFile(h.clock - 86400000, [{ at: 0, prompt: 80000, credits: 30, text: "Older work" }]));
+      fs.writeFileSync(path.join(cs, "sess-1.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
+      // its "saved" notification is never clicked: the command must still finish
+      h.vscode.window.showInformationMessage = () => new Promise(() => {});
+      const done = await Promise.race([h.commands["cacheKeeper.spendReport"]().then(() => true),
+                                       new Promise(r => setTimeout(() => r(false), 5000))]);
+      assert.ok(done, "the command did not wait for the notification");
+      const shown = h.ran.find(r => r.id === "markdown.showPreview");
+      assert.ok(shown && /spend-report-\d{4}-\d\d-\d\d-60d\.md$/.test(shown.a.fsPath), "preview of the saved file");
+      assert.ok(!h.opened.length, "no unsaved document");
+      const md = fs.readFileSync(shown.a.fsPath, "utf8");
       assert.ok(/^# Copilot spend, last 60 days/.test(md), md.slice(0, 200));
       assert.ok(/\| Local \| claude-opus-5\.5 \|/.test(md), md);
-      assert.ok(/Local chats: 1, in /.test(md), "where it read");
+      assert.ok(/\| Older work \| Local, older chats \|/.test(md), "the older chat, from its chat file");
+      assert.ok(!/999/.test(md), "the chat with a debug log is not counted again from its chat file");
+      assert.ok(/Older Local chats \(no debug log left\): 1/.test(md), "where it read");
     } finally { h.close(); }
   });
 

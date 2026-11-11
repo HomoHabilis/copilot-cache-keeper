@@ -422,12 +422,18 @@ Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where C
 ## Spend report
 
 **Cache Keeper: Spend report (last N days)** (Command Palette) asks how many days to look back
-(60 by default) and opens a Markdown report of what your Copilot chats cost and what drove it:
+(60 by default) and shows a Markdown report of what your Copilot chats cost and what drove it:
 totals by harness and model, expired caches after pauses and other cache misses with what they
-added, context re-read above 100k, and the costliest misses and chats. It reads every chat on the
-window's side (Windows, WSL, SSH host or container), not just this window's: Local chats of every
-workspace, and the Copilot SDK, Claude and Codex chats VS Code created. Credits are as billed where
-the log says, else from Copilot's price sheet; calls with no known price are flagged.
+added, context re-read above 100k, and the costliest misses and chats. The report is saved in
+Cache Keeper's storage (`spend-reports/spend-report-<date>-<days>d.md`, the notification says
+where) and opened as a preview.
+
+It reads every chat, not just this window's, on the window's side (WSL, SSH host or container)
+and, for a remote window, on this computer too: Local chats of every workspace, older Local chats
+whose debug log VS Code has removed (from VS Code's own chat files, per message), and the Copilot
+SDK, Claude and Codex chats VS Code created. Credits are as billed where the log says, else from
+Copilot's price sheet; calls with no known price are flagged. On this machine it matches the Python
+helper below within 0.3%; the helper also covers OpenCode and Copilot CLI.
 
 For a deeper look, [`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
 only, not part of the extension) that reads weeks of logs from every harness, Local, Copilot SDK,

@@ -11,7 +11,7 @@ const MISS_MIN_CTX = 30000;     // ignore misses on small prompts
 const MISS_CACHED_BELOW = 0.5;  // less than half the prompt cached: a miss
 const TYPICAL_NEW = 1000;       // tokens a normal message adds uncached (not part of a miss)
 const BIG_CTX = 100000;         // above this, the context is re-read (at the cache price) on every call
-const KIND_NAME = { local: "Local", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" };
+const KIND_NAME = { local: "Local", "local-msg": "Local, older chats", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" };
 
 /** Credits for one call: as billed when the log says, else from the per-token rates. */
 function callCredits(c, sheet) {
@@ -25,6 +25,9 @@ function callCredits(c, sheet) {
 /**
  * chats: [{ kind, id, title, workspace, events, sheetFor(model) -> price sheet or null,
  *           billed? (credits Copilot billed for the whole chat: estimates are scaled to it) }]
+ * kind "local-msg": a Local chat known only from VS Code's chat file (its debug log is gone), one
+ * "call" per message with its billed credits and prompt size, `gap` (s since the previous message
+ * ended) and `ours` (Cache Keeper's message); no cached-token detail.
  * Returns the calls of the period, with credits, and the figures for the report.
  */
 function analyzeSpend(chats, { since = 0, now = Date.now(), ttlOverrides = {} } = {}) {
@@ -51,6 +54,16 @@ function analyzeSpend(chats, { since = 0, now = Date.now(), ttlOverrides = {} } 
       calls.push(rec);
       Object.assign(mine, { calls: mine.calls + 1, credits: mine.credits + rec.credits, maxCtx: Math.max(mine.maxCtx, rec.ctx),
                             first: mine.first || c.ts, last: c.ts });
+      if (ch.kind === "local-msg") {
+        // per message: an expired cache when the pause before it was longer than the lifetime
+        const ttl = core.ttlFor(rec.model, ttlOverrides), sheet = sheetFor(rec.model), r = sheet && core.rates(sheet, rec.ctx);
+        if (c.gap !== undefined && c.gap !== null && !c.ours && rec.ctx >= MISS_MIN_CTX && c.gap >= ttl) {
+          const extra = r ? Math.max(0, rec.ctx - TYPICAL_NEW) * Math.max(0, r.write - r.read) : 0;
+          misses.push({ ...rec, pause: c.gap, ttl, expired: true, extra });
+          mine.misses++; mine.missCredits += extra;
+        }
+        continue;
+      }
       // a miss: most of a large prompt sent again uncached, after an earlier call of this chat
       if (i === 0 || rec.ctx < MISS_MIN_CTX || rec.cached >= MISS_CACHED_BELOW * rec.ctx) continue;
       const prev = priced[i - 1].c;
@@ -78,7 +91,8 @@ function analyzeSpend(chats, { since = 0, now = Date.now(), ttlOverrides = {} } 
     const k = `${c.kind}|${c.model}`;
     if (!groups.has(k)) groups.set(k, { kind: c.kind, model: c.model, calls: 0, credits: 0, ctx: [], cached: 0, input: 0 });
     const g = groups.get(k);
-    g.calls++; g.credits += c.credits; g.ctx.push(c.ctx); g.cached += c.cached; g.input += c.ctx;
+    g.calls++; g.credits += c.credits; g.ctx.push(c.ctx);
+    if (c.kind !== "local-msg") { g.cached += c.cached; g.input += c.ctx; }
   }
   const median = xs => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor((s.length - 1) / 2)] : 0; };
   return {
@@ -122,7 +136,8 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
       "| | Credits | Share | Calls | What to do |", "|---|---:|---:|---:|---|");
     for (const f of a.factors) L.push(`| ${f.name} | ${cr(f.credits)} | ${pct(f.credits)} | ${f.count} | ${f.todo} |`);
     L.push("", "## By harness and model", "", "| Harness | Model | Calls | Credits | Median context | Cached |", "|---|---|---:|---:|---:|---:|");
-    for (const g of a.byModel) L.push(`| ${KIND_NAME[g.kind]} | ${g.model} | ${g.calls} | ${cr(g.credits)} | ${k(g.medianCtx)} | ${Math.round(100 * g.cachedShare)}% |`);
+    for (const g of a.byModel) L.push(`| ${KIND_NAME[g.kind]} | ${g.model} | ${g.calls}${g.kind === "local-msg" ? " msgs" : ""} | ${cr(g.credits)} | ` +
+      `${k(g.medianCtx)} | ${g.kind === "local-msg" ? "-" : `${Math.round(100 * g.cachedShare)}%`} |`);
     if (a.topMisses.length) {
       L.push("", "## Costliest cache misses", "", "| When | Chat | Harness | Model | Context | Pause | Lifetime | Extra credits |",
         "|---|---|---|---|---:|---:|---:|---:|");
@@ -135,6 +150,9 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
       `${c.misses ? `${c.misses} (${cr(c.missCredits)} cr)` : "0"} | ${k(c.maxCtx)} | ${day(c.last)} |`);
   }
   L.push("", "## How it is computed", "",
+    "- Local, older chats: chats whose debug log VS Code has removed, read from VS Code's own chat files, one line per " +
+    "message with the credits it was billed (all its model calls together). Their expired caches: a pause before the " +
+    "message longer than the cache lifetime, priced on the message's prompt.",
     "- Credits: as billed where the log says (Local, Copilot SDK; Claude scaled to the credits Copilot billed for the chat), " +
     "else from Copilot's price sheet (Codex). 1 credit = $0.01.",
     "- A cache miss: a call with at least 30k tokens of context and less than half of it cached. It is an expired cache when " +
@@ -148,4 +166,53 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
   return L.join("\n") + "\n";
 }
 
-module.exports = { analyzeSpend, spendMarkdown, callCredits };
+// ---------------------------------------------------------------- VS Code's own chat files
+// workspaceStorage/<workspace>/chatSessions/<chat id>.jsonl, on the side VS Code's UI runs (Windows
+// for a WSL window): an op log of the chat's requests, one per message, each with the credits it was
+// billed. Kept after the chat's debug log is gone, so older chats still count.
+
+/** The chat's requests, replayed from the op log. */
+function chatFileRequests(text) {
+  let reqs = [];
+  for (const line of String(text || "").split("\n")) {
+    let o;
+    try { o = JSON.parse(line); } catch { continue; }
+    const key = o.k || [], v = o.v;
+    if (o.kind === 0 && v && typeof v === "object") reqs = [...(v.requests || [])];
+    else if (key.length === 1 && key[0] === "requests" && o.kind === 2 && Array.isArray(v)) reqs.splice(o.i === undefined ? reqs.length : o.i, Infinity, ...v);
+    else if (key.length === 3 && key[0] === "requests" && o.kind === 1 && Number.isInteger(key[1])) {
+      while (reqs.length <= key[1]) reqs.push({});
+      reqs[key[1]] = { ...reqs[key[1]], [key[2]]: v };
+    }
+  }
+  return reqs;
+}
+
+/**
+ * One "call" per billed message of a chat file (see analyzeSpend, kind "local-msg"), and the chat's
+ * title (its first message). Copies of the same chat (VS Code keeps one per workspace folder it was
+ * in) are merged by the caller: pass all their texts.
+ */
+function chatFileMessages(texts) {
+  const best = new Map();
+  let title = "";
+  for (const text of texts) {
+    const reqs = chatFileRequests(text);
+    let prevEnd = null;
+    reqs.forEach((q, i) => {
+      const ts = q.timestamp || 0, el = q.elapsedMs, msg = q.message && typeof q.message === "object" ? q.message.text || "" : "";
+      if (!title && msg) title = msg.trim().split("\n")[0].slice(0, 80);
+      if (ts && q.copilotCredits !== undefined && q.copilotCredits !== null && el && Number(q.copilotCredits) > 0) {
+        const m = { t: "call", ts, end: ts + el, model: String(q.modelId || "?").split("/").pop(), input: Number(q.promptTokens) || 0,
+                    cached: 0, out: Number(q.completionTokens) || 0, credits: Number(q.copilotCredits),
+                    gap: prevEnd ? (ts - prevEnd) / 1000 : null, ours: core.isOwnMessage(msg) };
+        const k = `${ts}|${i}`, old = best.get(k);
+        if (!old || m.credits > old.credits) best.set(k, m);   // the most complete copy
+      }
+      if (ts && el) prevEnd = ts + el;
+    });
+  }
+  return { title, events: [...best.values()].sort((a, b) => a.ts - b.ts) };
+}
+
+module.exports = { analyzeSpend, spendMarkdown, callCredits, chatFileRequests, chatFileMessages };
