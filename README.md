@@ -419,6 +419,17 @@ maximum age for learned cache lifetimes. They can still be overridden in `settin
 (`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where Compact is used.
 
+## Spend report (helper)
+
+[`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
+only, not part of the extension) that reads weeks of logs from every harness, Local, Copilot SDK,
+Claude, Codex, plus Copilot CLI and OpenCode, and ranks what drove your Copilot spend: expired
+caches after pauses, large contexts, reasoning effort, tool definitions and more.
+
+```bash
+python3 tools/spend-analyzer/analyze_spend.py --days 60
+```
+
 ## Build from source
 
 Requires Python 3 (no Node build step and no dependencies):
