@@ -239,7 +239,11 @@ See [Supported chat harnesses](#supported-chat-harnesses).
      It only ever lengthens the default (rounded down to the minute, and only when more than 60 s
      longer): a cache miss can have other causes, so it never shortens it. On real logs this gives
      for example `kimi-k2.7-code` 1080 s, while Claude models stay at 300 s.
-  5. Defaults: 300 s for Claude models, 1800 s for Sol 6.1, 300 s for anything else.
+  5. Defaults: 300 s for Claude models, 1800 s for Sol 6.1. Any other model with no data is assumed
+     to last 300 s, and shown as a guess: `~` before its countdown, "lifetime assumed" in its warning,
+     "assumed: no data for this model" in the tooltip and diagnostics. Using the model once in a Copilot
+     SDK chat gives it a real lifetime for every harness. (The spend report doesn't judge expiries on
+     such a model.)
 
   The most precise source wins: exact values (1-3) before the measured minimum (4) before the
   defaults (5). The Output panel logs the learned values, with their age, when they change, and the status-bar tooltip and

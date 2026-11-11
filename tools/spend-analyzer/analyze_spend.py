@@ -224,6 +224,8 @@ def rates(model: str, ctx: int) -> dict | None:
 
 
 MEASURED_TTLS: dict[str, int] = {}   # model id -> longest gap after which a Local chat still hit the cache
+GUESS_TTL = 300        # what the extension's warnings assume for a model with no data
+MEASURED_MARGIN = 60   # a measured gap counts once it beats the guess (or known value) by this much
 
 
 def ttl_for(model: str, call_ttl: int | None = None) -> int | None:
@@ -235,8 +237,11 @@ def ttl_for(model: str, call_ttl: int | None = None) -> int | None:
     if model in TTLS:
         return TTLS[model]
     known = next((t for p, t in KNOWN_TTLS if (model or "").startswith(p)), None)
-    if model in MEASURED_TTLS:
-        return max(MEASURED_TTLS[model], known or 0)
+    # a measured gap is only a minimum: it counts once it beats the guess or the known value by a
+    # margin, rounded down to the minute (the extension's rule)
+    m = MEASURED_TTLS.get(model, 0)
+    if m > (known or GUESS_TTL) + MEASURED_MARGIN:
+        return m // 60 * 60
     return known
 
 
@@ -1048,7 +1053,7 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
       f"{int(MISS_CACHED_BELOW * 100)}% of it cached, not the first call of its session. \"Expired after a pause\" "
       "means the gap since the previous call in that session was at least the model's cache lifetime "
       "(from data only: the call's log, Copilot CLI/SDK logs, the longest gap after which a Local chat still hit the "
-      "cache" + (f" ({', '.join(f'{m} ≥{g}s' for m, g in sorted(MEASURED_TTLS.items()))})" if MEASURED_TTLS else "") +
+      "cache, once longer than 5 min" + (f" ({', '.join(f'{m} ≥{ttl_for(m)}s' for m in sorted(MEASURED_TTLS) if m not in TTLS and ttl_for(m) and ttl_for(m) >= GUESS_TTL + MEASURED_MARGIN)})" if MEASURED_TTLS else "") +
       f", else {', '.join(f'{p} {t}s' for p, t in KNOWN_TTLS)}; other models with no data: not judged). "
       "Extra = uncached tokens × (write/input price − cache-read price).")
     w("- Effort: extra output tokens vs the median output of the same model at the lowest effort you used, priced at "

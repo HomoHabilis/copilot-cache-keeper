@@ -1605,7 +1605,8 @@ async function offer(context, s) {
   const o = st.offer = { for: s.cacheFrom, answered: false, timedOut: false };
   const c = s.cost;
   // Short: a toast cuts long text. Every choice with its cost is in More... (the per-chat menu).
-  const msg = `${chatName(s)} expires in ${Math.max(0, Math.round(live(s)))}s.` +
+  const msg = `${chatName(s)} expires in ${s.ttlAssumed ? "~" : ""}${Math.max(0, Math.round(live(s)))}s` +
+    (s.ttlAssumed ? " (lifetime assumed: no data for this model)." : ".") +
     (c ? ` Expiry: +${core.fmt(c.missExtra)} cr.` : " No price for this model.") +
     ` No click: ${noClickText(st, s)}.`;
   const pick = choiceOf(await vscode.window.showWarningMessage(msg, ...warningButtons(s))) || undefined;
@@ -1690,7 +1691,7 @@ function awaitingAnswer() {
 /** "3:12", or for a chat whose agent works past the cache lifetime, "possibly expired". */
 function clockText(s) {
   const r = live(s);
-  return r > 0 ? mmss(r) : s.busy ? "possibly expired" : "expired";
+  return r > 0 ? countdown(s, r) : s.busy ? "possibly expired" : "expired";
 }
 
 function chatItem(s, cur = currentChat()) {
@@ -1948,6 +1949,8 @@ async function newChatFromHandoff(uri, lang, kind = "local") {
 }
 
 function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).padStart(2, "0")}`; }
+/** A chat's countdown; "~" when its cache lifetime is a guess (a model with no lifetime data). */
+function countdown(s, r = live(s)) { return (s.ttlAssumed ? "~" : "") + mmss(r); }
 
 function updateStatus(context) {
   const list = all.filter(managed);
@@ -1975,7 +1978,7 @@ function updateStatus(context) {
   // center): the bar asks for a choice, for whichever chat it is.
   const asking = awaitingAnswer();
   if (asking) {
-    statusItem.text = `$(bell) ${chatName(asking).slice(1, -1).slice(0, 20)} ${mmss(live(asking))} · click to choose${autoElsewhere}`;
+    statusItem.text = `$(bell) ${chatName(asking).slice(1, -1).slice(0, 20)} ${countdown(asking)} · click to choose${autoElsewhere}`;
     statusItem.tooltip = new vscode.MarkdownString(`**Cache expires in ${Math.round(live(asking))} s:** ${describe(asking).replace(/[\\`*_[\]<>]/g, "")}.  \n` +
       `No click: ${noClickText(stateFor(asking.id), asking)}. Click to keep it warm, summarize or ignore.`, true);
     statusItem.backgroundColor = red || new vscode.ThemeColor("statusBarItem.warningBackground");
@@ -1988,7 +1991,7 @@ function updateStatus(context) {
   const costlyRestart = r <= 0 && !s.busy && s.ctx >= thresholdTokens();
   if (s.busy) statusItem.text = `$(sync~spin) working · ${clockText(s)}${autoElsewhere}${others}`;
   else if (r > 0) {
-    statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} ${mmss(r)}` +
+    statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} ${countdown(s, r)}` +
       (autoHere || (st.mode === "once" ? " · armed" : "")) + autoElsewhere + others;
   } else statusItem.text = (costlyRestart ? "$(warning)" : "$(circle-slash)") + " expired" +
     (s.cost ? ` · +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;

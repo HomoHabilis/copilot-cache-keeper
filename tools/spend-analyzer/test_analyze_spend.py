@@ -107,6 +107,11 @@ class LifetimeTests(unittest.TestCase):
         spend.learn_measured_ttls(calls)
         self.assertEqual(spend.ttl_for("gpt-5.6-luna"), 1140)
 
+    def test_short_measured_gap_is_not_a_lifetime(self):
+        # a hit after 74 s only proves at least 74 s: not enough to judge expiries
+        spend.MEASURED_TTLS["gpt-6-astra"] = 74
+        self.assertIsNone(spend.ttl_for("gpt-6-astra"))
+
     def test_miss_without_lifetime_data_is_not_called_expired(self):
         calls = [spend.call(source="vscode", session="s", ts=t, model="new-model", ctx=80_000, cached=0, credits=1.0)
                  for t in (0, 3_600_000)]

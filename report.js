@@ -109,8 +109,11 @@ function lifetime(c, model, measured, overrides) {
   if (c && c.ttl) return c.ttl;
   if (overrides[model]) return overrides[model];
   if (core.ttlSource(model) === "Copilot CLI/SDK log") return core.ttlFor(model);
+  // a measured gap is only a minimum: it counts once it beats the 5 min guess (or the known value) by
+  // a margin, rounded down to the minute, the same rule as the warnings (core.setMeasuredTtls)
   const known = core.knownTtl(model);
-  if (measured[model]) return Math.max(measured[model], known || 0);
+  const m = measured[model];
+  if (m && m > (known || core.defaultTtl(model)) + core.MEASURED_MARGIN) return Math.floor(m / 60) * 60;
   return known;
 }
 
@@ -260,7 +263,10 @@ function analyzeSpend(chats, { since = 0, now = Date.now(), ttlOverrides = {} } 
   }
   return {
     total, calls: recs.length, chats: perChat.length, unpriced, unpricedModels: [...unpricedModels].sort(),
-    unknownLifetime: [...unknownLifetime].sort(), measured,
+    unknownLifetime: [...unknownLifetime].sort(),
+    // the measured lifetimes the report used (longer than the guess or known value, by a margin)
+    measured: Object.fromEntries(Object.entries(measured).filter(([m, g]) =>
+      g > (core.knownTtl(m) || core.defaultTtl(m)) + core.MEASURED_MARGIN).map(([m, g]) => [m, Math.floor(g / 60) * 60])),
     factors: [
       { name: "Expired caches after pauses", credits: sum(expired), count: expired.length,
         what: "Calls that re-sent their whole context after a pause longer than the cache lifetime.",
@@ -348,7 +354,7 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
     "the pause since the chat's previous call was longer than the model's cache lifetime. Extra credits: the re-sent part " +
     "at the uncached price minus the cache price.",
     "- Cache lifetimes, from data only: what the call's log says (Copilot SDK, Claude), Copilot CLI/SDK logs for the model, " +
-    "the longest gap after which your Local chats still hit the cache" +
+    "the longest gap after which your Local chats still hit the cache, once over 6 min" +
     (Object.keys(a.measured).length ? ` (${Object.entries(a.measured).map(([m, g]) => `${m} ≥${g} s`).join(", ")})` : "") +
     ", else the known values (Claude 5 min, Sol 6.1 30 min)." +
     (a.unknownLifetime.length ? ` No data for ${a.unknownLifetime.join(", ")}: no expiry judged for them.` : ""),

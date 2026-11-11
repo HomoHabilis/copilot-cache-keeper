@@ -2208,6 +2208,32 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("a model with no lifetime data: 5 min assumed and shown as a guess (~, warning, tooltip)", async () => {
+    const h = await harness({ answer: never, settings: { minCredits: 0 } });
+    try {
+      // you switch the chat to a model no log or built-in value says anything about
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Go on with the new model" } },
+                { type: "turn_start", ts: h.clock + 5 },
+                { type: "llm_request", ts: h.clock + 10, dur: 500, attrs: { debugName: "panel/editAgent", model: "brand-new-model",
+                  inputTokens: 41000, cachedTokens: 0, outputTokens: 4 } },
+                { type: "turn_end", ts: h.clock + 600 }]);
+      await h.run(5);
+      assert.ok(/^\$\(flame\) ~\d:\d\d/.test(h.status.text), h.status.text);
+      await h.run(300, () => h.warnings.length > 0);
+      const w = (h.warnings[0] || {}).msg || "";
+      assert.ok(/expires in ~\d+s \(lifetime assumed: no data for this model\)\./.test(w), w);
+    } finally { h.close(); }
+    assert.strictEqual(core.ttlSource("brand-new-model"), "assumed: no data for this model");
+    assert.strictEqual(core.ttlFor("brand-new-model"), 300);
+    assert.strictEqual(core.ttlSource("claude-opus-5.5"), "default");
+    const t0 = now - 60000;
+    const s = core.analyzeTrace("local", "/x/new", { events: [{ t: "user", ts: t0, text: "go" }, { t: "turn_start", ts: t0 },
+      { t: "call", ts: t0 + 10, end: t0 + 500, model: "brand-new-model", input: 50000, cached: 0, out: 5 }, { t: "turn_end", ts: t0 + 600 }], info: {} },
+      { now });
+    assert.strictEqual(s.ttl, 300);
+    assert.strictEqual(s.ttlAssumed, true);
+  });
+
   await check("warning: short, what no click does; 3 buttons (main, second, More…) that fit; a cost button works", async () => {
     let buttons;
     const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return b[0]; } return never(); } });

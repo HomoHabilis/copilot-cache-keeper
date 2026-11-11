@@ -58,7 +58,8 @@ with `--input <folder>`.
   This can happen on a remote VM with only Copilot SDK logs. Use `--input <folder>` with VS Code
   logs from another machine containing `workspaceStorage/.../GitHub.copilot-chat/debug-logs/.../models.json`.
 - **Cache lifetimes, from data only:** what a call's log says (Claude's cache tier), Copilot
-  CLI/SDK logs, and the longest gap after which a Local chat still hit the cache. Otherwise the known
+  CLI/SDK logs, and the longest gap after which a Local chat still hit the cache, once it is more than
+  a minute longer than 5 min (a shorter one only proves a minimum). Otherwise the known
   values (Claude 300 s, Sol 6.1 1800 s). A model with no data gets no lifetime, and no expiry is
   judged for it (its misses show as "unknown cache lifetime").
 - **Factors overlap**, for example an expired cache on a large context, so they aren't meant to
