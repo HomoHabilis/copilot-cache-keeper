@@ -53,6 +53,10 @@ with `--input <folder>`.
 - **Prices** come from the newest price sheet Copilot sent to VS Code (`models.json` in the debug
   logs), including context-size tiers. VS Code debug logs give exact credits, Copilot CLI is scaled
   to its own reported totals, and OpenCode uses its own cost (in dollars × 100).
+  If a model has no matching price sheet and its credits cannot be computed, the report warns and
+  excludes those calls from spending totals. Their cache misses remain visible with unknown costs.
+  This can happen on a remote VM with only Copilot SDK logs. Use `--input <folder>` with VS Code
+  logs from another machine containing `workspaceStorage/.../GitHub.copilot-chat/debug-logs/.../models.json`.
 - **Cache lifetimes:** Claude 300 s, Sol 6.1 1800 s, others 300 s. Learned from Copilot CLI logs
   when present.
 - **Factors overlap**, for example an expired cache on a large context, so they aren't meant to

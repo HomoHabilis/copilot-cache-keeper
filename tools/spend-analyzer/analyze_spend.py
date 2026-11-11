@@ -832,6 +832,7 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
     ]
     factors.sort(key=lambda f: -f[1])
     return dict(total=total, calls=model_calls, misses=misses, expired=expired, effort_rows=effort_rows,
+                unpriced=[c for c in calls if c["kind"] != "message" and c["credits"] is None],
                 mcp_frac=default_frac, tool_share=default_share,
                 ctx_rows=ctx_rows, setting_rows=setting_rows, pause=pause, sessions=sess, factors=factors,
                 comp=comp, turns=t_ok)
@@ -844,6 +845,12 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
     w(f"# Agent spend report ({now}, last {days} days)\n")
     w("Credits: 1 credit = $0.01. " + ", ".join(f"{k}: {v}" for k, v in sources.items()) + ".\n")
     mc = a["calls"]
+    if a["unpriced"]:
+        models = ", ".join(sorted({c["model"] for c in a["unpriced"]}))
+        w(f"**Warning:** Credits are unknown for {len(a['unpriced'])} model calls ({models}). "
+                "These calls are excluded from spending totals; cost and savings estimates are incomplete. "
+                "Model prices may be missing on this machine. Use `--input DIR` with VS Code logs containing "
+                "a matching `workspaceStorage/.../GitHub.copilot-chat/debug-logs/.../models.json` price sheet.\n")
     w(f"**Total: {fmt(a['total'])} credits** (${a['total'] / 100:,.2f}) over {len(mc)} model calls "
       f"in {len(a['sessions'])} sessions.\n")
 
@@ -877,9 +884,11 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
         w("| When | Tool | Workspace | Model | Context | Cached | Pause | Credits | Extra vs cached | Cause |")
         w("|---|---|---|---|---:|---:|---:|---:|---:|---|")
         for m in sorted(a["misses"], key=lambda m: -m["extra"])[:15]:
+            credits = f"{m['credits']:.1f}" if m["credits"] is not None else "unknown"
+            extra = f"{m['extra']:.1f}" if rates(m["model"], m["ctx"]) is not None else "unknown"
             w(f"| {dt.datetime.fromtimestamp(m['ts'] / 1000):%m-%d %H:%M} | {m['source']} | {m['workspace']} | {m['model']} | "
               f"{m['ctx'] / 1000:.0f}k | {100 * m['cached'] / max(m['ctx'], 1):.0f}% | {m['gap'] / 60:.0f} min | "
-              f"{m['credits']:.1f} | {m['extra']:.1f} | {m['cause']} |")
+              f"{credits} | {extra} | {m['cause']} |")
     else:
         w("None found.\n")
 
@@ -970,6 +979,12 @@ def main() -> None:
         sys.exit("No agent logs with usage found in the period.")
 
     a = analyze(calls, turns, cli_comp)
+    if a["unpriced"]:
+        models = ", ".join(sorted({c["model"] for c in a["unpriced"]}))
+        print(f"Warning: credits unknown for {len(a['unpriced'])} model calls ({models}); "
+              "spending totals exclude them and savings estimates are incomplete. "
+              "Use --input DIR with VS Code debug logs containing a matching models.json price sheet.",
+              file=sys.stderr)
     text = report(a, calls, args.days, sources)
     out = args.out or Path(f"spend-report-{dt.date.today()}.md")
     out.write_text(text, encoding="utf-8")
