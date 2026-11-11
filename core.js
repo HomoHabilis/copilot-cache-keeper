@@ -108,7 +108,10 @@ function isKeepAlive(text) { return KEEPALIVE_SET.has(String(text || "").trim())
 // The handoff summary request varies (file name, sizes), so it can't be matched exactly: it starts
 // with a short tag in the chat's language instead. Only add tags, for the same reason as above.
 const SUMMARY_TAGS = { en: "[summary]", it: "[riepilogo]", fr: "[résumé]", es: "[resumen]", de: "[Zusammenfassung]" };
-const OWN_PREFIXES = [MARKER, ...Object.values(SUMMARY_TAGS)];
+// A compaction is VS Code's (or the harness's) own /compact command, with what to keep in the chat's
+// language. Typed by you or sent by Cache Keeper, it is not a message to the agent.
+const COMPACT_COMMAND = "/compact";
+const OWN_PREFIXES = [MARKER, ...Object.values(SUMMARY_TAGS), COMPACT_COMMAND];
 
 /**
  * The handoff summary request, in `lang` (English if not covered). `x`: { rel, turns, compactions,
@@ -150,6 +153,27 @@ function summaryPrompt(lang, x) {
   return t[lang] || t.en;
 }
 
+/**
+ * The compaction request, in `lang` (English if not covered): /compact with what the summary must
+ * keep, so the chat can go on after the pause. The harness decides how long the summary is and keeps
+ * the most recent turns as they are.
+ */
+function compactPrompt(lang) {
+  const focus = {
+    en: "I'm pausing. Keep: the goal, what is done, current state, decisions and why, files changed, " +
+      "open problems, failed approaches to avoid, exact next steps.",
+    it: "Faccio una pausa. Conserva: obiettivo, cosa è fatto, stato attuale, decisioni e motivi, file modificati, " +
+      "problemi aperti, approcci falliti da evitare, prossimi passi precisi.",
+    fr: "Je fais une pause. Garde : l'objectif, ce qui est fait, l'état actuel, les décisions et pourquoi, les fichiers modifiés, " +
+      "les problèmes ouverts, les approches qui ont échoué, les prochaines étapes précises.",
+    es: "Hago una pausa. Conserva: el objetivo, qué está hecho, el estado actual, las decisiones y por qué, los archivos cambiados, " +
+      "los problemas abiertos, los enfoques fallidos a evitar, los próximos pasos exactos.",
+    de: "Ich mache eine Pause. Behalte: das Ziel, was erledigt ist, den aktuellen Stand, Entscheidungen und Gründe, geänderte Dateien, " +
+      "offene Probleme, gescheiterte Ansätze, die genauen nächsten Schritte.",
+  };
+  return `${COMPACT_COMMAND} ${focus[lang] || focus.en}`;
+}
+
 /** The first message of a new chat from a handoff file (you finish and send it), in `lang`. */
 function handoffStart(lang) {
   return { en: "Continue from the attached handoff summary. ", it: "Continua dal riepilogo di passaggio allegato. ",
@@ -180,6 +204,10 @@ const SUMMARY_MAX_SHARE = 1 / 3;
 // Only write one automatically when it, plus starting a new chat from it, costs at most this share
 // of continuing the chat cold: the margin pays for the cases where you continue the old chat anyway.
 const SUMMARY_PAYS_SHARE = 0.75;
+// A compaction keeps the most recent turns as they are (VS Code: recent rounds, tool results capped).
+// Their size isn't known before it runs: assume this many tokens, at most what the chat holds beyond
+// a fresh chat's first prompt. Once it has run, the log tells (the next call's prompt).
+const COMPACT_TAIL = 15000;
 
 /** Local disk access, for tests and command-line use. */
 const nodeIo = (() => {
@@ -396,6 +424,7 @@ function priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats) {
   const missExtra = ctx * r.write - hit;
   const perWord = TOKENS_PER_WORD * (r.out + r.write);
   if (perWord > 0) words = summaryWords(stats, (SUMMARY_MAX_SHARE * missExtra - SUMMARY_CALLS * hit) / perWord);
+  const compacted = compactedSize(ctx, firstCtx, stats);
   return {
     words,
     cost: {
@@ -403,8 +432,22 @@ function priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats) {
       missExtra,                                     // what letting the cache expire adds to the next message
       summary: SUMMARY_CALLS * hit + words * perWord,
       restart: (firstCtx + words * TOKENS_PER_WORD) * fresh.write, // first message of a new chat built from the summary
+      // compaction: one call reads the warm context and writes the summary; your next message then
+      // re-sends the compacted chat (system prompt, summary, recent turns) uncached
+      compact: hit + summaryWords(stats) * TOKENS_PER_WORD * r.out,
+      compactResume: compacted * fresh.write,
+      compacted,
     },
   };
+}
+
+/**
+ * Estimated prompt size of a chat after a compaction: a fresh chat's first prompt, the summary
+ * (sized like a handoff summary) and the recent turns it keeps. Never more than the chat holds now.
+ */
+function compactedSize(ctx, firstCtx, stats) {
+  const kept = Math.min(COMPACT_TAIL, Math.max(0, ctx - firstCtx));
+  return Math.round(Math.min(ctx, firstCtx + summaryWords(stats) * TOKENS_PER_WORD + kept));
 }
 
 /**
@@ -431,6 +474,16 @@ function keepAliveFixedPart(pairs) {
  *   priceFor(model) -> Copilot price sheet (token_prices) when the log carries no prices,
  *   credits: credits spent, when known from elsewhere (else summed from the calls, or estimated).
  */
+// Compactions that leave no trace in the chat's log: VS Code 1.146 logs nothing at all for a Local
+// /compact (no message, no summarizing call, not in the transcript either). Cache Keeper notes the
+// ones it sent here, as "<kind>|<dir>" -> time (the log's clock), and analyzeTrace counts them like
+// logged ones. Kept for this window's life only.
+const unloggedCompactions = new Map();
+function noteCompaction(kind, dir, ts) {
+  const k = `${kind}|${dir}`;
+  unloggedCompactions.set(k, Math.max(unloggedCompactions.get(k) || 0, ts));
+}
+
 function analyzeTrace(kind, dir, trace, opts = {}) {
   if (!trace) return null;
   const { events, info = {} } = trace;
@@ -439,7 +492,17 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   if (!calls.length) return null;
   const last = calls[calls.length - 1];
   const model = last.model || "?";
-  const ctx = last.input;                            // after any compaction: what a miss re-sends
+  // Compacted since the last call (the /compact command, or an idle compaction): the next message
+  // re-sends the compacted chat, not what the last call read. Its size is known only once a call
+  // has run on it, so until then it is estimated.
+  const compactions_ = events.filter(e => e.t === "compaction");
+  // ... or one Cache Keeper knows ran but the log doesn't show (noteCompaction)
+  const compactedAt = Math.max(compactions_.length ? compactions_[compactions_.length - 1].ts : 0,
+    unloggedCompactions.get(`${kind}|${dir}`) || 0);
+  const compactedIdle = compactedAt > (last.end || last.ts);
+  // a compaction that has started (some harnesses log its start at once, its end much later)
+  const compactStartedAt = Math.max(0, ...events.filter(e => e.t === "compacting").map(e => e.ts));
+  let ctx = last.input;                              // after any compaction: what a miss re-sends
   // Size of a fresh chat's first prompt: about the chat's first call, minus any big attachments in
   // that first message (capped).
   const firstCtx = Math.min(calls[0].input, 40000);
@@ -475,6 +538,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const files = new Set(events.filter(e => e.t === "edit").flatMap(e => e.files || []));
   const compactions = Math.max(info.compactions || 0, events.filter(e => e.t === "compaction").length);
   const stats = { ctx, turns: real.length, compactions, files: files.size, calls: calls.length };
+  if (compactedIdle) ctx = stats.ctx = compactedSize(ctx, firstCtx, { ...stats, compactions: compactions - 1 });
   // Tokens a keep-alive adds uncached: measured on this chat's earlier keep-alives when there are
   // any (exact); otherwise VS Code's context block + our message + the agent's last reply, which is
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
@@ -488,6 +552,18 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     pairs.push({ input: calls[i].input || 0, cached: calls[i].cached || 0, prevOut: calls[i - 1].out || 0 });
   }
   const heartbeatNew = keepAliveFixedPart(pairs) + (last.out || 0);
+  // The model call that answered the last message in the chat (yours or Cache Keeper's), with how
+  // much of it was cached and how long after the previous call: whether the cache was still warm.
+  let lastMsgCall = null;
+  const lastMsg = users[users.length - 1];
+  if (lastMsg) {
+    const i = calls.findIndex(c => c.ts >= lastMsg.ts - slack);
+    if (i > 0) {
+      const c = calls[i], p = calls[i - 1];
+      lastMsgCall = { at: lastMsg.ts, own: isOurs(lastMsg), input: c.input || 0, cached: c.cached || 0,
+                      sinceStart: Math.round((c.ts - p.ts) / 1000), sinceEnd: Math.round((c.ts - (p.end || p.ts)) / 1000) };
+    }
+  }
   // Prices: what the log says this chat was billed per token (exact), else Copilot's price sheet,
   // with the write price corrected from what calls with a known cost were billed. Observed on Local
   // chats: a cold call is billed near the input price, below the sheet's cache_write_price, so the
@@ -527,13 +603,14 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom,
-    lastEnd: last.end || last.ts, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
+    lastEnd: last.end || last.ts, compactedAt, compactStartedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
     remaining: ttl - (now - cacheFrom) / 1000,
     lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,
+    lastMsgCall,
     title: title.length > 50 ? title.slice(0, 47) + "..." : title,   // which chat a warning is about
     // Last message you typed yourself (not one of ours): tells whether a handoff is still current.
     lastRealUserTs: Math.max(0, ...real.map(u => u.ts || 0)),
@@ -541,9 +618,51 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   };
 }
 
+// Logs are read every few seconds and most have not changed: the same text gives the same trace, so
+// the last trace of each log is kept instead of parsing every line again. One entry per log (the
+// text is already held by the file reader's cache); a cached trace is shared, so it is never changed.
+// A log that grew (they are append-only) is parsed only from where the last parse stopped: the
+// whole lines already read keep their parsed objects. A log that changed otherwise (rewritten,
+// truncated) is parsed again in full.
+const traceCache = new Map();  // log path -> { text, extra, trace, done, lines }
+const TRACE_CACHE_MAX = 500;
+const GROWING_KEPT = 10;       // logs whose parsed lines are kept for an incremental parse
+/** The log's complete lines as objects, reusing what an earlier parse of the same log read. */
+function parseGrowing(prev, text) {
+  text = String(text || "");
+  const end = text.lastIndexOf("\n") + 1;              // a last line without "\n" may still be written
+  let lines, from = 0;
+  if (prev && prev.lines && prev.done <= end && text.startsWith(prev.text.slice(0, prev.done))) { lines = prev.lines.slice(); from = prev.done; }
+  else lines = [];
+  for (const line of text.slice(from, end).split("\n")) {
+    if (!line.trim()) continue;
+    try { lines.push(JSON.parse(line)); } catch { /* not JSON */ }
+  }
+  const rest = text.slice(end).trim();                  // the unfinished last line, if it already parses
+  let tail = null;
+  if (rest) { try { tail = JSON.parse(rest); } catch { /* still being written */ } }
+  return { lines, done: end, all: tail ? [...lines, tail] : lines };
+}
+/** translate(text, extra), or the trace of the same text of the same log from last time. */
+function cachedTrace(key, text, translate, extra) {
+  const ex = extra === undefined ? "" : JSON.stringify(extra);
+  const hit = traceCache.get(key);
+  if (hit && hit.text === text && hit.extra === ex) return hit.trace;
+  const parsed = parseGrowing(hit, text);
+  const trace = translate(parsed.all, extra);
+  traceCache.delete(key);
+  traceCache.set(key, { text, extra: ex, trace, done: parsed.done, lines: parsed.lines });
+  // parsed lines only for the logs that changed most recently (the ones still growing): the others
+  // keep just their trace, and are parsed in full if they ever change again
+  let n = 0;
+  for (const v of [...traceCache.values()].reverse()) if (v.lines && ++n > GROWING_KEPT) { v.lines = null; v.done = 0; }
+  if (traceCache.size > TRACE_CACHE_MAX) traceCache.delete(traceCache.keys().next().value);
+  return trace;
+}
+
 /** State of one Local chat from its Agent Debug Log (main.jsonl + models.json). */
 function analyze(dir, mainText, modelsText, now = Date.now(), ttlOverrides = {}) {
-  return analyzeTrace("local", dir, harnesses.localTrace(mainText),
+  return analyzeTrace("local", dir, cachedTrace("local|" + dir, mainText, harnesses.localTrace),
     { now, ttlOverrides, priceFor: m => modelsText ? priceSheetFrom(modelsText, m) : null });
 }
 
@@ -613,7 +732,7 @@ function parseYamlFlat(text) {
 
 /** State of one Copilot SDK chat from its events.jsonl, same shape as analyze(). Null without a call. */
 function analyzeSdk(dir, eventsText, yaml = {}, now = Date.now(), ttlOverrides = {}) {
-  return analyzeTrace("sdk", dir, harnesses.sdkTrace(eventsText, yaml), { now, ttlOverrides });
+  return analyzeTrace("sdk", dir, cachedTrace("sdk|" + dir, eventsText, harnesses.sdkTrace, yaml), { now, ttlOverrides });
 }
 
 async function readSdkSession(io, dir, now = Date.now(), ttlOverrides = {}) {
@@ -697,6 +816,15 @@ function summaryPays(session) {
 }
 
 /**
+ * Whether a compaction is worth running automatically: by the same rule as a summary, it and your
+ * next message on the compacted chat cost clearly less than continuing this chat after expiry.
+ */
+function compactPays(session) {
+  const c = session.cost;
+  return !!c && c.compact + c.compactResume <= SUMMARY_PAYS_SHARE * c.missExtra;
+}
+
+/**
  * Order of the status-bar list: the chat you last typed in first (the one you are most likely
  * thinking about), then the other warm or working chats by soonest expiry (the next one to need a
  * decision; this order holds still while the countdowns run), then expired ones, newest first.
@@ -715,9 +843,9 @@ function fmt(credits) {
 }
 
 module.exports = {
-  summaryPays,
+  summaryPays, compactPays, compactPrompt, compactedSize, COMPACT_COMMAND,
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace,
+  analyzeTrace, cachedTrace, parseGrowing, noteCompaction,
 };

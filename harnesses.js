@@ -17,7 +17,7 @@
 //   { t: "reply", ts, text }      the agent's answer (for the language of our messages)
 //   { t: "edit", ts, files }      files the agent edited (for the summary length)
 //   { t: "compaction", ts }       the history was summarized
-// Each translator returns { events, info } (info: cwd, gitRoot, stepTurns, compactions) or
+// Each translator takes the log's text, or its lines already parsed (an array), and returns { events, info } (info: cwd, gitRoot, stepTurns, compactions) or
 // null when the log has no model call yet.
 "use strict";
 
@@ -29,6 +29,8 @@ function parseJsonl(text) {
   }
   return out;
 }
+/** A log's lines as objects: from its text, or already parsed (core.cachedTrace parses only what was appended). */
+function entries(log) { return Array.isArray(log) ? log : parseJsonl(log); }
 const time = s => Date.parse(s || "") || 0;
 const byTime = list => list.sort((a, b) => a.ts - b.ts);
 const done = (events, info = {}) => events.some(e => e.t === "call") ? { events: byTime(events), info } : null;
@@ -49,7 +51,7 @@ const LOCAL_EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edi
 
 function localTrace(mainText) {
   const ev = [];
-  for (const e of parseJsonl(mainText)) {
+  for (const e of entries(mainText)) {
     const a = e.attrs || {}, ts = e.ts || 0;
     if (e.type === "user_message") {
       // Copilot leaves a turn open, with no turn_end, when the request is stopped or when you send a
@@ -91,7 +93,7 @@ function sdkRates(u) {
 
 function sdkTrace(eventsText, yaml = {}) {
   const ev = [];
-  for (const e of parseJsonl(eventsText)) {
+  for (const e of entries(eventsText)) {
     const d = e.data || {}, ts = time(e.timestamp);
     switch (e.type) {
       // a message sent while the agent works gets a <reminder> appended
@@ -117,7 +119,9 @@ function sdkTrace(eventsText, yaml = {}) {
         break;
       }
       default:
-        if (/compaction_(complete|completed|end)$/.test(e.type || "")) ev.push({ t: "compaction", ts });
+        if (/compaction_(complete|completed|end)$/.test(e.type || "")) ev.push({ t: "compaction", ts }, { t: "turn_end", ts });
+        // logged at once (the end can come many seconds later): the compaction is running, the chat busy
+        else if (/compaction_start(ed)?$/.test(e.type || "")) ev.push({ t: "compacting", ts }, { t: "turn_start", ts });
     }
   }
   // An SDK request is several turns (one per model call and its tools), with a few ms between them.
@@ -138,15 +142,28 @@ const CLAUDE_TURN_DONE = /^(end_turn|stop_sequence|max_tokens|refusal)$/;
 function claudeTrace(text) {
   const ev = [], starts = new Map(), calls = new Map();
   let cwd = "";
-  for (const e of parseJsonl(text)) {
+  for (const e of entries(text)) {
     const ts = time(e.timestamp), m = e.message && typeof e.message === "object" ? e.message : {};
     if (e.isSidechain) { if (ts) ev.push({ t: "activity", ts }); continue; }   // a subagent: alive, other cache
     if (e.cwd) cwd = e.cwd;
     if (e.type === "queue-operation" && e.operation === "enqueue") ev.push({ t: "queued", ts });
     else if (e.type === "api-request" && e.id) starts.set(e.id, ts);
     else if (e.type === "system" && e.subtype === "compact_boundary") ev.push({ t: "compaction", ts });
-    else if (e.type === "user" && !e.isMeta) {
+    else if (e.type === "user" && (e.isCompactSummary || e.isVisibleInTranscriptOnly)) {
+      // the summary a compaction carries over ("This session is being continued..."): not a message
+      ev.push({ t: "activity", ts });
+    } else if (e.type === "user" && !e.isMeta) {
       const c = m.content;
+      // a local command (/compact): logged as <command-name> + <command-args>, its output as
+      // <local-command-stdout>, with no model turn of its own. One message; the output ends it.
+      const raw = typeof c === "string" ? c : "";
+      const cmd = /^\s*<command-name>([^<]*)<\/command-name>/.exec(raw);
+      if (cmd) {
+        const args = (/<command-args>([\s\S]*?)<\/command-args>/.exec(raw) || [])[1] || "";
+        ev.push({ t: "user", ts, text: `${cmd[1].trim()} ${args.trim()}`.trim() }, { t: "turn_start", ts });
+        continue;
+      }
+      if (/^\s*<local-command-(stdout|stderr)>/.test(raw)) { ev.push({ t: "turn_end", ts }); continue; }
       // what you typed only: the harness adds attachments as separate <system-reminder> text blocks
       const textPart = withoutReminders(typeof c === "string" ? c
         : Array.isArray(c) ? c.filter(p => p && p.type === "text").map(p => p.text).join("\n") : "");
@@ -186,7 +203,7 @@ function codexText(content) {
 function codexTrace(text) {
   const ev = [];
   let model = "?", cwd = "", lastInput = 0;
-  for (const e of parseJsonl(text)) {
+  for (const e of entries(text)) {
     const p = e.payload || {}, ts = time(e.timestamp);
     if (e.type === "session_meta") { cwd = p.cwd || cwd; continue; }
     if (e.type === "turn_context") { model = p.model || model; cwd = p.cwd || cwd; continue; }

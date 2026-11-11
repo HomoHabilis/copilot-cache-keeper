@@ -33,6 +33,10 @@
         "title": "Cache Keeper: Write handoff summary now"
       },
       {
+        "command": "cacheKeeper.compactNow",
+        "title": "Cache Keeper: Compact chat now"
+      },
+      {
         "command": "cacheKeeper.stop",
         "title": "Cache Keeper: Stop keeping warm"
       },
@@ -53,12 +57,18 @@
           "type": "number",
           "default": 100000,
           "minimum": 0,
-          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary (if cacheKeeper.autoSummary is on and the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
+          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary or compacts the chat (cacheKeeper.autoAction, when the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
         },
-        "cacheKeeper.autoSummary": {
-          "type": "boolean",
-          "default": true,
-          "description": "Above the threshold, write a handoff summary if nobody answers the warning (only when it and a new chat from it cost clearly less than continuing this chat cold)."
+        "cacheKeeper.autoAction": {
+          "type": "string",
+          "enum": ["summary", "compact", "off"],
+          "enumDescriptions": [
+            "Write a handoff summary file. The chat is left as it is; start a new chat from the file when you are back.",
+            "Compact the chat (/compact): older turns are summarized in place, the recent ones kept. You just go on in the same chat. It changes the chat and can't be undone. Local chats only for now; others get a summary.",
+            "Nothing automatic: the cache just expires."
+          ],
+          "default": "summary",
+          "description": "Above the threshold, what happens if nobody answers the warning, and when keeping warm ends (with cacheKeeper.summaryAfterKeepWarm). Only when it and your next message after it cost clearly less than continuing the chat cold."
         },
         "cacheKeeper.autoKeepWarmCapPercent": {
           "type": "number",
@@ -87,7 +97,7 @@
         "cacheKeeper.summaryAfterKeepWarm": {
           "type": "boolean",
           "default": true,
-          "description": "Write a handoff summary when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap, if it and a new chat from it cost clearly less than continuing this chat cold. Off: the cache just expires."
+          "description": "Write a handoff summary (or compact, with cacheKeeper.autoAction set to compact) when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap, if it costs clearly less than continuing this chat cold. Off: the cache just expires."
         },
         "cacheKeeper.minCredits": {
           "type": "number",
@@ -130,6 +140,18 @@
           "minimum": 1,
           "maximum": 168,
           "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."
+        },
+        "cacheKeeper.handoffMaxAgeDays": {
+          "type": "number",
+          "default": 7,
+          "minimum": 0,
+          "description": "Delete handoff summaries in .copilot-handoff/ older than this many days, except the newest cacheKeeper.handoffKeep ones, which always stay. 0 = never delete. Deleted files go to the trash where possible."
+        },
+        "cacheKeeper.handoffKeep": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "description": "How many of the newest handoff summaries in each .copilot-handoff/ folder are always kept, however old (see cacheKeeper.handoffMaxAgeDays)."
         }
       }
     }
