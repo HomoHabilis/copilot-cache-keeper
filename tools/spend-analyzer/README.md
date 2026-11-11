@@ -27,7 +27,7 @@ It finds these by itself, wherever they are on the machine:
 |---|---|---|
 | VS Code Copilot Agent Debug Logs | `…/workspaceStorage/<id>/GitHub.copilot-chat/debug-logs/` (VS Code server in WSL/SSH/containers, local VS Code on Windows/macOS/Linux, Windows from WSL) | every model call: context, cached tokens, output, effort, **exact credits** |
 | VS Code chat session files | `…/workspaceStorage/<id>/chatSessions/*.jsonl` | every message: credits, context-size setting, effort, share of the prompt taken by tool definitions. Used for older chats that no longer have debug logs |
-| Copilot CLI, and VS Code "Copilot" harness chats (Copilot SDK, shown separately) | `~/.copilot/session-state/*/events.jsonl` | every call: prompt, cache read/write, reasoning tokens, cache expiry time; scaled to the session's exact total |
+| Copilot CLI, and VS Code "Copilot" harness chats (Copilot SDK, shown separately) | `~/.copilot/session-state/*/events.jsonl` | every call: prompt, cache read/write, reasoning tokens, cache expiry time; credits as billed per call; what the session's billed total has beyond its calls (a compaction, or a session that logs only its total) counts as one more line; older logs without per-call credits are scaled to the session total |
 | VS Code Claude harness chats | listed in VS Code's `agent-host.db`; log in `~/.claude/projects/*/<id>.jsonl` | every call: prompt, cache read/write; scaled to the credits Copilot billed for the chat (`agentSessionData/<id>/session.db`). Only chats VS Code created: your own Claude Code sessions, billed by Anthropic, are left out |
 | VS Code Codex harness chats | listed in VS Code's `agent-host.db`; log in `~/.codex/sessions/Y/M/D/rollout-*.jsonl` | every call: prompt, cached tokens, reasoning; credits from Copilot's prices |
 | OpenCode | `~/.local/share/opencode/opencode.db` | every call: tokens and cost |
@@ -51,10 +51,17 @@ with `--input <folder>`.
 ## How the estimates work
 
 - **Prices** come from the newest price sheet Copilot sent to VS Code (`models.json` in the debug
-  logs), including context-size tiers. VS Code debug logs give exact credits, Copilot CLI is scaled
-  to its own reported totals, and OpenCode uses its own cost (in dollars × 100).
-- **Cache lifetimes:** Claude 300 s, Sol 6.1 1800 s, others 300 s. Learned from Copilot CLI logs
-  when present.
+  logs), including context-size tiers. VS Code debug logs give exact credits, Copilot CLI/SDK give
+  credits per call plus whatever their session total adds (else scaled to that total), and OpenCode uses its own cost (in dollars × 100).
+  If a model has no matching price sheet and its credits cannot be computed, the report warns and
+  excludes those calls from spending totals. Their cache misses remain visible with unknown costs.
+  This can happen on a remote VM with only Copilot SDK logs. Use `--input <folder>` with VS Code
+  logs from another machine containing `workspaceStorage/.../GitHub.copilot-chat/debug-logs/.../models.json`.
+- **Cache lifetimes, from data only:** what a call's log says (Claude's cache tier), Copilot
+  CLI/SDK logs, and the longest gap after which a Local chat still hit the cache, once it is more than
+  a minute longer than 5 min (a shorter one only proves a minimum). Otherwise the known
+  values (Claude 300 s, Sol 6.1 1800 s). A model with no data gets no lifetime, and no expiry is
+  judged for it (its misses show as "unknown cache lifetime").
 - **Factors overlap**, for example an expired cache on a large context, so they aren't meant to
   be added up.
 - **Duplicates:** VS Code keeps copies of a chat's file under several workspace folders, for
@@ -65,6 +72,11 @@ with `--input <folder>`.
   `untitled workspace (closed, <date>)`.
 - **Older chats** only have per-message records, so some figures for them are estimated from your
   own debug-log data, and capped so no estimate exceeds what a message actually cost.
+
+**Run from WSL or from Windows, same result.** From WSL it also reads the Windows side
+(`/mnt/c/Users/...`); from Windows it also reads the home folders of the running WSL distros
+(`\\wsl.localhost\<distro>\home\...`, where a WSL window's logs are). Distros that aren't running
+are not started; it lists them so you can start them and run it again.
 
 Reading Windows-side files from WSL is slow: expect about a minute on a machine with a few hundred
 chats.

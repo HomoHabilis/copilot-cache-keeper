@@ -41,6 +41,10 @@
         "title": "Cache Keeper: Stop keeping warm"
       },
       {
+        "command": "cacheKeeper.spendReport",
+        "title": "Cache Keeper: Spend report (last N days)"
+      },
+      {
         "command": "cacheKeeper.diagnose",
         "title": "Cache Keeper: Show which chats are tracked (diagnostics)"
       }

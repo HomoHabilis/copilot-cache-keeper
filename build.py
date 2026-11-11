@@ -62,7 +62,7 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr("[Content_Types].xml", types)
     z.writestr("extension.vsixmanifest", manifest)
     z.writestr("extension/package.json", json.dumps(pkg, indent=2) + "\n")   # with the build's version
-    for f in ("extension.js", "core.js", "sqlite.js", "harnesses.js", "README.md"):
+    for f in ("extension.js", "core.js", "sqlite.js", "harnesses.js", "report.js", "README.md"):
         if (here / f).exists():
             z.write(here / f, f"extension/{f}")
 print(out)

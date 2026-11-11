@@ -308,6 +308,12 @@ function setMeasuredTtls(gaps) {
   return { ...measuredTtls };
 }
 
+/** The built-in lifetime of a model whose lifetime is known (Claude, Sol 6.1), else null: no guess. */
+function knownTtl(model) {
+  const hit = DEFAULT_TTLS.find(([prefix]) => (model || "").startsWith(prefix));
+  return hit ? hit[1] : null;
+}
+
 function defaultTtl(model) {
   const hit = DEFAULT_TTLS.find(([prefix]) => (model || "").startsWith(prefix));
   return hit ? hit[1] : UNKNOWN_TTL;
@@ -319,8 +325,10 @@ function ttlSource(model, overrides = {}) {
   if (overrides[model]) return "setting";
   if (learnedTtls[model]) return "Copilot CLI/SDK log";
   if (measuredTtls[model]) return "measured in your chats";
-  return "default";
+  // Claude and Sol 6.1: known; any other model with no data: 5 min is a guess (shown as such)
+  return knownTtl(model) ? "default" : ASSUMED;
 }
+const ASSUMED = "assumed: no data for this model";
 
 function ttlFor(model, overrides = {}) {
   model = model || "";
@@ -602,7 +610,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const lastUser = users[users.length - 1];
   const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
   return {
-    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom,
+    id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom, ttlAssumed: ttlFrom === ASSUMED,
     lastEnd: last.end || last.ts, compactedAt, compactStartedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
@@ -847,5 +855,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace, cachedTrace, parseGrowing, noteCompaction,
+  analyzeTrace, cachedTrace, parseGrowing, noteCompaction, knownTtl, MEASURED_MARGIN,
 };

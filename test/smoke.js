@@ -163,6 +163,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const logName = { sdk: "events.jsonl", local: "main.jsonl", claude: "claude-sdk-1.jsonl", codex: "rollout-2026-11-03T13-19-13-thread-1.jsonl" }[kind];
   const cwd = sdkCwd || tmp;
   let clock = now;
+  const opened = [];
   const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [], listed = [];
   let status;
   const fakeFs = {
@@ -189,6 +190,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const vscode = {
     env: { remoteName: undefined },
     workspace: { getConfiguration: () => ({ get: k => settings[k] }), fs: fakeFs,
+                 openTextDocument: async o => { opened.push(o.content); return { uri: { scheme: "untitled" } }; },
                  textDocuments: [chatInput, otherInput],
                  onDidChangeTextDocument: f => { changeListeners.push(f); return { dispose() { changeListeners.splice(changeListeners.indexOf(f), 1); } }; },
                  applyEdit: async e => { for (const [u, t] of e.edits) setText([chatInput, otherInput].find(d => d.uri.toString() === u.toString()), t); return true; },
@@ -204,6 +206,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       showInformationMessage: async m => { infos.push(m); return undefined; },
       showErrorMessage: async m => { throw new Error("unexpected error message: " + m); },
       showQuickPick: async items => menu(items),
+      showTextDocument: async () => undefined,
+      showInputBox: async o => o.value,
+      withProgress: async (o, f) => f({ report() {} }),
       // the status-bar list: picks the first chat
       createQuickPick: () => { const qp = { items: [], activeItems: [], selectedItems: [], dispose() {},
         onDidAccept: f => { qp.accept = f; }, onDidHide() {},
@@ -254,6 +259,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       },
     },
     StatusBarAlignment: { Right: 2 },
+    ProgressLocation: { Notification: 15 },
     MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
     ThemeColor: class { constructor(id) { this.id = id; } },
     Range: class { constructor(...a) { this.a = a; } },
@@ -294,7 +300,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   await ext._read();
   const h = {
     sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
-    memento, globalStorage, sdkRoot, lists, logs, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
+    memento, globalStorage, sdkRoot, lists, logs, opened, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
     userTypes() {
@@ -1406,6 +1412,143 @@ const never = () => new Promise(() => {});
   });
 
 
+  // ---------------------------------------------------------------- spend report
+  const report = require("../report");
+  await check("spend report: billed credits, Claude scaled to its bill, Codex priced, an expired cache found and costed", () => {
+    const sheet = { batch_size: 1e6, default: { cache_read_price: 50, cache_write_price: 625, input_price: 500, output_price: 2500 } };
+    const t0 = now - 3 * 3600000;
+    const local = { kind: "local", id: "l1", title: "Refactor", workspace: "app", sheetFor: () => sheet, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "claude-opus-5.5", input: 120000, cached: 0, out: 500, credits: 50 },
+      // 20 min later: the 300 s cache has expired, the whole prompt is sent again
+      { t: "call", ts: t0 + 1200000, end: t0 + 1201000, model: "claude-opus-5.5", input: 121000, cached: 0, out: 500, credits: 51 }] };
+    const claude = { kind: "claude", id: "c1", title: "Fix tests", sheetFor: () => sheet, billed: 3, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "claude-haiku-5.5", input: 20000, cached: 0, out: 100 },
+      { t: "call", ts: t0 + 60000, end: t0 + 61000, model: "claude-haiku-5.5", input: 21000, cached: 20000, out: 100 }] };
+    const codex = { kind: "codex", id: "x1", title: "Port", sheetFor: () => sheet, events: [
+      { t: "call", ts: t0, end: t0 + 1000, model: "gpt-6.1-sol", input: 10000, cached: 0, out: 100 }] };
+    const old = { kind: "local", id: "l0", sheetFor: () => sheet, events: [{ t: "call", ts: now - 90 * 86400000, model: "m", input: 1, credits: 999 }] };
+    const a = report.analyzeSpend([local, claude, codex, old], { since: now - 60 * 86400000, now });
+    const codexCr = 10000 * 625 / 1e6 + 100 * 2500 / 1e6;
+    assert.ok(Math.abs(a.total - (101 + 3 + codexCr)) < 1e-6, String(a.total));
+    assert.strictEqual(a.calls, 5, "the 90-day-old call is outside 60 days");
+    const exp = a.factors.find(f => /Expired/.test(f.name));
+    assert.strictEqual(exp.count, 1);
+    assert.ok(Math.abs(exp.credits - (121000 - 1000) * (625 - 50) / 1e6) < 1e-6, String(exp.credits));
+    assert.strictEqual(a.topMisses[0].chat, "Refactor");
+    const md = report.spendMarkdown(a, { days: 60, where: ["Local chats: 2"] });
+    for (const h2 of ["# Copilot spend, last 60 days", "## What drove it", "## By harness and model", "## Costliest cache misses", "## Costliest chats"])
+      assert.ok(md.includes(h2), h2);
+    assert.ok(!/Warning/.test(md), "all priced");
+  });
+
+  await check("spend report: every factor of the Python helper (effort, tier, MCP, compactions, subagents); SDK rates read, no NaN", () => {
+    const sheet = { batch_size: 1e6, base: { max_prompt_tokens: 272000, cache_read_price: 50, cache_write_price: 625, output_price: 2500 },
+                    long: { max_prompt_tokens: 1e6, cache_read_price: 100, cache_write_price: 1250, output_price: 5000 } };
+    const t0 = now - 3 * 3600000;
+    const local = { kind: "local", id: "l1", title: "Big", sheetFor: () => sheet, mcpFrac: 0.5, toolShares: [{ ts: t0, share: 0.4 }], events: [
+      { t: "user", ts: t0, text: "go" },
+      { t: "call", ts: t0 + 10, end: t0 + 1000, model: "m", input: 300000, cached: 290000, out: 1000, credits: 20, effort: "medium" },
+      { t: "call", ts: t0 + 2000, end: t0 + 3000, model: "m", input: 300000, cached: 299000, out: 9000, credits: 25, effort: "max" },
+      { t: "aux", ts: t0 + 4000, model: "m", input: 5000, cached: 0, out: 900, credits: 2, summary: true },
+      { t: "aux", ts: t0 + 5000, model: "m", input: 800, cached: 0, out: 10, credits: 0.1 }],
+      subEvents: [{ t: "call", ts: t0 + 6000, model: "m", input: 9000, cached: 0, out: 100, credits: 1.5 }] };
+    // a Copilot SDK chat priced from its own log (cache_read, cache_write, input, output): a miss mid-chat
+    const rates = { cache_read: 0.00005, cache_write: 0.000625, input: 0.0005, output: 0.0025 };
+    const sdk = { kind: "sdk", id: "s1", events: [
+      { t: "call", ts: t0, model: "x", input: 60000, cached: 0, out: 10, credits: 40, rates },
+      { t: "call", ts: t0 + 60000, model: "x", input: 61000, cached: 0, out: 10, credits: 40, rates },
+      { t: "compaction", ts: t0 + 70000 }] };
+    const a = report.analyzeSpend([local, sdk], { since: 0, now });
+    const f = n => a.factors.find(x => x.name.startsWith(n));
+    for (const x of a.factors) assert.ok(Number.isFinite(x.credits), `${x.name}: ${x.credits}`);
+    assert.ok(Math.abs(f("Other cache misses").credits - (61000 - 1000) * (0.000625 - 0.00005)) < 1e-9, "SDK miss priced from its log");
+    assert.ok(Math.abs(f("Max / xhigh").credits - 8000 * 2500 / 1e6) < 1e-9, String(f("Max / xhigh").credits));   // at the base price, like the Python helper
+    assert.ok(f("Long-context").credits > 0 && f("Long-context").count === 2);
+    assert.ok(Math.abs(f("MCP tool").credits - 2 * 300000 * 0.4 * 0.5 * 100 / 1e6) < 1e-9, String(f("MCP tool").credits));
+    assert.strictEqual(f("Compactions").credits, 2);
+    assert.strictEqual(f("Compactions").count, 2, "the Local summarizing call and the SDK compaction");
+    assert.ok(Math.abs(f("Subagents").credits - 1.6) < 1e-9);
+    assert.ok(Math.abs(a.total - (20 + 25 + 2 + 0.1 + 1.5 + 80)) < 1e-9, String(a.total));
+    assert.ok(/## Reasoning effort/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("spend report: a Copilot SDK session's billed total beyond its calls counts as its compaction", () => {
+    const t0 = now - 3600000;
+    const sdk = { kind: "sdk", id: "s1", billedTotal: 14, events: [
+      { t: "call", ts: t0, model: "gpt-6.1-sol", input: 20000, cached: 0, out: 10, credits: 4 },
+      { t: "call", ts: t0 + 60000, model: "gpt-6.1-sol", input: 21000, cached: 20000, out: 10, credits: 2 },
+      { t: "compaction", ts: t0 + 120000 }] };
+    const a = report.analyzeSpend([sdk], { since: 0, now });
+    assert.strictEqual(a.total, 14, "the session's billed total");
+    assert.strictEqual(a.factors.find(f => f.name === "Compactions").credits, 8);
+  });
+
+  await check("spend report: a Copilot SDK session with only a billed total (older SDK) still counts", () => {
+    const log = [JSON.stringify({ type: "user.message", timestamp: iso(now - 7200000), data: { content: "Help me" } }),
+                 JSON.stringify({ type: "session.usage_checkpoint", timestamp: iso(now - 7000000), data: { totalNanoAiu: 36e9 } })].join("\n");
+    const t = report.sdkSessionTotal(log);
+    assert.deepStrictEqual(t, { total: 36, lastTs: now - 7200000 });
+    const a = report.analyzeSpend([{ kind: "sdk", id: "old", events: [], billedTotal: t.total, lastTs: t.lastTs }], { since: 0, now });
+    assert.strictEqual(a.total, 36);
+  });
+
+  await check("spend report: a call with no known price is warned about, not a crash", () => {
+    const a = report.analyzeSpend([{ kind: "sdk", id: "s1", events: [
+      { t: "call", ts: now - 1000, model: "mystery-1", input: 50000, cached: 0, out: 10 }] }], { since: 0, now });
+    assert.strictEqual(a.unpriced, 1);
+    assert.ok(/Warning:\*\* 1 model call\(s\) have no known price \(mystery-1\)/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  // VS Code's chat file: the initial state, then a request appended, then a field set (its op log)
+  const chatFile = (t0, msgs) => [
+    JSON.stringify({ kind: 0, v: { requests: [] } }),
+    JSON.stringify({ kind: 2, k: ["requests"], v: msgs.map((m, i) => ({ timestamp: t0 + m.at * 1000, message: { text: m.text || `step ${i}` },
+      modelId: "copilot/claude-opus-5.5", promptTokens: m.prompt, completionTokens: 200 })) }),
+    ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "elapsedMs"], v: 20000 })),
+    ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "copilotCredits"], v: m.credits }))].join("\n") + "\n";
+
+  await check("chat files: replayed per message, copies merged, a pause past the lifetime is an expired cache", () => {
+    const t0 = now - 7200000;
+    const text = chatFile(t0, [{ at: 0, prompt: 90000, credits: 40, text: "Port the parser" }, { at: 60, prompt: 91000, credits: 6 },
+                               { at: 1800, prompt: 92000, credits: 45 }]);
+    const m = report.chatFileMessages([text, text]);
+    assert.strictEqual(m.title, "Port the parser");
+    assert.strictEqual(m.events.length, 3, "copies merged");
+    assert.strictEqual(m.events[2].gap, 1800 - 60 - 20, "pause since the previous message ended");
+    const sheet = { batch_size: 1e6, default: { cache_read_price: 50, cache_write_price: 625, output_price: 2500 } };
+    const a = report.analyzeSpend([{ kind: "local-msg", id: "old", title: m.title, events: m.events, sheetFor: () => sheet }], { since: 0, now });
+    assert.strictEqual(a.total, 91);
+    const exp = a.factors.find(f => /Expired/.test(f.name));
+    assert.strictEqual(exp.count, 1, "only the message after the long pause");
+    assert.ok(/\| Local, older chats \| claude-opus-5\.5 \| 3 msgs \|/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("spend report command: asks the days (60), reads Local logs and older chat files, saves the file, shows its preview", async () => {
+    const h = await harness({ answer: never });
+    try {
+      await h.run(5);
+      // chat files on the UI side: an older chat (no debug log left), and the current one (has a log: not counted twice)
+      const cs = path.join(h.dir, "workspaceStorage", "ws1", "chatSessions");
+      fs.mkdirSync(cs, { recursive: true });
+      fs.writeFileSync(path.join(cs, "old-chat.jsonl"), chatFile(h.clock - 86400000, [{ at: 0, prompt: 80000, credits: 30, text: "Older work" }]));
+      fs.writeFileSync(path.join(cs, "sess-1.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
+      // its "saved" notification is never clicked: the command must still finish
+      h.vscode.window.showInformationMessage = () => new Promise(() => {});
+      const done = await Promise.race([h.commands["cacheKeeper.spendReport"]().then(() => true),
+                                       new Promise(r => setTimeout(() => r(false), 5000))]);
+      assert.ok(done, "the command did not wait for the notification");
+      const shown = h.ran.find(r => r.id === "markdown.showPreview");
+      assert.ok(shown && /spend-report-\d{4}-\d\d-\d\d-60d\.md$/.test(shown.a.fsPath), "preview of the saved file");
+      assert.ok(!h.opened.length, "no unsaved document");
+      const md = fs.readFileSync(shown.a.fsPath, "utf8");
+      assert.ok(/^# Copilot spend, last 60 days/.test(md), md.slice(0, 200));
+      assert.ok(/\| Local \| claude-opus-5\.5 \|/.test(md), md);
+      assert.ok(/\| Older work \| Local, older chats \|/.test(md), "the older chat, from its chat file");
+      assert.ok(!/999/.test(md), "the chat with a debug log is not counted again from its chat file");
+      assert.ok(/Older Local chats \(no debug log left\): 1/.test(md), "where it read");
+    } finally { h.close(); }
+  });
+
   // ---------------------------------------------------------------- Claude and Codex harnesses
   const harnesses = require("../harnesses");
   const ALL_KINDS = [["local", {}], ["sdk", {}], ["claude", {}], ["codex", { ttlSeconds: { "gpt-6.1-sol": 300 } }]];
@@ -2063,6 +2206,32 @@ const never = () => new Promise(() => {});
       await h.run(250);
       assert.ok(h.infos.some(m => /will send a keep-alive 5s before/.test(m)), h.infos.join(" | "));
     } finally { h.close(); }
+  });
+
+  await check("a model with no lifetime data: 5 min assumed and shown as a guess (~, warning, tooltip)", async () => {
+    const h = await harness({ answer: never, settings: { minCredits: 0 } });
+    try {
+      // you switch the chat to a model no log or built-in value says anything about
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Go on with the new model" } },
+                { type: "turn_start", ts: h.clock + 5 },
+                { type: "llm_request", ts: h.clock + 10, dur: 500, attrs: { debugName: "panel/editAgent", model: "brand-new-model",
+                  inputTokens: 41000, cachedTokens: 0, outputTokens: 4 } },
+                { type: "turn_end", ts: h.clock + 600 }]);
+      await h.run(5);
+      assert.ok(/^\$\(flame\) ~\d:\d\d/.test(h.status.text), h.status.text);
+      await h.run(300, () => h.warnings.length > 0);
+      const w = (h.warnings[0] || {}).msg || "";
+      assert.ok(/expires in ~\d+s \(lifetime assumed: no data for this model\)\./.test(w), w);
+    } finally { h.close(); }
+    assert.strictEqual(core.ttlSource("brand-new-model"), "assumed: no data for this model");
+    assert.strictEqual(core.ttlFor("brand-new-model"), 300);
+    assert.strictEqual(core.ttlSource("claude-opus-5.5"), "default");
+    const t0 = now - 60000;
+    const s = core.analyzeTrace("local", "/x/new", { events: [{ t: "user", ts: t0, text: "go" }, { t: "turn_start", ts: t0 },
+      { t: "call", ts: t0 + 10, end: t0 + 500, model: "brand-new-model", input: 50000, cached: 0, out: 5 }, { t: "turn_end", ts: t0 + 600 }], info: {} },
+      { now });
+    assert.strictEqual(s.ttl, 300);
+    assert.strictEqual(s.ttlAssumed, true);
   });
 
   await check("warning: short, what no click does; 3 buttons (main, second, More…) that fit; a cost button works", async () => {

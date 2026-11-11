@@ -44,14 +44,49 @@ import shutil
 from pathlib import Path
 
 HOME = Path.home()
-DEFAULT_TTLS = [("claude", 300), ("gpt-6.1-sol", 1800)]   # seconds; learned from CLI logs when present
-UNKNOWN_TTL = 300
+# Cache lifetimes, from data only (see ttl_for): logged, measured, else these known values. Other
+# models with no data get none, and no expiry is judged for them.
+KNOWN_TTLS = [("claude", 300), ("gpt-6.1-sol", 1800)]   # seconds
 MISS_MIN_CTX = 30_000          # ignore misses on small prompts
 MISS_CACHED_BELOW = 0.5        # a call with less than half its prompt cached is a miss
 TYPICAL_NEW = 1_000            # tokens a normal message adds uncached (not part of a miss)
 BIG_CTX = 100_000              # context above this is re-read (cache price) on every call
 
 # ---------------------------------------------------------------- where logs live
+
+def wsl_homes() -> list[Path]:
+    r"""On Windows: the home folders of the running WSL distros (\\wsl.localhost\<distro>\home\<user>),
+    where VS Code keeps a WSL window's logs. Only running distros: reading one would start it."""
+    if os.name != "nt":
+        return []
+    import subprocess
+    def distros(*flags):
+        try:
+            out = subprocess.run(["wsl.exe", "-l", "-q", *flags], capture_output=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        # UTF-16 by default; UTF-8 when WSL_UTF8 is set or in newer wsl.exe versions
+        text = out.decode("utf-16-le", errors="ignore") if b"\x00" in out else out.decode("utf-8", errors="ignore")
+        return [d.strip().lstrip("\ufeff") for d in text.replace("\x00", "").splitlines() if d.strip()]
+    running, installed = distros("--running"), distros()
+    stopped = [d for d in installed if d not in running]
+    if stopped:
+        print(f"WSL distros not running, not read: {', '.join(stopped)} (start them to include their chats)", file=sys.stderr)
+    homes = []
+    for d in running:
+        for prefix in (r"\\wsl.localhost", r"\\wsl$"):
+            base = Path(prefix + "\\" + d + "\\home")
+            try:
+                homes += [p for p in base.iterdir() if p.is_dir()]
+                break
+            except OSError:
+                continue
+    return homes
+
+
+OTHER_HOMES = wsl_homes()
+
+
 
 def vscode_storage_roots(extra: list[Path]) -> list[Path]:
     """VS Code workspaceStorage folders: local install, VS Code server (remote/WSL), Windows from WSL."""
@@ -68,13 +103,16 @@ def vscode_storage_roots(extra: list[Path]) -> list[Path]:
                  Path(os.environ["APPDATA"]) / "Code - Insiders/User/workspaceStorage"]
     pats += [Path(p) for p in glob.glob("/mnt/c/Users/*/AppData/Roaming/Code/User/workspaceStorage")]
     pats += [Path(p) for p in glob.glob("/mnt/c/Users/*/AppData/Roaming/Code - Insiders/User/workspaceStorage")]
+    for h in OTHER_HOMES:
+        pats += [h / ".vscode-server/data/User/workspaceStorage", h / ".vscode-server-insiders/data/User/workspaceStorage"]
     for e in extra:
         pats += [Path(p) for p in glob.glob(str(e / "**/workspaceStorage"), recursive=True)]
     return [p for p in dict.fromkeys(pats) if p.is_dir()]
 
 
 def cli_roots(extra: list[Path]) -> list[Path]:
-    roots = [HOME / ".copilot/session-state"] + [Path(p) for p in glob.glob("/mnt/c/Users/*/.copilot/session-state")]
+    roots = [HOME / ".copilot/session-state"] + [Path(p) for p in glob.glob("/mnt/c/Users/*/.copilot/session-state")] + \
+            [h / ".copilot/session-state" for h in OTHER_HOMES]
     for e in extra:
         roots += [Path(p) for p in glob.glob(str(e / "**/session-state"), recursive=True)]
     return [p for p in dict.fromkeys(roots) if p.is_dir()]
@@ -82,7 +120,8 @@ def cli_roots(extra: list[Path]) -> list[Path]:
 
 def opencode_dbs(extra: list[Path]) -> list[Path]:
     dbs = [HOME / ".local/share/opencode/opencode.db"] + \
-          [Path(p) for p in glob.glob("/mnt/c/Users/*/.local/share/opencode/opencode.db")]
+          [Path(p) for p in glob.glob("/mnt/c/Users/*/.local/share/opencode/opencode.db")] + \
+          [h / ".local/share/opencode/opencode.db" for h in OTHER_HOMES]
     if os.environ.get("LOCALAPPDATA"):
         dbs.append(Path(os.environ["LOCALAPPDATA"]) / "opencode/opencode.db")
     for e in extra:
@@ -98,6 +137,8 @@ def harness_roots(extra: list[Path]) -> list[tuple[Path, Path]]:
              (HOME / ".config/Code", HOME), (HOME / "Library/Application Support/Code", HOME)]
     if os.environ.get("APPDATA"):
         pairs.append((Path(os.environ["APPDATA"]) / "Code", HOME))
+    for h in OTHER_HOMES:
+        pairs += [(h / ".vscode-server/data", h), (h / ".vscode-server-insiders/data", h)]
     for u in glob.glob("/mnt/c/Users/*"):
         pairs.append((Path(u) / "AppData/Roaming/Code", Path(u)))
     for e in extra:
@@ -182,10 +223,55 @@ def rates(model: str, ctx: int) -> dict | None:
             "tier_max": tiers[0].get("max_prompt_tokens") if len(tiers) > 1 else None}
 
 
-def ttl_for(model: str) -> int:
+MEASURED_TTLS: dict[str, int] = {}   # model id -> longest gap after which a Local chat still hit the cache
+GUESS_TTL = 300        # what the extension's warnings assume for a model with no data
+MEASURED_MARGIN = 60   # a measured gap counts once it beats the guess (or known value) by this much
+
+
+def ttl_for(model: str, call_ttl: int | None = None) -> int | None:
+    """A cache lifetime from data only: the call's own log (Claude's cache tier), Copilot CLI/SDK logs,
+    what the Local debug logs prove (at least the known value), the known values (Claude, Sol 6.1).
+    None for any other model: no expiry is judged without data."""
+    if call_ttl:
+        return call_ttl
     if model in TTLS:
         return TTLS[model]
-    return next((t for p, t in DEFAULT_TTLS if (model or "").startswith(p)), UNKNOWN_TTL)
+    known = next((t for p, t in KNOWN_TTLS if (model or "").startswith(p)), None)
+    # a measured gap is only a minimum: it counts once it beats the guess or the known value by a
+    # margin, rounded down to the minute (the extension's rule)
+    m = MEASURED_TTLS.get(model, 0)
+    if m > (known or GUESS_TTL) + MEASURED_MARGIN:
+        return m // 60 * 60
+    return known
+
+
+def learn_measured_ttls(calls: list[dict]) -> None:
+    """Longest proven cache lifetime per model in Local chats' debug logs (the extension's provenGaps):
+    the gap between a call and the previous call of the same model (any call of the chat refreshes the
+    cache), when the cache still covered the chat's own conversation: at least 5k tokens of its own, at
+    least 80% of them cached, and at least 90% of the previous prompt."""
+    sessions = collections.defaultdict(list)
+    for c in calls:
+        if c["source"] == "vscode" and c["kind"] in ("agent", "side", "compaction"):
+            sessions[c["session"]].append(c)
+    for evs in sessions.values():
+        evs.sort(key=lambda c: c["ts"])
+        agent = [c for c in evs if c["kind"] == "agent"]
+        if len(agent) < 2:
+            continue
+        base = agent[0]["ctx"] or 0
+        for a0, a1 in zip(agent, agent[1:]):
+            model = a1["model"]
+            if not model or a0["model"] != model:
+                continue
+            prev, cached = a0["ctx"] or 0, a1["cached"] or 0
+            own = prev - base
+            if own < 5000 or cached < base + 0.8 * own or cached < 0.9 * prev:
+                continue
+            last = max([a0["ts"]] + [e["ts"] for e in evs if e["model"] == model and e["ts"] < a1["ts"]])
+            gap = round((a1["ts"] - last) / 1000)
+            if gap > MEASURED_TTLS.get(model, 0):
+                MEASURED_TTLS[model] = gap
 
 
 def estimate_credits(model: str, ctx: int, cached: int, written: int, out: int) -> float | None:
@@ -464,11 +550,13 @@ def collect_cli(roots: list[Path], since_ms: int) -> tuple[list[dict], dict]:
             except OSError:
                 continue
             sid, effort, cwd, nano_total, records = f.parent.name, None, "", None, []
+            per_call_sum, per_call_known, last_compaction = 0.0, True, 0
             # a VS Code "Copilot" harness chat (Copilot SDK in VS Code's Agent Host), same log format
             src = "copilot-sdk" if "vscode-agent-host" in read_text(f.parent / "workspace.yaml") else "cli"
             for line in f.open(encoding="utf-8", errors="ignore"):
                 if not any(k in line for k in ('"session.start"', '"session.usage_record"', 'cacheTtlSeconds',
-                                               '"user.message"', 'compaction_complete', 'totalNanoAiu')):
+                                               '"user.message"', 'compaction_complete', 'totalNanoAiu',
+                                               '"reasoningEffort"')):
                     continue
                 try:
                     o = json.loads(line)
@@ -478,31 +566,58 @@ def collect_cli(roots: list[Path], since_ms: int) -> tuple[list[dict], dict]:
                 ts = int(dt.datetime.fromisoformat(o["timestamp"].replace("Z", "+00:00")).timestamp() * 1000) if o.get("timestamp") else 0
                 for m in re.finditer(r'"modelId":"([^"]+)","cacheExpiresAt":"[^"]*","cacheTtlSeconds":(\d+)', line):
                     TTLS[m.group(1)] = int(m.group(2))
+                # the effort in force: set at session start and on each model or effort change
+                if isinstance(d.get("reasoningEffort"), str):
+                    effort = d["reasoningEffort"]
                 if t == "session.start":
-                    effort = d.get("reasoningEffort")
                     cwd = ((d.get("context") or {}).get("cwd") or "") if isinstance(d.get("context"), dict) else ""
                 elif t == "session.compaction_complete":
                     compactions[sid] += 1
+                    last_compaction = ts
                 elif t == "user.message" and ts >= since_ms:
                     records.append(call(source=src, session=sid, workspace=Path(cwd).name or sid[:8], ts=ts,
                                         kind="message", user_msg=True))
-                elif t == "session.usage_record" and ts >= since_ms:
+                elif t == "session.usage_record":
                     u = d.get("usage") or {}
+                    nano = (u.get("copilotUsage") or {}).get("totalNanoAiu")
+                    if nano is None:
+                        per_call_known = False
+                    else:
+                        per_call_sum += nano / 1e9
+                    if ts < since_ms:
+                        continue
                     records.append(call(source=src, session=sid, workspace=Path(cwd).name or sid[:8], ts=ts,
                                         model=u.get("model", "?"), effort=effort, ctx=u.get("inputTokens", 0),
                                         cached=u.get("cacheReadTokens", 0), written=u.get("cacheWriteTokens", 0),
                                         out=u.get("outputTokens", 0), reasoning=u.get("reasoningTokens", 0),
+                                        ttl=u.get("cacheTtlSeconds") or None,      # the call's own cache lifetime
+                                        billed=nano / 1e9 if nano is not None else None,
                                         kind="agent" if u.get("initiator") in (None, "user", "agent") else "side"))
                 elif "totalNanoAiu" in d:
-                    nano_total = d.get("totalNanoAiu")
+                    nano_total = max(nano_total or 0, d.get("totalNanoAiu") or 0)
             est = []
             for c in records:
                 if c["kind"] != "message":
-                    c["credits"] = estimate_credits(c["model"], c["ctx"], c["cached"], c["written"], c["out"])
-                    est.append(c)
+                    billed = c.pop("billed", None)
+                    if per_call_known and billed is not None:
+                        c["credits"], c["exact"] = billed, True        # as billed, call by call
+                    else:
+                        c["credits"] = estimate_credits(c["model"], c["ctx"], c["cached"], c["written"], c["out"])
+                        est.append(c)
+                else:
+                    c.pop("billed", None)
+            # billed in the session's total but with no call of its own (a compaction's call): one more
+            # record, a compaction when the session had one, else a side call
+            if per_call_known and nano_total and nano_total / 1e9 > per_call_sum + 0.01:
+                at = last_compaction or max([c["ts"] for c in records] or [0])
+                if at >= since_ms:
+                    model = next((c["model"] for c in sorted(records, key=lambda c: -c["ts"]) if c["kind"] != "message"), "?")
+                    records.append(call(source=src, session=sid, workspace=Path(cwd).name or sid[:8], ts=at, model=model,
+                                        credits=nano_total / 1e9 - per_call_sum, exact=True,
+                                        kind="compaction" if last_compaction else "side"))
             # scale estimates to the session's exact total when the CLI reported one
             tot = sum(c["credits"] or 0 for c in est)
-            if nano_total and tot > 0:
+            if est and nano_total and tot > 0 and not per_call_known:
                 k = nano_total / 1e9 / tot
                 for c in est:
                     c["credits"] = (c["credits"] or 0) * k
@@ -550,12 +665,14 @@ def claude_calls(f: Path, sid: str, ws: str, since_ms: int) -> list[dict]:
                 continue
             u, key = m["usage"], e.get("requestRef") or m.get("id") or ts
             written = u.get("cache_creation_input_tokens") or 0
+            cc = u.get("cache_creation") or {}
+            ttl = 3600 if (cc.get("ephemeral_1h_input_tokens") or 0) > 0 else 300 if (cc.get("ephemeral_5m_input_tokens") or 0) > 0 else None
             # Copilot's model ids use a dot: claude-opus-5-5 -> claude-opus-5.5
             model = re.sub(r"-(\d+)-(\d+)$", r"-\1.\2", m.get("model") or "?")
             calls[key] = call(source="claude-harness", session=sid, workspace=ws, ts=start, model=model,
                               ctx=(u.get("input_tokens") or 0) + written + (u.get("cache_read_input_tokens") or 0),
                               cached=u.get("cache_read_input_tokens") or 0, written=written, out=u.get("output_tokens") or 0,
-                              kind="subagent" if e.get("isSidechain") else "agent")   # a streamed reply repeats: last wins
+                              ttl=ttl, kind="subagent" if e.get("isSidechain") else "agent")   # a streamed reply repeats: last wins
     return out + list(calls.values())
 
 
@@ -698,11 +815,14 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
                 r = rates(c["model"], c["ctx"])
                 lost = max(0, c["ctx"] - c["cached"] - TYPICAL_NEW)
                 extra = lost * ((r["write"] or r["input"]) - r["read"]) if r else 0.0
-                misses.append(dict(c, gap=gap, extra=extra,
-                                   cause="expired after a pause" if gap >= ttl_for(c["model"]) - 5 else "compaction / changed prompt"))
+                ttl = ttl_for(c["model"], c.get("ttl"))
+                cause = ("expired after a pause" if ttl and gap >= ttl - 5 else
+                         "compaction / changed prompt" if ttl else "unknown cache lifetime")
+                misses.append(dict(c, gap=gap, extra=extra, cause=cause))
             prev = c
     for c in msgs:
-        if c.get("gap") is not None and not c.get("ours") and c["ctx"] >= MISS_MIN_CTX and c["gap"] >= ttl_for(c["model"]):
+        ttl = ttl_for(c["model"])
+        if ttl and c.get("gap") is not None and not c.get("ours") and c["ctx"] >= MISS_MIN_CTX and c["gap"] >= ttl:
             r = rates(c["model"], c["ctx"])
             extra = max(0, c["ctx"] - TYPICAL_NEW) * ((r["write"] or r["input"]) - r["read"]) if r else 0.0
             misses.append(dict(c, extra=extra, cause="expired after a pause"))
@@ -782,7 +902,10 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
     pause = collections.defaultdict(list)
     for t in t_ok:
         if t["gap"] is not None and t["prompt"] > 20_000 and not t["ours"]:
-            kind = "pause longer than the cache lifetime" if t["gap"] >= ttl_for(t["model"]) else "within the cache lifetime"
+            ttl = ttl_for(t["model"])
+            if not ttl:
+                continue                       # no data on this model's cache lifetime
+            kind = "pause longer than the cache lifetime" if t["gap"] >= ttl else "within the cache lifetime"
             pause[(t["model"], kind)].append(t["credits"] / (t["prompt"] / 1e5))
 
     # 6. sessions
@@ -832,6 +955,7 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
     ]
     factors.sort(key=lambda f: -f[1])
     return dict(total=total, calls=model_calls, misses=misses, expired=expired, effort_rows=effort_rows,
+                unpriced=[c for c in calls if c["kind"] != "message" and c["credits"] is None],
                 mcp_frac=default_frac, tool_share=default_share,
                 ctx_rows=ctx_rows, setting_rows=setting_rows, pause=pause, sessions=sess, factors=factors,
                 comp=comp, turns=t_ok)
@@ -844,6 +968,12 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
     w(f"# Agent spend report ({now}, last {days} days)\n")
     w("Credits: 1 credit = $0.01. " + ", ".join(f"{k}: {v}" for k, v in sources.items()) + ".\n")
     mc = a["calls"]
+    if a["unpriced"]:
+        models = ", ".join(sorted({c["model"] for c in a["unpriced"]}))
+        w(f"**Warning:** Credits are unknown for {len(a['unpriced'])} model calls ({models}). "
+                "These calls are excluded from spending totals; cost and savings estimates are incomplete. "
+                "Model prices may be missing on this machine. Use `--input DIR` with VS Code logs containing "
+                "a matching `workspaceStorage/.../GitHub.copilot-chat/debug-logs/.../models.json` price sheet.\n")
     w(f"**Total: {fmt(a['total'])} credits** (${a['total'] / 100:,.2f}) over {len(mc)} model calls "
       f"in {len(a['sessions'])} sessions.\n")
 
@@ -877,9 +1007,11 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
         w("| When | Tool | Workspace | Model | Context | Cached | Pause | Credits | Extra vs cached | Cause |")
         w("|---|---|---|---|---:|---:|---:|---:|---:|---|")
         for m in sorted(a["misses"], key=lambda m: -m["extra"])[:15]:
+            credits = f"{m['credits']:.1f}" if m["credits"] is not None else "unknown"
+            extra = f"{m['extra']:.1f}" if rates(m["model"], m["ctx"]) is not None else "unknown"
             w(f"| {dt.datetime.fromtimestamp(m['ts'] / 1000):%m-%d %H:%M} | {m['source']} | {m['workspace']} | {m['model']} | "
               f"{m['ctx'] / 1000:.0f}k | {100 * m['cached'] / max(m['ctx'], 1):.0f}% | {m['gap'] / 60:.0f} min | "
-              f"{m['credits']:.1f} | {m['extra']:.1f} | {m['cause']} |")
+              f"{credits} | {extra} | {m['cause']} |")
     else:
         w("None found.\n")
 
@@ -920,8 +1052,10 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
     w(f"- Miss: a model call with at least {MISS_MIN_CTX // 1000}k tokens of context and less than "
       f"{int(MISS_CACHED_BELOW * 100)}% of it cached, not the first call of its session. \"Expired after a pause\" "
       "means the gap since the previous call in that session was at least the model's cache lifetime "
-      f"({', '.join(f'{p} {t}s' for p, t in DEFAULT_TTLS)}, others {UNKNOWN_TTL}s; learned from Copilot CLI logs "
-      "when present). Extra = uncached tokens × (write/input price − cache-read price).")
+      "(from data only: the call's log, Copilot CLI/SDK logs, the longest gap after which a Local chat still hit the "
+      "cache, once longer than 5 min" + (f" ({', '.join(f'{m} ≥{ttl_for(m)}s' for m in sorted(MEASURED_TTLS) if m not in TTLS and ttl_for(m) and ttl_for(m) >= GUESS_TTL + MEASURED_MARGIN)})" if MEASURED_TTLS else "") +
+      f", else {', '.join(f'{p} {t}s' for p, t in KNOWN_TTLS)}; other models with no data: not judged). "
+      "Extra = uncached tokens × (write/input price − cache-read price).")
     w("- Effort: extra output tokens vs the median output of the same model at the lowest effort you used, priced at "
       "the output rate; only counted for xhigh/max.")
     w(f"- Large context: tokens above {BIG_CTX // 1000}k × cache-read price, per agent call.")
@@ -933,7 +1067,7 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
       f"the debug logs, median {100 * a['mcp_frac']:.0f}%) × share of the prompt that is tool definitions (from "
       f"VS Code's prompt breakdown, median {100 * a['tool_share']:.0f}%) × context × cache-read price, per call.")
     w("- Prices: the newest price sheet Copilot sent to VS Code (models.json in the Agent Debug Logs). VS Code debug "
-      "logs give exact credits; Copilot CLI is scaled to its reported session totals; OpenCode uses its own cost.")
+      "logs give exact credits; Copilot CLI/SDK give credits per call, plus what their session total adds beyond the calls (else scaled to that total); OpenCode uses its own cost.")
     return "\n".join(L) + "\n"
 
 
@@ -956,6 +1090,7 @@ def main() -> None:
     h_calls = collect_harnesses(harness_roots(args.input), since)
     msg_calls = turns_as_calls(turns, debug_sessions)
     learn_calls_per_message(vs_calls)
+    learn_measured_ttls(vs_calls)
     calls = vs_calls + msg_calls + cli_calls + oc_calls + h_calls
     n = lambda cs: len([c for c in cs if c["kind"] != "message"])
     sources = {"VS Code debug logs": f"{n(vs_calls)} calls",
@@ -970,6 +1105,12 @@ def main() -> None:
         sys.exit("No agent logs with usage found in the period.")
 
     a = analyze(calls, turns, cli_comp)
+    if a["unpriced"]:
+        models = ", ".join(sorted({c["model"] for c in a["unpriced"]}))
+        print(f"Warning: credits unknown for {len(a['unpriced'])} model calls ({models}); "
+              "spending totals exclude them and savings estimates are incomplete. "
+              "Use --input DIR with VS Code debug logs containing a matching models.json price sheet.",
+              file=sys.stderr)
     text = report(a, calls, args.days, sources)
     out = args.out or Path(f"spend-report-{dt.date.today()}.md")
     out.write_text(text, encoding="utf-8")

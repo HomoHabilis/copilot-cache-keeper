@@ -239,7 +239,11 @@ See [Supported chat harnesses](#supported-chat-harnesses).
      It only ever lengthens the default (rounded down to the minute, and only when more than 60 s
      longer): a cache miss can have other causes, so it never shortens it. On real logs this gives
      for example `kimi-k2.7-code` 1080 s, while Claude models stay at 300 s.
-  5. Defaults: 300 s for Claude models, 1800 s for Sol 6.1, 300 s for anything else.
+  5. Defaults: 300 s for Claude models, 1800 s for Sol 6.1. Any other model with no data is assumed
+     to last 300 s, and shown as a guess: `~` before its countdown, "lifetime assumed" in its warning,
+     "assumed: no data for this model" in the tooltip and diagnostics. Using the model once in a Copilot
+     SDK chat gives it a real lifetime for every harness. (The spend report doesn't judge expiries on
+     such a model.)
 
   The most precise source wins: exact values (1-3) before the measured minimum (4) before the
   defaults (5). The Output panel logs the learned values, with their age, when they change, and the status-bar tooltip and
@@ -419,12 +423,26 @@ maximum age for learned cache lifetimes. They can still be overridden in `settin
 (`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where Compact is used.
 
-## Spend report (helper)
+## Spend report
 
-[`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
+**Cache Keeper: Spend report (last N days)** (Command Palette) asks how many days to look back
+(60 by default) and shows a Markdown report of what your Copilot chats cost and what drove it:
+totals by harness and model, expired caches after pauses and other cache misses with what they
+added, context re-read above 100k, and the costliest misses and chats. The report is saved in
+Cache Keeper's storage (`spend-reports/spend-report-<date>-<days>d.md`, the notification says
+where) and opened as a preview.
+
+It reads every chat, not just this window's, on the window's side (WSL, SSH host or container)
+and, for a remote window, on this computer too: Local chats of every workspace, older Local chats
+whose debug log VS Code has removed (from VS Code's own chat files, per message), and the Copilot
+SDK, Claude and Codex chats VS Code created. Credits are as billed where the log says, else from
+Copilot's price sheet; calls with no known price are flagged. On this machine it matches the Python
+helper below within 0.3%; the helper also covers OpenCode and Copilot CLI.
+
+For a deeper look, [`tools/spend-analyzer/`](tools/spend-analyzer/) has a separate Python script (standard library
 only, not part of the extension) that reads weeks of logs from every harness, Local, Copilot SDK,
-Claude, Codex, plus Copilot CLI and OpenCode, and ranks what drove your Copilot spend: expired
-caches after pauses, large contexts, reasoning effort, tool definitions and more.
+Claude, Codex, plus Copilot CLI, OpenCode and older chats, and adds reasoning effort, tool
+definitions, compactions and context-size settings to the analysis.
 
 ```bash
 python3 tools/spend-analyzer/analyze_spend.py --days 60
