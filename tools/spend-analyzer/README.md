@@ -70,5 +70,10 @@ with `--input <folder>`.
 - **Older chats** only have per-message records, so some figures for them are estimated from your
   own debug-log data, and capped so no estimate exceeds what a message actually cost.
 
+**Run from WSL or from Windows, same result.** From WSL it also reads the Windows side
+(`/mnt/c/Users/...`); from Windows it also reads the home folders of the running WSL distros
+(`\\wsl.localhost\<distro>\home\...`, where a WSL window's logs are). Distros that aren't running
+are not started; it lists them so you can start them and run it again.
+
 Reading Windows-side files from WSL is slow: expect about a minute on a machine with a few hundred
 chats.

@@ -53,6 +53,40 @@ BIG_CTX = 100_000              # context above this is re-read (cache price) on 
 
 # ---------------------------------------------------------------- where logs live
 
+def wsl_homes() -> list[Path]:
+    r"""On Windows: the home folders of the running WSL distros (\\wsl.localhost\<distro>\home\<user>),
+    where VS Code keeps a WSL window's logs. Only running distros: reading one would start it."""
+    if os.name != "nt":
+        return []
+    import subprocess
+    def distros(*flags):
+        try:
+            out = subprocess.run(["wsl.exe", "-l", "-q", *flags], capture_output=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        # UTF-16 by default; UTF-8 when WSL_UTF8 is set or in newer wsl.exe versions
+        text = out.decode("utf-16-le", errors="ignore") if b"\x00" in out else out.decode("utf-8", errors="ignore")
+        return [d.strip().lstrip("\ufeff") for d in text.replace("\x00", "").splitlines() if d.strip()]
+    running, installed = distros("--running"), distros()
+    stopped = [d for d in installed if d not in running]
+    if stopped:
+        print(f"WSL distros not running, not read: {', '.join(stopped)} (start them to include their chats)", file=sys.stderr)
+    homes = []
+    for d in running:
+        for prefix in (r"\\wsl.localhost", r"\\wsl$"):
+            base = Path(prefix + "\\" + d + "\\home")
+            try:
+                homes += [p for p in base.iterdir() if p.is_dir()]
+                break
+            except OSError:
+                continue
+    return homes
+
+
+OTHER_HOMES = wsl_homes()
+
+
+
 def vscode_storage_roots(extra: list[Path]) -> list[Path]:
     """VS Code workspaceStorage folders: local install, VS Code server (remote/WSL), Windows from WSL."""
     pats = [
@@ -68,13 +102,16 @@ def vscode_storage_roots(extra: list[Path]) -> list[Path]:
                  Path(os.environ["APPDATA"]) / "Code - Insiders/User/workspaceStorage"]
     pats += [Path(p) for p in glob.glob("/mnt/c/Users/*/AppData/Roaming/Code/User/workspaceStorage")]
     pats += [Path(p) for p in glob.glob("/mnt/c/Users/*/AppData/Roaming/Code - Insiders/User/workspaceStorage")]
+    for h in OTHER_HOMES:
+        pats += [h / ".vscode-server/data/User/workspaceStorage", h / ".vscode-server-insiders/data/User/workspaceStorage"]
     for e in extra:
         pats += [Path(p) for p in glob.glob(str(e / "**/workspaceStorage"), recursive=True)]
     return [p for p in dict.fromkeys(pats) if p.is_dir()]
 
 
 def cli_roots(extra: list[Path]) -> list[Path]:
-    roots = [HOME / ".copilot/session-state"] + [Path(p) for p in glob.glob("/mnt/c/Users/*/.copilot/session-state")]
+    roots = [HOME / ".copilot/session-state"] + [Path(p) for p in glob.glob("/mnt/c/Users/*/.copilot/session-state")] + \
+            [h / ".copilot/session-state" for h in OTHER_HOMES]
     for e in extra:
         roots += [Path(p) for p in glob.glob(str(e / "**/session-state"), recursive=True)]
     return [p for p in dict.fromkeys(roots) if p.is_dir()]
@@ -82,7 +119,8 @@ def cli_roots(extra: list[Path]) -> list[Path]:
 
 def opencode_dbs(extra: list[Path]) -> list[Path]:
     dbs = [HOME / ".local/share/opencode/opencode.db"] + \
-          [Path(p) for p in glob.glob("/mnt/c/Users/*/.local/share/opencode/opencode.db")]
+          [Path(p) for p in glob.glob("/mnt/c/Users/*/.local/share/opencode/opencode.db")] + \
+          [h / ".local/share/opencode/opencode.db" for h in OTHER_HOMES]
     if os.environ.get("LOCALAPPDATA"):
         dbs.append(Path(os.environ["LOCALAPPDATA"]) / "opencode/opencode.db")
     for e in extra:
@@ -98,6 +136,8 @@ def harness_roots(extra: list[Path]) -> list[tuple[Path, Path]]:
              (HOME / ".config/Code", HOME), (HOME / "Library/Application Support/Code", HOME)]
     if os.environ.get("APPDATA"):
         pairs.append((Path(os.environ["APPDATA"]) / "Code", HOME))
+    for h in OTHER_HOMES:
+        pairs += [(h / ".vscode-server/data", h), (h / ".vscode-server-insiders/data", h)]
     for u in glob.glob("/mnt/c/Users/*"):
         pairs.append((Path(u) / "AppData/Roaming/Code", Path(u)))
     for e in extra:
