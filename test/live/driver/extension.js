@@ -10,6 +10,7 @@
 //   { draft: "text", attach: [uri] }            type (not send) into the Chat view's input, attach files
 //   { boxes: "label" }                          log every chat input box's text
 //   { cmd: "<command>", args: [...] }           run a command (e.g. cacheKeeper.keepWarmNow)
+//   { cmd: "<command>", pick: true }            run a command that asks "which chat?" and take the first one
 //   { wait: seconds }
 "use strict";
 const vscode = require("vscode");
@@ -83,6 +84,16 @@ async function run() {
         continue;
       }
       if (st.boxes) { log(`input boxes ${st.boxes}: ${boxes()}`); continue; }
+      if (st.cmd && st.pick) {
+        // the command asks "which chat?" when there are several: take the first item, as a click would
+        // (Cache Keeper lists the chat you last wrote in first). With one chat it asks nothing.
+        const done = vscode.commands.executeCommand(st.cmd, ...(st.args || []));
+        await sleep(2500);
+        await vscode.commands.executeCommand("workbench.action.acceptSelectedQuickOpenItem");
+        await done;
+        log(`ran ${st.cmd}, first chat picked | tabs: ${tabs()}`);
+        continue;
+      }
       if (st.cmd) { await vscode.commands.executeCommand(st.cmd, ...(st.args || [])); log(`ran ${st.cmd} | tabs: ${tabs()}`); continue; }
     } catch (e) { log(`step ${JSON.stringify(st)} FAILED: ${e.message}`); }
   }

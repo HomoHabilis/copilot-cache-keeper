@@ -40,10 +40,11 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     into the notification center unseen) turns the bar into `🔔 Refactor the parser 0:22 · click
     to choose`, for whichever chat it is. That chat is first in the list; a choice there counts
     as answering the warning.
-- **60 s before expiry**, one short notification per chat: `Cache for "Refactor the parser"
-  expires in 59s. Expiry adds ~20 cr to your next message. No click: …`. The buttons carry their
-  cost (`Keep warm (~1.1 cr)`, `Auto keep warm`, `Summarize (~2.5 cr)`, `Compact (~1.4 cr)` on Local
-  chats, `Ignore`):
+- **60 s before expiry**, one short notification per chat: `"Refactor the parser" expires in 59s.
+  Expiry: +20 cr. No click: …`, with three buttons, short enough for VS Code to show in full:
+  `Keep warm (~1.1 cr)`, `Auto keep warm` (`Summarize (~2.5 cr)` when the price is unknown), and
+  `More…`, which opens the chat's menu: every choice (Summarize, Compact on Local chats, Ignore,
+  ...) with what it does and costs. A choice there answers the warning; closing the menu does not.
   - **No click:** nothing is kept warm, the cache expires. Keeping warm (once or auto) always
     takes a click. If the chat's context is at least `cacheKeeper.thresholdTokens` (default 100k
     tokens, about 40 credits with Opus 5.5), a handoff summary is written 15 s before expiry
@@ -78,7 +79,7 @@ See [Supported chat harnesses](#supported-chat-harnesses).
     the status-bar tooltip show it ("kept warm 1 h 10 min of 2 h").
     The closing handoff summary counts against the cap. When the next keep-alive would not fit
     the cap or the time limit, you get a warning to choose again (Keep warm once more, Auto keep
-    warm with a fresh cap, and a fresh 2 h if the time limit was reached, Summarize, Ignore). With no click it writes the summary and stops (or just stops, with
+    warm with a fresh cap, and a fresh 2 h if the time limit was reached, and More… for the rest). With no click it writes the summary and stops (or just stops, with
     `summaryAfterKeepWarm` off, or if a summary written since your last message is still
     current). While it runs, the status bar turns red and shows spent / cap, because it spends
     credits on its own.

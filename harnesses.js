@@ -119,7 +119,9 @@ function sdkTrace(eventsText, yaml = {}) {
         break;
       }
       default:
-        if (/compaction_(complete|completed|end)$/.test(e.type || "")) ev.push({ t: "compaction", ts });
+        if (/compaction_(complete|completed|end)$/.test(e.type || "")) ev.push({ t: "compaction", ts }, { t: "turn_end", ts });
+        // logged at once (the end can come many seconds later): the compaction is running, the chat busy
+        else if (/compaction_start(ed)?$/.test(e.type || "")) ev.push({ t: "compacting", ts }, { t: "turn_start", ts });
     }
   }
   // An SDK request is several turns (one per model call and its tools), with a few ms between them.
@@ -147,8 +149,21 @@ function claudeTrace(text) {
     if (e.type === "queue-operation" && e.operation === "enqueue") ev.push({ t: "queued", ts });
     else if (e.type === "api-request" && e.id) starts.set(e.id, ts);
     else if (e.type === "system" && e.subtype === "compact_boundary") ev.push({ t: "compaction", ts });
-    else if (e.type === "user" && !e.isMeta) {
+    else if (e.type === "user" && (e.isCompactSummary || e.isVisibleInTranscriptOnly)) {
+      // the summary a compaction carries over ("This session is being continued..."): not a message
+      ev.push({ t: "activity", ts });
+    } else if (e.type === "user" && !e.isMeta) {
       const c = m.content;
+      // a local command (/compact): logged as <command-name> + <command-args>, its output as
+      // <local-command-stdout>, with no model turn of its own. One message; the output ends it.
+      const raw = typeof c === "string" ? c : "";
+      const cmd = /^\s*<command-name>([^<]*)<\/command-name>/.exec(raw);
+      if (cmd) {
+        const args = (/<command-args>([\s\S]*?)<\/command-args>/.exec(raw) || [])[1] || "";
+        ev.push({ t: "user", ts, text: `${cmd[1].trim()} ${args.trim()}`.trim() }, { t: "turn_start", ts });
+        continue;
+      }
+      if (/^\s*<local-command-(stdout|stderr)>/.test(raw)) { ev.push({ t: "turn_end", ts }); continue; }
       // what you typed only: the harness adds attachments as separate <system-reminder> text blocks
       const textPart = withoutReminders(typeof c === "string" ? c
         : Array.isArray(c) ? c.filter(p => p && p.type === "text").map(p => p.text).join("\n") : "");

@@ -141,7 +141,7 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [] }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -235,6 +235,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
           if (ignorePreserve || !(a.acceptInputOptions && a.acceptInputOptions.preserveInput)) { setText(chatInput, a.inputValue); setText(chatInput, ""); }
           // Local /compact: no message in the log, only the summarizing call (an aux request, warm)
           if (kind === "local" && /^\/compact\b/.test(a.inputValue || "")) {
+            if (compactUnlogged) return;      // VS Code 1.146: nothing at all in the log
             append([{ type: "llm_request", ts: clock + 10, dur: 3000, attrs: { debugName: "summarizeConversationHistory-full",
               model: "claude-opus-5.5", inputTokens: lastCtx, cachedTokens: lastCtx - 700, outputTokens: 900 } }]);
             return;
@@ -725,14 +726,14 @@ const never = () => new Promise(() => {});
     assert.strictEqual(after.cacheFrom, before.cacheFrom, "the countdown is unchanged");
   });
 
-  await check("Compact button: on the warning of a Local chat, sends /compact without your draft, confirmed by the log", async () => {
-    let buttons = [];
-    const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return b.find(x => x.startsWith("Compact")); } return never(); },
-                              draft: "my unsent text" });
+  await check("Compact from a Local chat's warning (More…): sends /compact without your draft, confirmed by the log", async () => {
+    let buttons = [], items = [];
+    const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return "More…"; } return never(); },
+                              menu: m => { items = m; return m.find(i => i.label === "Compact"); }, draft: "my unsent text" });
     try {
       await h.run(300);
-      assert.ok(buttons.some(b => /^Compact \(~[\d.]+ cr\)$/.test(b)), buttons.join(" | "));
-      assert.deepStrictEqual(buttons.map(b => b.replace(/ \(.*$/, "")), ["Keep warm", "Auto keep warm", "Summarize", "Compact", "Ignore"]);
+      assert.deepStrictEqual(buttons.map(b => b.replace(/ \(.*$/, "")), ["Keep warm", "Auto keep warm", "More…"]);
+      assert.ok(/\(~[\d.]+ cr\)/.test((items.find(i => i.label === "Compact") || {}).detail || ""), "Compact in the menu with its cost");
       assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text).join(" | "));
       assert.ok(h.sent[0].text.startsWith("/compact "), h.sent[0].text);
       assert.ok(h.submits[0].acceptInputOptions.preserveInput, "sent like VS Code sends /compact itself");
@@ -744,20 +745,22 @@ const never = () => new Promise(() => {});
   });
 
   await check("Compact: not offered for chats of other harnesses (not tested there yet), unless set", async () => {
+    const labels = items => items.map(i => i.label);
     for (const kind of ["sdk", "claude", "codex"]) {
-      let buttons = [];
-      const h = await harness({ kind, answer: (m, b, n) => { if (n === 1) buttons = b; return never(); },
+      let items = [];
+      const h = await harness({ kind, answer: (m, b, n) => n === 1 ? "More…" : never(), menu: m => { items = m; },
                                 settings: { ttlSeconds: { "gpt-6.1-sol": 300 } } });
       try {
-        await h.run(320, () => buttons.length > 0);
-        assert.ok(buttons.length && !buttons.some(b => b.startsWith("Compact")), `${kind}: ${buttons.join(" | ")}`);
+        await h.run(320, () => items.length > 0);
+        assert.ok(items.length && !labels(items).includes("Compact"), `${kind}: ${labels(items).join(" | ")}`);
       } finally { h.close(); }
     }
-    let buttons = [];
-    const h = await harness({ kind: "sdk", settings: { compactHarnesses: ["local", "sdk"] }, answer: (m, b, n) => { if (n === 1) buttons = b; return never(); } });
+    let items = [];
+    const h = await harness({ kind: "sdk", settings: { compactHarnesses: ["local", "sdk"] }, answer: (m, b, n) => n === 1 ? "More…" : never(),
+                              menu: m => { items = m; } });
     try {
       await h.run(260);
-      assert.ok(buttons.some(b => b.startsWith("Compact")), buttons.join(" | "));
+      assert.ok(labels(items).includes("Compact"), labels(items).join(" | "));
     } finally { h.close(); }
   });
 
@@ -784,6 +787,42 @@ const never = () => new Promise(() => {});
       assert.ok(extra > 0 && extra < 30, `expiry adds ${extra} cr after compacting (about 60 for 150k uncompacted): ${notice}`);
       await h.run(400);
       assert.strictEqual(h.sent.length, 1, "no second compaction or summary");
+    } finally { h.close(); }
+  });
+
+  await check("Local /compact that VS Code doesn't log (1.146): counted as done, no 'did not start' warning, no second one", async () => {
+    const h = await harness({ answer: never, ctx: 150000, settings: { autoAction: "compact" }, compactUnlogged: true });
+    try {
+      await h.run(330);
+      assert.strictEqual(h.sent.length, 1, h.sent.map(x => x.text.slice(0, 40)).join(" | "));
+      assert.ok(!h.warnings.some(w => /could not confirm|did not start/.test(w.msg)), h.warnings.map(w => w.msg).join(" | "));
+      await h.run(400);
+      assert.strictEqual(h.sent.length, 1, "no second compaction or summary");
+      const notice = h.infos.find(m => /Copilot cache expired/.test(m)) || "";
+      const extra = Number((/~([\d.]+) extra credits/.exec(notice) || [])[1]);
+      assert.ok(extra > 0 && extra < 30, `priced as compacted: ${notice}`);
+      assert.ok(h.closed.length >= 1, "its tab closed after a while");
+    } finally { h.close(); }
+  });
+
+  await check("a chat is not moved back into the Chat view once you have written in another chat", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "More…" : never(), menu: m => m.find(i => i.label === "Compact"),
+                              settings: { afterSend: "restoreLastTyped" }, compactUnlogged: true });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.ok((h.sent[0] || {}).text.startsWith("/compact "), "compaction sent");
+      // meanwhile you start working in another chat
+      await h.run(20);
+      const two = path.join(h.logs, "sess-2");
+      fs.cpSync(path.join(h.logs, "sess-1"), two, { recursive: true });
+      fs.appendFileSync(path.join(two, "main.jsonl"), [
+        { type: "user_message", ts: h.clock, attrs: { content: "Something else please" } },
+        { type: "llm_request", ts: h.clock + 10, dur: 500, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+          inputTokens: 41000, cachedTokens: 40000, outputTokens: 4, copilotUsageNanoAiu: 1e9 } }].map(e => JSON.stringify(e)).join("\n") + "\n");
+      await h.run(60);
+      await new Promise(r => setTimeout(r, 1500));
+      assert.ok(!h.ran.some(r => r.id === "workbench.action.chat.openInSidebar"), "not moved back");
+      assert.ok(h.closed.length >= 1, "its tab closed");
     } finally { h.close(); }
   });
 
@@ -1407,6 +1446,38 @@ const never = () => new Promise(() => {});
     assert.strictEqual(s.ttl, 3600, "1-hour cache tier in the log");
   });
 
+  await check("Claude log: a /compact (local command) is one message, Cache Keeper's own, done when 'Compacted'; the carried-over summary is not a message", () => {
+    const base = claudeChatLog(now - 120000);
+    const prompt = core.compactPrompt("en"), args = prompt.replace(/^\/compact\s*/, "");
+    const t0 = now - 20000;
+    const tail = [
+      cl("system", t0 + 1230, { subtype: "compact_boundary", compactMetadata: { trigger: "manual" } }),
+      cl("user", t0 + 1229, { isCompactSummary: true, isVisibleInTranscriptOnly: true,
+        message: { role: "user", content: "This session is being continued from a previous conversation that ran out of context." } }),
+      cl("user", t0, { isMeta: true, message: { role: "user", content: "<local-command-caveat>The command below was run directly in Claude Code</local-command-caveat>" } }),
+      cl("user", t0, { message: { role: "user", content: `<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args>${args}</command-args>` } }),
+      cl("user", t0 + 1400, { message: { role: "user", content: "<local-command-stdout>Compacted </local-command-stdout>" } })];
+    const s = core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(base + lines(tail)), { now, priceFor });
+    assert.strictEqual(s.busy, false, "not left busy after the compaction");
+    assert.ok(s.compactedAt >= t0, "compaction seen");
+    assert.ok(core.isOwnMessage(s.lastUserText), `last message is Cache Keeper's /compact: ${s.lastUserText}`);
+    assert.ok(!/being continued/.test(s.lastUserText || ""), "the summary is not a message");
+    const mid = core.analyzeTrace("claude", "/c/x", harnesses.claudeTrace(base + lines(tail.slice(2, 4))), { now, priceFor });
+    assert.strictEqual(mid.busy, true, "busy while the /compact runs");
+  });
+
+  await check("Copilot SDK log: a compaction counts from its start (logged at once), busy until its end", () => {
+    const base = sdkChatLog(now - 120000);
+    const t0 = now - 20000;
+    const started = base + lines([ev("session.compaction_start", t0, { compactionAttemptId: "a1" })]);
+    const run = core.analyzeSdk("/x/sdk-1", started, {}, now);
+    assert.strictEqual(run.compactStartedAt, t0, "start seen");
+    assert.strictEqual(run.busy, true, "busy while it runs");
+    const done = core.analyzeSdk("/x/sdk-1", started + lines([ev("session.compaction_complete", t0 + 14000, { success: true, compactionAttemptId: "a1" })]), {}, now);
+    assert.strictEqual(done.busy, false, "idle once complete");
+    assert.strictEqual(done.compactedAt, t0 + 14000);
+  });
+
   await check("Claude log: a reply streamed in blocks counts once; subagent calls don't move the timer", () => {
     const [req, reply] = claudeCall(now - 30000, now - 29000, { input: 152000, read: 150000, id: "dup" });
     const sub = { ...claudeCall(now - 1000, now - 500, { input: 9000, read: 0, id: "sub" })[1], isSidechain: true };
@@ -1994,15 +2065,26 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("warning: short, what no click does, costs on the buttons; a cost button works", async () => {
+  await check("warning: short, what no click does; 3 buttons (main, second, More…) that fit; a cost button works", async () => {
     let buttons;
     const h = await harness({ answer: (m, b, n) => { if (n === 1) { buttons = b; return b[0]; } return never(); } });
     try {
       await h.run(320);
       const msg = h.warnings[0].msg;
-      assert.ok(msg.length < 200 && /^Cache for ".+" expires in \d+s\. Expiry adds ~[\d.]+ cr to your next message\. No click: /.test(msg), msg);
-      assert.ok(/^Keep warm \(~[\d.]+ cr\)$/.test(buttons[0]) && buttons[1] === "Auto keep warm" && /^Summarize \(~[\d.]+ cr\)$/.test(buttons[2]), buttons.join(" | "));
+      assert.ok(msg.length < 160 && /^".+" expires in \d+s\. Expiry: \+[\d.]+ cr\. No click: /.test(msg), msg);
+      assert.ok(/^Keep warm \(~[\d.]+ cr\)$/.test(buttons[0]) && buttons[1] === "Auto keep warm" && buttons[2] === "More…" && buttons.length === 3, buttons.join(" | "));
       assert.ok(core.isKeepAlive(h.sent[0].text), "Keep warm (~x cr) chose Keep warm");
+    } finally { h.close(); }
+  });
+
+  await check("warning More… then the menu closed: the warning stays unanswered (last-chance status bar still shows)", async () => {
+    let menus = 0;
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "More…" : never(), menu: () => { menus++; return undefined; } });
+    try {
+      await h.run(280);
+      assert.strictEqual(menus, 1, "More… opened the chat's menu");
+      assert.ok(/click to choose/.test(h.status.text), h.status.text);
+      assert.strictEqual(h.sent.length, 0);
     } finally { h.close(); }
   });
 

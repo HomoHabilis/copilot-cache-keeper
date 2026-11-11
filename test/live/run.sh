@@ -47,6 +47,8 @@ cp package.json extension.js core.js sqlite.js harnesses.js "$LIVE/dev/"
 cp test/live/driver/package.json test/live/driver/extension.js "$LIVE/driver/"
 
 # Test folder: Cache Keeper's log mirrored to a file, every chat counted (cheap models too)
+# No expiry warnings: a chat in its warning's last 30 s goes first in Cache Keeper's "which chat?"
+# list, and the driver takes the first one (the chat it just wrote in).
 # Kept between runs: VS Code asks once whether you trust a new folder, and holds agent requests until then.
 mkdir -p "$WS/.vscode" "$(dirname "$ATTACH")"
 echo "Attached by the live test: must never go out with a keep-alive." > "$ATTACH"
@@ -55,6 +57,7 @@ cat > "$WS/.vscode/settings.json" <<EOF
   "cacheKeeper.debugLogFile": "$(echo "$WINTEMP_W\\ck-live.log" | sed 's/\\/\\\\/g')",
   "cacheKeeper.minCredits": 0,
   "cacheKeeper.afterSend": "restoreLastTyped",
+  "cacheKeeper.warnSeconds": 0,
   "cacheKeeper.compactHarnesses": ["local", "sdk", "claude", "codex"]
 }
 EOF

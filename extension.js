@@ -15,6 +15,7 @@ const SUMMARY_LEAD = 15;       // seconds before expiry for an automatic summary
 const QUEUED_AFTER_MS = 8000;  // our message not in the log by then: it was queued
 const NOT_LANDED_MS = 90000;   // our message still not in the log: stop waiting for it
 const REPLY_MAX_MS = 30 * 60000; // landed, but the reply never logged its end: clean up anyway
+const UNLOGGED_COMPACT_MS = 60000; // a compaction the log doesn't show: its tab is left alone this long
 // Automatic actions only for chats seen active since this window started: after a reload the
 // Chat view may show another chat, and a brand-new chat leaves no trace in the logs.
 const startedAt = Date.now();
@@ -864,7 +865,7 @@ async function sendNow(context, s, text, label, opts = {}) {
     // remember each chat's last message time (remote clock) to recognise ours when it lands
     const lastMsgs = new Map(all.map(x => [x.id, x.lastUserTs || 0]));
     // a /compact may not be logged as a message, only as the compaction it runs
-    const lastCompactions = new Map(all.map(x => [x.id, x.compactedAt || 0]));
+    const lastCompactions = new Map(all.map(x => [x.id, Math.max(x.compactedAt || 0, x.compactStartedAt || 0)]));
     // opening the tab took time: check again right before submitting
     const late = await unsafeToSend(s, opts);
     if (late) {
@@ -943,7 +944,11 @@ async function finishTab(p) {
   const policy = cfg("afterSend") || "restoreLastTyped";
   if (policy === "keepTab") return;
   try {
-    if (p.restore && policy === "restoreLastTyped") {
+    // You have written in another chat since we sent (a long reply or compaction): you moved on, and
+    // moving this chat into the Chat view now would take it from under you. Just close our tab.
+    const movedOn = p.sentAt && all.some(x => x.id !== p.sessionId && (x.lastRealUserTs || 0) > p.sentAt + (clockOffset || 0));
+    if (movedOn && p.restore && policy === "restoreLastTyped") logx(`${p.sessionId.slice(0, 8)} not moved back into the Chat view: you wrote in another chat since`);
+    if (p.restore && policy === "restoreLastTyped" && !movedOn) {
       // focus its tab again, then "Move Chat into Side Bar" (back into the Chat view)
       await vscode.commands.executeCommand("workbench.action.chat.openSessionInEditorGroup", { resource: p.uri });
       await sleep(400);
@@ -976,8 +981,10 @@ async function verifyPending() {
     let landedAt = landed && landed.lastUserTs;
     if (!landed && p.label === "compaction" && p.beforeCompaction) {
       // only the target chat: another chat may compact on its own meanwhile
-      landed = pool.find(x => x.id === p.expectId && (x.compactedAt || 0) > (p.beforeCompaction.get(x.id) || 0));
-      landedAt = landed && landed.compactedAt;
+      // its end, or its start where the harness logs one (Copilot SDK: the end can come 15 s later)
+      const at = x => Math.max(x.compactedAt || 0, x.compactStartedAt || 0);
+      landed = pool.find(x => x.id === p.expectId && at(x) > (p.beforeCompaction.get(x.id) || 0));
+      landedAt = landed && at(landed);
     }
     if (landed && !p.landed) {
       p.landed = landed.id;
@@ -988,6 +995,15 @@ async function verifyPending() {
           "Stopped acting on the original chat.");
       }
     }
+    // A Local /compact leaves nothing in the log (VS Code 1.146: no message, no summarizing call), so
+    // its absence says nothing: it was sent into an idle chat (unsafeToSend), so it ran. Counted from
+    // here as a compaction (pricing, no second one); the tab is left alone until it has had time to finish.
+    if (!p.landed && p.label === "compaction" && target && target.kind === "local" && Date.now() - p.sentAt > QUEUED_AFTER_MS) {
+      p.landed = p.expectId;
+      p.unlogged = true;
+      core.noteCompaction("local", target.dir, p.sentAt + (clockOffset || 0));
+      logx(`compaction for ${p.expectId.slice(0, 8)}: not in the chat's log (VS Code doesn't log a Local /compact); counted as done`);
+    }
     // Not in the log a few seconds after submitting: Copilot queued it behind work that started in
     // the meantime. It cannot be taken back from here, and it may run on an expired cache.
     if (!p.landed && !p.queuedWarned && Date.now() - p.sentAt > QUEUED_AFTER_MS) {
@@ -997,7 +1013,7 @@ async function verifyPending() {
         "it is queued. If it runs after the cache expires it re-sends the whole context" +
         (p.miss ? ` (~${core.fmt(p.miss)} cr extra)` : "") + ". Remove it from the chat's queue if you don't want that.");
     }
-    const done = p.landed && !(pool.find(x => x.id === p.landed) || {}).busy;
+    const done = p.landed && (p.unlogged ? Date.now() - p.sentAt > UNLOGGED_COMPACT_MS : !(pool.find(x => x.id === p.landed) || {}).busy);
     // a summary is done when the agent is, and then its file must be there
     if (done && p.label === "summary request" && !p.fileChecked) { p.fileChecked = true; checkHandoffWritten(st); }
     // Not landed after 90 s: give up. Landed: wait for the reply, however long (a handoff summary on
@@ -1373,12 +1389,14 @@ function chatName(s) {
 }
 
 /** Button labels with what each costs, when the price is known. */
-function costButtons(s, withAuto = true) {
-  const c = s.cost;
-  const compactBtn = canCompact(s) && !s.compactedIdle ? [c ? `Compact (~${core.fmt(c.compact)} cr)` : "Compact"] : [];
-  if (!c) return ["Keep warm", "Summarize", ...compactBtn, "Ignore"];
-  return [`Keep warm (~${core.fmt(c.heartbeat)} cr)`, ...(withAuto ? ["Auto keep warm"] : []),
-          `Summarize (~${core.fmt(c.summary)} cr)`, ...compactBtn, "Ignore"];
+// A warning has room for three short buttons (VS Code cuts the rest, and can't wrap them): the main
+// choice, a second one, and More... for the per-chat menu, where every choice has room for what it
+// does and costs. Closing the warning (X) is Ignore.
+const MORE = "More…";
+function warningButtons(s, withAuto = true) {
+  const c = s.cost, cost = x => c ? ` (~${core.fmt(x)} cr)` : "";
+  const second = withAuto && c ? "Auto keep warm" : `Summarize${cost(c && c.summary)}`;
+  return [`Keep warm${cost(c && c.heartbeat)}`, second, MORE];
 }
 
 async function offer(context, s) {
@@ -1387,11 +1405,13 @@ async function offer(context, s) {
   // take a notification back), so it never blocks the warning for a later window.
   const o = st.offer = { for: s.cacheFrom, answered: false, timedOut: false };
   const c = s.cost;
-  // Short: a toast cuts long text. The costs are on the buttons; the details are in the status-bar list.
-  const msg = `Cache for ${chatName(s)} expires in ${Math.max(0, Math.round(live(s)))}s.` +
-    (c ? ` Expiry adds ~${core.fmt(c.missExtra)} cr to your next message.` : " No price for this model.") +
+  // Short: a toast cuts long text. Every choice with its cost is in More... (the per-chat menu).
+  const msg = `${chatName(s)} expires in ${Math.max(0, Math.round(live(s)))}s.` +
+    (c ? ` Expiry: +${core.fmt(c.missExtra)} cr.` : " No price for this model.") +
     ` No click: ${noClickText(st, s)}.`;
-  const pick = choiceOf(await vscode.window.showWarningMessage(msg, ...costButtons(s))) || undefined;
+  const pick = choiceOf(await vscode.window.showWarningMessage(msg, ...warningButtons(s))) || undefined;
+  // More...: the per-chat menu; a choice there answers the warning (choose()), closing it does not
+  if (pick === MORE) { await chatMenu(context, all.find(x => x.id === s.id) || s); return; }
   o.answered = true;
   // Closed (X): a deliberate "not now", so the same as Ignore: nothing automatic, nothing spent,
   // no more warnings until you write in the chat again. (A warning that just slides into the
@@ -1424,10 +1444,11 @@ async function offerAtCap(context, s) {
     `kept warm ${fmtDuration(warmMs(st))}, ${core.fmt(st.spent)} of ${st.cap === null ? "?" : core.fmt(st.cap)} cr spent. ` +
     `Expires in ${Math.max(0, Math.round(live(s)))}s; expiry adds ~${core.fmt(c.missExtra)} cr. ` +
     `No click: ${closing(s) ? `${autoText(s)}, then it expires` : "it expires"}.`;
-  const [keep, ...rest] = costButtons(s, false);
+  const [keep] = warningButtons(s, false);
   const again = `Auto keep warm (new cap ~${core.fmt(fresh)} cr${timeUp ? `, ${fmtDuration(maxWarmMs())}` : ""})`;
-  const pick = await vscode.window.showWarningMessage(msg, keep, again, ...rest);
-  if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
+  const pick = await vscode.window.showWarningMessage(msg, keep, again, MORE);
+  if (pick === MORE) { st.quietFor = undefined; await chatMenu(context, all.find(x => x.id === s.id) || s); }
+  else if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
 
 /** How many expired chats the list keeps (cacheKeeper.expiredChats, default 5). */
@@ -1512,12 +1533,16 @@ async function pickChat(context) {
   clearInterval(timer);
   qp.dispose();
   if (!chat) return;
-  const st = stateFor(chat.s.id);
+  await chatMenu(context, all.find(x => x.id === chat.s.id) || chat.s);   // the latest state: the list may have been open a while
+}
+
+/** The menu of one chat (from the list, or a warning's More...): every choice, with what it does and costs. */
+async function chatMenu(context, cs) {
+  const st = stateFor(cs.id);
   // the expiry notice can slide into the notification center unseen: the same action lives here too
   const handoff = await findHandoff(st) ? [{ label: NEW_FROM_HANDOFF,
     detail: `Open a new chat with ${path.posix.basename(st.handoff.path)} attached` +
-      (chat.s.cost ? ` (first message ≈ ${core.fmt(chat.s.cost.restart)} cr)` : "") }] : [];
-  const cs = all.find(x => x.id === chat.s.id) || chat.s;   // the latest state: the list may have been open a while
+      (cs.cost ? ` (first message ≈ ${core.fmt(cs.cost.restart)} cr)` : "") }] : [];
   const pick = await vscode.window.showQuickPick([...handoff, ...choiceItems(st, cs)],
     { placeHolder: `${describe(cs)}: what should happen before its cache expires? (now: ${modeLabel(st.mode)})` });
   if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || cs.kind);

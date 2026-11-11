@@ -82,7 +82,9 @@ for (const h of wanted) {
       const to = lines.findIndex((l, i) => i > from && /llm_request|usage_record|token_usage_record|"usage"/.test(l));
       r.noAttachment = from >= 0 ? !lines.slice(from, to < 0 ? undefined : to + 1).some(l => l.includes(MARKER)) : "?";
       if (COMPACT) {
-        r.compacted = new RegExp(`compaction sent to ${m[1]}`).test(ckLog) && ev.slice(kaIdx).some(e => e.t === "compaction");
+        // Local: VS Code (1.146) logs nothing for a /compact, so Cache Keeper counts it as done itself
+        const counted = h === "local" && new RegExp(`compaction for ${m[1]}: not in the chat's log .*counted as done`).test(ckLog);
+        r.compacted = new RegExp(`compaction sent to ${m[1]}`).test(ckLog) && (counted || ev.slice(kaIdx).some(e => e.t === "compaction"));
         r.compactCache = "?";
         if (h === "local") {         // the summarizing call is in the Agent Debug Log with its tokens
           const req = lines.map(l => { try { return JSON.parse(l); } catch { return null; } })

@@ -474,6 +474,16 @@ function keepAliveFixedPart(pairs) {
  *   priceFor(model) -> Copilot price sheet (token_prices) when the log carries no prices,
  *   credits: credits spent, when known from elsewhere (else summed from the calls, or estimated).
  */
+// Compactions that leave no trace in the chat's log: VS Code 1.146 logs nothing at all for a Local
+// /compact (no message, no summarizing call, not in the transcript either). Cache Keeper notes the
+// ones it sent here, as "<kind>|<dir>" -> time (the log's clock), and analyzeTrace counts them like
+// logged ones. Kept for this window's life only.
+const unloggedCompactions = new Map();
+function noteCompaction(kind, dir, ts) {
+  const k = `${kind}|${dir}`;
+  unloggedCompactions.set(k, Math.max(unloggedCompactions.get(k) || 0, ts));
+}
+
 function analyzeTrace(kind, dir, trace, opts = {}) {
   if (!trace) return null;
   const { events, info = {} } = trace;
@@ -486,8 +496,12 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // re-sends the compacted chat, not what the last call read. Its size is known only once a call
   // has run on it, so until then it is estimated.
   const compactions_ = events.filter(e => e.t === "compaction");
-  const compactedAt = compactions_.length ? compactions_[compactions_.length - 1].ts : 0;
+  // ... or one Cache Keeper knows ran but the log doesn't show (noteCompaction)
+  const compactedAt = Math.max(compactions_.length ? compactions_[compactions_.length - 1].ts : 0,
+    unloggedCompactions.get(`${kind}|${dir}`) || 0);
   const compactedIdle = compactedAt > (last.end || last.ts);
+  // a compaction that has started (some harnesses log its start at once, its end much later)
+  const compactStartedAt = Math.max(0, ...events.filter(e => e.t === "compacting").map(e => e.ts));
   let ctx = last.input;                              // after any compaction: what a miss re-sends
   // Size of a fresh chat's first prompt: about the chat's first call, minus any big attachments in
   // that first message (capped).
@@ -589,7 +603,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
   return {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom,
-    lastEnd: last.end || last.ts, compactedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
+    lastEnd: last.end || last.ts, compactedAt, compactStartedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
@@ -833,5 +847,5 @@ module.exports = {
   orderChats, MARKER, SUMMARY_TAGS, summaryPrompt, handoffStart, KEEPALIVES, KEEPALIVES_BY_LANG, keepAliveText, detectLanguage, isKeepAlive, isOwnMessage, nodeIo, analyze, readSession, readSessions, canAffordHeartbeat, autoCap, ttlFor, ttlSource, learnTtls,
   LIFETIME_MAX_AGE_DAYS, rates, priceSheetFrom, fmt, keepAliveJitter, summaryWords, describeLog,
   analyzeSdk, readSdkSession, readSdkSessions, sdkChatOwner, parseYamlFlat, setMeasuredTtls, provenGaps, gapsFromLog, defaultTtl,
-  analyzeTrace, cachedTrace, parseGrowing,
+  analyzeTrace, cachedTrace, parseGrowing, noteCompaction,
 };
