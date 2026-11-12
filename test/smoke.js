@@ -1679,7 +1679,8 @@ const never = () => new Promise(() => {});
       const cs = path.join(h.dir, "workspaceStorage", "ws1", "chatSessions");
       fs.mkdirSync(cs, { recursive: true });
       fs.writeFileSync(path.join(cs, "wsl-chat.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
-      const homes = [{ distro: "Ubuntu", home }];
+      // read through Node's fs, as when VS Code's file API refuses \\wsl.localhost
+      const homes = [{ distro: "Ubuntu", home, io: h.ext._spendHooks.nodeIo }];
       homes.stopped = ["Debian"];
       h.ext._spendHooks.wslHomes = async () => homes;
       h.vscode.window.showInformationMessage = () => new Promise(() => {});

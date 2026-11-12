@@ -162,8 +162,35 @@ function makeIo(remoteSide) {
   };
   return self;
 }
+/**
+ * The same file access through Node's own fs, on this computer: for \\\\wsl.localhost paths, which
+ * VS Code's file API may refuse (security.restrictUNCAccess) while Node reads them.
+ */
+function makeNodeIo() {
+  const fsp = require("fs").promises;
+  const self = {
+    toUri: p => vscode.Uri.file(p),
+    join: (...parts) => path.join(...parts),
+    async stat(p) { try { const st = await fsp.stat(p); return { mtime: st.mtimeMs, size: st.size }; } catch { return null; } },
+    async readBytes(p) { try { return await fsp.readFile(p); } catch { return null; } },
+    async readText(p) {
+      const st = await self.stat(p);
+      if (!st) return null;
+      const key = `n|${p}`, hit = fileCache.get(key);
+      if (hit && hit.mtime === st.mtime && hit.size === st.size) return hit.text;
+      const b = await self.readBytes(p);
+      if (!b) return null;
+      const text = b.toString("utf8");
+      fileCache.set(key, { mtime: st.mtime, size: st.size, text });
+      return text;
+    },
+    async list(d) { try { return await fsp.readdir(d); } catch { return []; } },
+  };
+  return self;
+}
 const io = makeIo(true);       // the window's side: Copilot's logs and the workspace
 const localIo = makeIo(false); // Windows side: Copilot CLI sessions there, our own lock files
+const nodeIo = makeNodeIo();   // WSL distros seen from Windows, when VS Code's file API refuses them
 function toUri(p) { return io.toUri(p); }
 
 /**
@@ -657,11 +684,11 @@ async function spendSides(context) {
     const wsl = [], homes = await spendHooks.wslHomes();
     const notes = [...(homes.notes || [])];
     if (homes.stopped && homes.stopped.length) notes.push(`not running, not read: ${homes.stopped.join(", ")} (start them to include their chats)`);
-    for (const { distro, home } of homes) {
+    for (const { distro, home, io: hio = localIo } of homes) {
       const server = path.join(home, ".vscode-server");
-      if (!(await localIo.stat(server))) { notes.push(`${distro}: no VS Code server in ${home}`); continue; }
+      if (!(await hio.stat(server))) { notes.push(`${distro}: no VS Code server in ${home}`); continue; }
       const data = path.join(server, "data");
-      wsl.push({ name: `WSL ${distro} (${path.basename(home)})`, io: localIo, ws: path.join(data, "User", "workspaceStorage"),
+      wsl.push({ name: `WSL ${distro} (${path.basename(home)})`, io: hio, ws: path.join(data, "User", "workspaceStorage"),
                  home, data, db: path.join(data, "User", "globalStorage", "agent-host.db") });
     }
     return { sides: [...(ui ? [ui] : []), ...wsl], ui, wslNotes: notes };
@@ -694,22 +721,33 @@ async function wslHomes() {
   if (!installed.names.length) return homes;
   const running = await list(["--running"]);
   homes.stopped = installed.names.filter(d => !running.names.includes(d));
+  // VS Code's file API first, else Node's (VS Code may refuse UNC hosts it hasn't been told to allow)
+  const tryList = async (fio, d) => {
+    try {
+      return fio === nodeIo ? { names: await require("fs").promises.readdir(d) }
+        : { names: (await vscode.workspace.fs.readDirectory(vscode.Uri.file(d))).map(([n]) => n) };
+    } catch (e) { return { names: [], err: String((e && (e.code || e.message)) || e).slice(0, 160) }; }
+  };
   for (const distro of running.names) {
+    const errs = [];
     let found = false;
     for (const prefix of ["\\\\wsl.localhost\\", "\\\\wsl$\\"]) {
       const base = `${prefix}${distro}\\home`;
-      const users = await localIo.list(base);
-      if (!users.length) continue;
-      for (const u of users) homes.push({ distro, home: path.join(base, u) });
-      found = true;
-      break;
+      for (const fio of [localIo, nodeIo]) {
+        const r = await tryList(fio, base);
+        if (r.err) { errs.push(`${base}: ${r.err}`); continue; }
+        for (const u of r.names) homes.push({ distro, home: path.join(base, u), io: fio });
+        found = true;
+        break;
+      }
+      if (found) break;
     }
-    if (!found) homes.notes.push(`${distro}: \\\\wsl.localhost\\${distro}\\home could not be read`);
+    if (!found) homes.notes.push(`${distro}: its home folders could not be read (${errs.join("; ")})`);
   }
   return homes;
 }
 // replaced by the tests
-const spendHooks = { wslHomes };
+const spendHooks = { wslHomes, nodeIo };
 
 /** A workspace's name from its workspace.json; an untitled multi-folder workspace has none. */
 const wsLabel = info => {
