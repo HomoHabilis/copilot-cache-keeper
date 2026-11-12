@@ -1338,6 +1338,34 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("Fusion: countdown follows the first cache to expire among models used since your last message", () => {
+    const now = Date.now(), m = 60000;
+    const P = { sol: { input: 140, cache_read: 7, cache_write: 175, output: 700 }, luna: { input: 7, cache_read: 0.7, cache_write: 8.75, output: 35 } };
+    const use = (t, model, input, read) => { const u = sdkUsage(t, 1000, { model, input, read, ttl: 1800, auto: true });
+      u.data.usage.copilotUsage.tokenDetails = Object.entries(P[model === "gpt-6.1-sol" ? "sol" : "luna"])
+        .map(([k, v]) => ({ batchSize: 1e6, costPerBatch: v * 1e9, tokenType: k, tokenCount: 1 })); return u; };
+    const turn = (t, text, model, input, read) => [ev("user.message", t, { content: text }), ev("assistant.turn_start", t + 5),
+      use(t + 10, model, input, read), ev("assistant.turn_end", t + 1100), ev("session.usage_checkpoint", t + 1110)];
+    const ka = core.KEEPALIVES_BY_LANG.it[1];
+    // you write (sol answers), 28 min later a keep-alive goes to luna: sol's cache still decides
+    let log = [ev("session.start", now - 40 * m), ...turn(now - 28 * m, "Confronta le cartelle", "gpt-6.1-sol", 121000, 15000),
+               ...turn(now - 2 * m, ka, "gpt-6-luna", 93000, 0)].map(e => JSON.stringify(e)).join("\n") + "\n";
+    let x = core.analyzeSdk("/x/fusion", log, {}, now);
+    assert.strictEqual(x.routed, true);
+    assert.strictEqual(x.model, "gpt-6.1-sol");
+    assert.ok(Math.abs(x.remaining - 120) < 2, String(x.remaining));        // 28 min after sol's call
+    // at most what the next message re-sends (93k now)
+    assert.ok(Math.abs(x.cost.missExtra - 93000 * (175 - 7) / 1e6) < 0.01, String(x.cost.missExtra));
+    assert.strictEqual(x.lastMsgCall.firstForModel, true);
+    assert.deepStrictEqual(x.caches.map(c => c.model), ["gpt-6.1-sol", "gpt-6-luna"]);
+    // a new message from you: only the models used since then count
+    log += [...turn(now - 1 * m, "Vai avanti", "gpt-6-luna", 95000, 93000)].map(e => JSON.stringify(e)).join("\n") + "\n";
+    x = core.analyzeSdk("/x/fusion", log, {}, now);
+    assert.strictEqual(x.model, "gpt-6-luna");
+    assert.deepStrictEqual(x.caches.map(c => c.model), ["gpt-6-luna"]);
+    assert.ok(Math.abs(x.remaining - 1740) < 2, String(x.remaining));
+  });
+
   await check("Fusion (auto model) SDK chat: no keep-warm offered or sent, Summarize still offered", async () => {
     const now = Date.now();
     assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000, { auto: true }), {}, now).routed, true);

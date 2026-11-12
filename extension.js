@@ -609,11 +609,12 @@ function noteHit(s) {
   const warm = pct >= 50;
   if (h.own) {
     hitStats[warm ? "warm" : "cold"]++;
-    hitStats.last = [...hitStats.last, `${s.id.slice(0, 8)} ${pct}% after ${h.sinceStart} s`].slice(-5);
+    hitStats.last = [...hitStats.last, `${s.id.slice(0, 8)} ${pct}% after ${h.firstForModel ? "a model switch" : h.sinceStart + " s"}`].slice(-5);
   }
   logx(`cache ${warm ? "hit" : "MISS"} for ${h.own ? "Cache Keeper's message" : "your message"} in ${s.id.slice(0, 8)}: ` +
     `${pct}% cached (${Math.round(h.cached / 1000)}k of ${Math.round(h.input / 1000)}k), ` +
-    `${h.sinceStart} s after the previous call started (${h.sinceEnd} s after it ended), lifetime ${s.ttl} s`);
+    (h.firstForModel ? `first call to ${h.model} in this chat (Fusion switched model: its own cache)`
+      : `${h.sinceStart} s after the previous ${s.routed ? h.model + " " : ""}call started (${h.sinceEnd} s after it ended), lifetime ${s.ttl} s`));
 }
 
 const whyShown = new Map();    // chat id -> reason last logged for not listing it ("" = listed)
@@ -2019,7 +2020,13 @@ function updateStatus(context) {
   if (s.busy && r <= 0) md.push("**Agent working past the cache lifetime:** the cache has possibly expired. The countdown " +
     "runs from the last model call's start; a long answer can still leave it cached. The next call's cache hit is logged " +
     "in the Output panel (Cache Keeper).", "");
-  if (s.routed) md.push(`Fusion (auto model): no keep-warm. ${ROUTED_WHY}.`, "");
+  if (s.routed) {
+    md.push(`Fusion (auto model): no keep-warm. ${ROUTED_WHY}.  `);
+    if (s.caches && s.caches.length > 1) md.push("Models since your last message (the countdown follows the first to expire):  ",
+      ...s.caches.map(x => { const left = x.ttl - (Date.now() + (clockOffset || 0) - x.cacheFrom) / 1000;
+        return `${x.model}: ${left > 0 ? mmss(left) : "expired"} (lifetime ${x.ttl} s)  `; }));
+    md.push("");
+  }
   if (st.mode === "once" && r > 0) md.push("Keep-alive armed: one is sent just before expiry.", "");
   if (costlyRestart) {
     md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
