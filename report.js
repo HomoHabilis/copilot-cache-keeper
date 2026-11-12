@@ -11,7 +11,7 @@ const MISS_MIN_CTX = 30000;     // ignore misses on small prompts
 const MISS_CACHED_BELOW = 0.5;  // less than half the prompt cached: a miss
 const TYPICAL_NEW = 1000;       // tokens a normal message adds uncached (not part of a miss)
 const BIG_CTX = 100000;         // above this, the context is re-read (at the cache price) on every call
-const KIND_NAME = { local: "Local", "local-msg": "Local, older chats", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" };
+const KIND_NAME = { local: "Local", "local-msg": "Local, per message", sdk: "Copilot SDK", claude: "Claude", codex: "Codex" };
 
 /**
  * Per-token credits for a call: what its log says it was billed (Copilot SDK: cache_read, cache_write,
@@ -345,7 +345,8 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
       `${c.misses ? `${c.misses} (${cr(c.missCredits)} cr)` : "0"} | ${k(c.maxCtx)} | ${day(c.last)} |`);
   }
   L.push("", "## How it is computed", "",
-    "- Local, older chats: chats whose debug log VS Code has removed, read from VS Code's own chat files, one line per " +
+    "- Local, per message: chats with no Agent Debug Log (it is off by default, and VS Code removes old ones), read from " +
+    "VS Code's own chat files, one line per " +
     "message with the credits it was billed (all its model calls together). Their expired caches: a pause before the " +
     "message longer than the cache lifetime, priced on the message's prompt.",
     "- Credits: as billed where the log says (Local, Copilot SDK; Claude scaled to the credits Copilot billed for the chat), " +
@@ -369,11 +370,18 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
 // ---------------------------------------------------------------- VS Code's own chat files
 // workspaceStorage/<workspace>/chatSessions/<chat id>.jsonl, on the side VS Code's UI runs (Windows
 // for a WSL window): an op log of the chat's requests, one per message, each with the credits it was
-// billed. Kept after the chat's debug log is gone, so older chats still count.
+// billed. Kept after the chat's debug log is gone, so older chats still count. VS Code before 1.109,
+// or with chat.useLogSessionStorage off, writes <chat id>.json instead: the whole chat as one object.
+// Chats of a window with no folder open are in globalStorage/emptyWindowChatSessions.
 
-/** The chat's requests, replayed from the op log. */
+/** The chat's requests, replayed from the op log (or read from a whole-chat .json file). */
 function chatFileRequests(text) {
   let reqs = [];
+  // a whole-chat .json file parses as one object with its requests; an op log (one change per line) does not
+  try {
+    const o = JSON.parse(String(text || ""));
+    if (o && Array.isArray(o.requests)) return [...o.requests];
+  } catch { /* an op log */ }
   for (const line of String(text || "").split("\n")) {
     let o;
     try { o = JSON.parse(line); } catch { continue; }
@@ -391,10 +399,11 @@ function chatFileRequests(text) {
 /**
  * One "call" per billed message of a chat file (see analyzeSpend, kind "local-msg"), and the chat's
  * title (its first message). Copies of the same chat (VS Code keeps one per workspace folder it was
- * in) are merged by the caller: pass all their texts.
+ * in) are merged by the caller: pass all their texts. `unbilled`: finished messages since `since` that
+ * carry tokens but no credits (not counted).
  */
-function chatFileMessages(texts) {
-  const best = new Map();
+function chatFileMessages(texts, since = 0) {
+  const best = new Map(), unbilled = new Set();
   let title = "";
   for (const text of texts) {
     const reqs = chatFileRequests(text);
@@ -411,11 +420,14 @@ function chatFileMessages(texts) {
                     toolShare: tools && tools.percentageOfPrompt ? tools.percentageOfPrompt / 100 : undefined };
         const k = `${ts}|${i}`, old = best.get(k);
         if (!old || m.credits > old.credits) best.set(k, m);   // the most complete copy
+      } else if (ts && ts >= since && el && (q.copilotCredits === undefined || q.copilotCredits === null) && (q.promptTokens || q.completionTokens)) {
+        unbilled.add(`${ts}|${i}`);   // a finished message with tokens but no credits: not counted, but said
       }
       if (ts && el) prevEnd = ts + el;
     });
   }
-  return { title, events: [...best.values()].sort((a, b) => a.ts - b.ts) };
+  for (const k of best.keys()) unbilled.delete(k);
+  return { title, events: [...best.values()].sort((a, b) => a.ts - b.ts), unbilled: unbilled.size };
 }
 
 /** Adds another copy's events to a chat: each event once (same kind, time and tokens), in time order. */

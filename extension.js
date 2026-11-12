@@ -663,21 +663,33 @@ async function gatherSpend(context, since, progress) {
   const { sides, ui } = spendSides(context);
   for (const side of sides) {
     const fio = side.io, at = side.name ? `${side.name}: ` : "";
-    // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json)
+    // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json),
+    // or, for a window with no folder open, the same under globalStorage/github.copilot-chat. The
+    // Agent Debug Log is off by default: without it, Local chats come from VS Code's chat files below.
     if (side.ws) {
       step(`${at}Local chats`);
       let n = 0;
+      const logDirs = [];
       for (const w of await fio.list(side.ws)) {
         const dl = fio.join(side.ws, w, "GitHub.copilot-chat", "debug-logs");
         const dirs = await fio.list(dl);
         if (!dirs.length) continue;
-        const label = wsLabel(jsonOr(await fio.readText(fio.join(side.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
+        logDirs.push({ dl, dirs, label: wsLabel(jsonOr(await fio.readText(fio.join(side.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) });
+      }
+      for (const ext of ["github.copilot-chat", "GitHub.copilot-chat"]) {
+        const dl = fio.join(side.ws, "..", "globalStorage", ext, "debug-logs");
+        const dirs = await fio.list(dl);
+        if (dirs.length && !logDirs.some(x => x.dl.toLowerCase() === dl.toLowerCase())) logDirs.push({ dl, dirs, label: "(no folder)" });
+      }
+      for (const { dl, dirs, label } of logDirs) {
         for (const id of dirs) {
-          withLog.add(id);
           const dir = fio.join(dl, id), st = await fio.stat(fio.join(dir, "main.jsonl"));
-          if (!st || st.mtime < since) continue;
+          if (!st) continue;
+          if (st.mtime < since) { withLog.add(id); continue; }
           const trace = harnesses.localTrace(await fio.readText(fio.join(dir, "main.jsonl")));
+          // a log with no model call in it: the chat's file below still counts it
           if (!trace) continue;
+          withLog.add(id);
           const models = await fio.readText(fio.join(dir, "models.json"));
           const s = core.analyzeTrace("local", dir, trace, { priceFor });
           // its subagents' logs (the other .jsonl files) and the MCP share of its tool definitions
@@ -754,26 +766,33 @@ async function gatherSpend(context, since, progress) {
   }
   // Older Local chats, whose debug log is gone: VS Code's own chat files, on the UI side (Windows for
   // a WSL window), one record per message with its billed credits. Copies of a chat are merged.
+  // Chat files: <chat id>.jsonl (an op log), or <chat id>.json (VS Code before 1.109, or with
+  // chat.useLogSessionStorage off); a window with no folder open keeps them in globalStorage.
   if (ui) {
-    step("older Local chats");
+    step("Local chats from VS Code's chat files");
     const copies = new Map();
-    for (const w of await localIo.list(ui.ws)) {
-      const cs = path.join(ui.ws, w, "chatSessions");
-      const files = (await localIo.list(cs)).filter(f => f.endsWith(".jsonl"));
+    const folders = [];
+    for (const w of await localIo.list(ui.ws))
+      folders.push({ cs: path.join(ui.ws, w, "chatSessions"), labelOf: async () => wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) });
+    folders.push({ cs: path.join(ui.ws, "..", "globalStorage", "emptyWindowChatSessions"), labelOf: async () => "(no folder)" });
+    let nFiles = 0;
+    for (const { cs, labelOf } of folders) {
+      const files = (await localIo.list(cs)).filter(f => /\.jsonl?$/.test(f));
       if (!files.length) continue;
-      const label = wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
+      const label = await labelOf();
       for (const f of files) {
-        const id = f.slice(0, -".jsonl".length);
+        const id = f.replace(/\.jsonl?$/, "");
         const st = await localIo.stat(path.join(cs, f));
         if (!st || st.mtime < since) continue;
+        nFiles++;
         if (!copies.has(id)) copies.set(id, { texts: [], labels: [] });
         copies.get(id).texts.push(await localIo.readText(path.join(cs, f)));
         copies.get(id).labels.push(label);
       }
     }
-    let older = 0;
+    let older = 0, unbilled = 0;
     for (const [id, c] of copies) {
-      const { title, events } = report.chatFileMessages(c.texts);
+      const { title, events, unbilled: nb } = report.chatFileMessages(c.texts, since);
       const toolShares = events.filter(e => e.toolShare).map(e => ({ ts: e.ts, share: e.toolShare }));
       // a chat that has a debug log: only its tool-definition share is taken from here
       if (withLog.has(id)) {
@@ -781,13 +800,16 @@ async function gatherSpend(context, since, progress) {
         if (ch) ch.toolShares = toolShares;
         continue;
       }
+      unbilled += nb;
       if (!events.length) continue;
       older++;
       // named after a plain folder when one copy is (another may be a multi-folder workspace)
       const label = c.labels.find(l => !/\.code-workspace$/.test(l)) || c.labels[0];
       chats.push({ kind: "local-msg", id, title, workspace: label, events, toolShares, sheetFor: priceFor });
     }
-    where.push(`Older Local chats (no debug log left): ${older}, from VS Code's chat files in ${ui.ws}`);
+    where.push(`Local chats with no debug log: ${older}, from VS Code's chat files in ${ui.ws}` +
+      ` (${nFiles} chat file(s) changed in the period)` +
+      (unbilled ? `; ${unbilled} message(s) left out: VS Code recorded no credits for them` : ""));
   }
   if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
   return { chats, where };
