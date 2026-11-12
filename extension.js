@@ -485,7 +485,8 @@ async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null)
 // 30 min: this workspace's Local chats first, else the most recently used workspaces.
 let priceBook = { text: null, at: 0, from: "", wideAt: 0 };
 const PRICE_WIDE_MS = 60000;   // no price sheet yet: other workspaces are searched at most this often
-async function refreshPrices(context) {
+/** `wide`: search other workspaces now, whenever this one has no price sheet (the spend report). */
+async function refreshPrices(context, wide = false) {
   if (Date.now() - priceBook.at < 30 * 60 * 1000 && priceBook.text) return;
   priceBook.at = Date.now();
   const newest = async dirs => {
@@ -501,7 +502,7 @@ async function refreshPrices(context) {
   };
   let best = logRootPath ? await newest([logRootPath]) : null;
   // other workspaces: every workspaceStorage folder, so not on every read while none has prices
-  if (!best && Date.now() - priceBook.wideAt >= PRICE_WIDE_MS) {
+  if (!best && (wide || Date.now() - priceBook.wideAt >= PRICE_WIDE_MS)) {
     priceBook.wideAt = Date.now();
     const ws = workspaceStorageRoot(context);
     if (ws) {
@@ -524,7 +525,9 @@ function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook
 /** VS Code's workspaceStorage folder on the window's side (every workspace's Local chat logs). */
 function workspaceStorageRoot(context) {
   return remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
-    : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
+    : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath))
+    // a window with no folder open has no workspace storage: workspaceStorage sits next to globalStorage
+    : context.globalStorageUri ? path.join(path.dirname(path.dirname(context.globalStorageUri.fsPath)), "workspaceStorage") : null;
 }
 
 // ---------------------------------------------------------------- cache lifetimes
@@ -878,7 +881,7 @@ async function spendReport(context, daysArg) {
   const since = Date.now() - days * 86400000;
   const text = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Cache Keeper: reading chat logs" },
     async progress => {
-      await refreshPrices(context);
+      await refreshPrices(context, true);
       const { chats, where } = await gatherSpend(context, since, progress);
       const a = report.analyzeSpend(chats, { since, ttlOverrides: cfg("ttlSeconds") || {} });
       logx(`spend report, ${days} days: ${core.fmt(a.total)} cr, ${a.calls} calls in ${a.chats} chats` +

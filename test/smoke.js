@@ -141,10 +141,11 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [] }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [], noFolder = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
-  const storage = path.join(tmp, "workspaceStorage", "ws1");
+  // a window with no folder open: VS Code gives no workspace storage; workspaceStorage sits next to globalStorage
+  const storage = noFolder ? path.join(tmp, "data", "User", "workspaceStorage", "ws1") : path.join(tmp, "workspaceStorage", "ws1");
   const logs = path.join(storage, "GitHub.copilot-chat", "debug-logs");
   // Copilot SDK chats live under ~/.copilot: point the home folder at the temp dir
   const realHome = process.env.HOME;
@@ -195,7 +196,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                  onDidChangeTextDocument: f => { changeListeners.push(f); return { dispose() { changeListeners.splice(changeListeners.indexOf(f), 1); } }; },
                  applyEdit: async e => { for (const [u, t] of e.edits) setText([chatInput, otherInput].find(d => d.uri.toString() === u.toString()), t); return true; },
                  // more folders = a multi-root workspace: tmp, tmp/repo2, ...
-                 workspaceFolders: Array.from({ length: folders }, (_, i) => {
+                 workspaceFolders: noFolder ? undefined : Array.from({ length: folders }, (_, i) => {
                    const f = i ? path.join(tmp, `repo${i + 1}`) : tmp;
                    return { uri: { scheme: "file", fsPath: f, path: f, with(o) { return { ...this, ...o, fsPath: o.path || this.fsPath }; } } };
                  }) },
@@ -277,7 +278,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const ext = require("../extension");
   fs.mkdirSync(logs, { recursive: true });
   const memento = new Map();
-  ext.activate({ storageUri: { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
+  ext.activate({ storageUri: noFolder ? undefined : { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
                  globalStorageUri: { fsPath: path.join(globalStorage, "local.copilot-cache-keeper") },
                  globalState: { get: k => memento.get(k), update: async (k, v) => { memento.set(k, v); } } });
   await ext._read();                                  // first read: no chats yet
@@ -1690,6 +1691,20 @@ const never = () => new Promise(() => {});
       assert.ok(/Copilot prices: .*wsl-chat.models\.json/.test(md), "the price sheet read there");
       assert.ok(/\| Codex \| gpt-6\.1-sol \|/.test(md) && !/no known price/.test(md), "the Codex chat is priced");
     } finally { h.close(); }
+  });
+
+  await check("spend report in a window with no folder open: Copilot's prices found in other workspaces, right after it opens", async () => {
+    for (const kind of ["claude", "codex"]) {
+      const h = await harness({ kind, answer: never, noFolder: true });
+      try {
+        await h.run(5);
+        h.vscode.window.showInformationMessage = () => new Promise(() => {});
+        await h.commands["cacheKeeper.spendReport"](60);
+        const md = fs.readFileSync(h.ran.find(r => r.id === "markdown.showPreview").a.fsPath, "utf8");
+        assert.ok(/Copilot prices: .*price-src.models\.json/.test(md), md.slice(md.indexOf("Read:")));
+        assert.ok(!/no known price/.test(md) && !/\*\*0\.00 credits\*\*/.test(md), md.split("\n")[2]);
+      } finally { h.close(); }
+    }
   });
 
   // ---------------------------------------------------------------- Claude and Codex harnesses
