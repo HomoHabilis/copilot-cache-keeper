@@ -742,7 +742,13 @@ async function wslHomes() {
       }
       if (found) break;
     }
-    if (!found) homes.notes.push(`${distro}: its home folders could not be read (${errs.join("; ")})`);
+    if (found) continue;
+    // VS Code blocks UNC hosts it hasn't been told to allow, for its file API and for Node's fs alike:
+    // that is the user's security setting, so say how to allow it rather than work around it
+    if (errs.some(e => /ERR_UNC_HOST_NOT_ALLOWED/.test(e)))
+      homes.notes.push(`${distro}: not read, VS Code blocks \\\\wsl.localhost here (security.restrictUNCAccess). To include it, add ` +
+        `"wsl.localhost" to the setting security.allowedUNCHosts and restart VS Code, or run the report from a WSL window`);
+    else homes.notes.push(`${distro}: its home folders could not be read (${errs.join("; ")})`);
   }
   return homes;
 }
