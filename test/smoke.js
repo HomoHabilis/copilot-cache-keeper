@@ -141,7 +141,7 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [] }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -296,6 +296,11 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   } else {
     fs.writeFileSync(path.join(chat, "models.json"), MODELS);
     fs.writeFileSync(path.join(chat, "main.jsonl"), chatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+  }
+  // handoff summaries already in the workspace, written before this window started
+  for (const n of handoffs) {
+    fs.mkdirSync(path.join(tmp, ".copilot-handoff"), { recursive: true });
+    fs.writeFileSync(path.join(tmp, ".copilot-handoff", n), "# handoff\n");
   }
   await ext._read();
   const h = {
@@ -1130,6 +1135,22 @@ const never = () => new Promise(() => {});
       fs.writeFileSync(other, "# handoff");
       await h.commands["cacheKeeper.options"]();
       assert.strictEqual(offered[0], "New chat from handoff", offered.join(", "));
+    } finally { h.close(); }
+  });
+
+  await check("window restarted: an expired chat's earlier handoff file is found and offered", async () => {
+    let offered;
+    const h = await harness({ answer: () => undefined, settings: { autoAction: "off" },
+      handoffs: ["20261110-0900-sess-1.md", "20261111-1335-sess-1.md", "20261111-1400-other123.md", "notes.md"],
+      menu: items => { offered = items.map(i => i.label); return items.find(i => i.label === "New chat from handoff"); } });
+    try {
+      await h.run(400);                          // well past expiry
+      assert.ok(!h.sent.length, "nothing sent");
+      await h.commands["cacheKeeper.options"]();
+      assert.strictEqual(offered[0], "New chat from handoff", String(offered));
+      const open = h.ran.find(x => x.id === "workbench.action.chat.open");
+      assert.ok(open && open.a.attachFiles[0].fsPath.endsWith("20261111-1335-sess-1.md"), "the newest of this chat's files");
+      assert.ok(h.lists[0].some(i => /handoff summary ready/.test(i.detail)), "listed as ready");
     } finally { h.close(); }
   });
 
