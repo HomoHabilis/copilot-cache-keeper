@@ -926,6 +926,7 @@ function setAll(r) {
     if (!baseline[kind] && ready) baseline[kind] = new Map(r.filter(x => x.kind === kind).map(x => [x.id, x.cacheFrom]));
   }
   all = r;
+  return recoverHandoffs(r);
 }
 /** This chat's state read again from its own log (Local or SDK). */
 async function reread(s) {
@@ -1258,6 +1259,37 @@ async function findHandoff(st) {
     if (await exists(u)) { st.handoff = u; return true; }
   }
   return false;
+}
+
+/**
+ * A handoff summary written before this window (re)started: Cache Keeper only remembered it in
+ * memory, so after a reload the chat showed "summary" nowhere and New chat from handoff was gone.
+ * The file is named after the chat (<date>-<time>-<chat id>.md): take the newest one for each chat
+ * from every workspace folder's .copilot-handoff/. Looked up once per chat and cache window.
+ */
+async function recoverHandoffs(chats) {
+  const todo = chats.filter(s => { const st = stateFor(s.id); return !st.handoff && st.handoffLookedFor !== s.cacheFrom; });
+  if (!todo.length) return;
+  const files = [];                 // { n, uri } in every folder's .copilot-handoff/
+  for (const f of vscode.workspace.workspaceFolders || []) {
+    const dir = vscode.Uri.joinPath(f.uri, ".copilot-handoff");
+    try {
+      for (const [n] of await vscode.workspace.fs.readDirectory(dir)) if (HANDOFF_NAME.test(n)) files.push({ n, uri: vscode.Uri.joinPath(dir, n) });
+    } catch { /* no such folder */ }
+  }
+  for (const s of todo) {
+    const st = stateFor(s.id);
+    st.handoffLookedFor = s.cacheFrom;
+    const tail = `-${s.id.slice(0, 8)}.md`;
+    const mine = files.filter(x => x.n.endsWith(tail)).sort((a, b) => b.n < a.n ? -1 : b.n > a.n ? 1 : 0);
+    if (!mine.length) continue;
+    st.handoff = mine[0].uri;
+    st.handoffLang = s.lang;
+    st.handoffKind = s.kind;
+    // still up to date if written after your last message (Summarize then says so instead of asking again)
+    try { if ((await vscode.workspace.fs.stat(st.handoff)).mtime >= (s.lastRealUserTs || 0)) st.handoffCovers = s.lastRealUserTs; } catch { /* gone */ }
+    logx(`handoff summary ${mine[0].n} found for ${s.id.slice(0, 8)} (written before this window started)`);
+  }
 }
 
 /**
@@ -2132,4 +2164,4 @@ function activate(context) {
 function deactivate() {}
 
 // for tests
-module.exports = { activate, deactivate, _noOverlap: noOverlap, _read: async (c) => { setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };
+module.exports = { activate, deactivate, _noOverlap: noOverlap, _read: async (c) => { await setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };
