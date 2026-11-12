@@ -500,6 +500,8 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   if (!calls.length) return null;
   const last = calls[calls.length - 1];
   const model = last.model || "?";
+  // Fusion (auto model): Copilot picks the model for each call, and each model has its own cache
+  const routed = !!last.auto;
   // Compacted since the last call (the /compact command, or an idle compaction): the next message
   // re-sends the compacted chat, not what the last call read. Its size is known only once a call
   // has run on it, so until then it is estimated.
@@ -567,9 +569,11 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   if (lastMsg) {
     const i = calls.findIndex(c => c.ts >= lastMsg.ts - slack);
     if (i > 0) {
-      const c = calls[i], p = calls[i - 1];
-      lastMsgCall = { at: lastMsg.ts, own: isOurs(lastMsg), input: c.input || 0, cached: c.cached || 0,
-                      sinceStart: Math.round((c.ts - p.ts) / 1000), sinceEnd: Math.round((c.ts - (p.end || p.ts)) / 1000) };
+      // Fusion: compared with the previous call of the same model (each model has its own cache)
+      const c = calls[i], p = routed ? calls.slice(0, i).reverse().find(x => x.model === c.model) : calls[i - 1];
+      lastMsgCall = { at: lastMsg.ts, own: isOurs(lastMsg), input: c.input || 0, cached: c.cached || 0, model: c.model || "?",
+                      firstForModel: !p, sinceStart: p ? Math.round((c.ts - p.ts) / 1000) : null,
+                      sinceEnd: p ? Math.round((c.ts - (p.end || p.ts)) / 1000) : null };
     }
   }
   // Prices: what the log says this chat was billed per token (exact), else Copilot's price sheet,
@@ -593,6 +597,23 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   }
   let cost = null, words = summaryWords(stats);      // cost null = price unknown for this model
   if (r) ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
+  // Fusion: what a cold message could add, at worst: the costliest of the models used since your
+  // last message, losing what it cached (its last prompt, at most what the next message re-sends).
+  // Used for cacheKeeper.minCredits: a Fusion chat is listed like any other once that is reached.
+  let models = null;
+  if (routed) {
+    const since = Math.max(0, ...real.map(u => u.ts || 0)) - slack;
+    const latest = new Map();                         // model -> its last call since your last message
+    for (const c of calls) if (c.ts >= since) latest.set(c.model || "?", c);
+    if (!latest.size) latest.set(model, last);
+    models = [...latest.keys()];
+    if (cost && !compactedIdle) {
+      cost.missExtra = Math.max(0, ...[...latest.values()].map(c => {
+        const rm = (c.rates && toR(c.rates)) || r;
+        return Math.min(ctx, c.input || 0) * (rm.write - rm.read);
+      }));
+    }
+  }
   // Credits spent: billed per call when the log says, otherwise estimated from the prices.
   let credits = 0, creditsEstimated = false;
   for (const c of calls) {
@@ -615,6 +636,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
+    routed, models,                                   // Fusion, and the models used since your last message
     remaining: ttl - (now - cacheFrom) / 1000,
     lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,

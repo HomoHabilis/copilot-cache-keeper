@@ -4,7 +4,7 @@
 //
 // The shared event list, oldest first:
 //   { t: "user", ts, text }       a message in the chat (yours or Cache Keeper's)
-//   { t: "call", ts, model, input, cached, written, out, credits?, ttl?, expiresAt?, rates? }
+//   { t: "call", ts, model, input, cached, written, out, credits?, ttl?, expiresAt?, rates?, auto? }
 //                                 a model call of the chat's own conversation. ts = when the request
 //                                 started (the cache is refreshed then); input = whole prompt incl.
 //                                 cached; written = tokens written to the cache; credits = billed;
@@ -131,7 +131,9 @@ function sdkTrace(eventsText, yaml = {}) {
                   cached: u.cacheReadTokens || 0, written: u.cacheWriteTokens, out: u.outputTokens || 0,
                   credits: u.copilotUsage && u.copilotUsage.totalNanoAiu !== undefined ? u.copilotUsage.totalNanoAiu / 1e9 : undefined,
                   ttl, expiresAt: time(u.cacheExpiresAt) || undefined, rates: sdkRates(u), effort,
-                  side: u.initiator !== undefined && u.initiator !== "user" && u.initiator !== "agent" });
+                  side: u.initiator !== undefined && u.initiator !== "user" && u.initiator !== "agent",
+                  // Fusion (auto model): Copilot picks the model for each call
+                  auto: u.isAuto === true || undefined });
         break;
       }
       default:

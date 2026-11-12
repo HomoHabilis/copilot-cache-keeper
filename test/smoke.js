@@ -63,10 +63,10 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20
 // Copilot SDK chat log (~/.copilot/session-state/<id>/events.jsonl), same prices as Opus above.
 const SDK_PRICES = { input: 400, cache_read: 20, cache_write: 500, output: 2000 };   // credits per 1M tokens
 const iso = t => new Date(t).toISOString();
-function sdkUsage(start, dur, { model = "claude-opus-5.5", input, read, write = input - read, out = 300, ttl = 300 }) {
+function sdkUsage(start, dur, { model = "claude-opus-5.5", input, read, write = input - read, out = 300, ttl = 300, auto }) {
   const counts = { input: input - read - write, cache_read: read, cache_write: write, output: out };
   return { type: "session.usage_record", timestamp: iso(start + dur), data: { usage: {
-    model, inputTokens: input, cacheReadTokens: read, cacheWriteTokens: write, outputTokens: out, duration: dur,
+    model, isAuto: auto, inputTokens: input, cacheReadTokens: read, cacheWriteTokens: write, outputTokens: out, duration: dur,
     cacheExpiresAt: iso(start + ttl * 1000), cacheTtlSeconds: ttl,
     copilotUsage: { totalNanoAiu: Object.entries(counts).reduce((a, [k, n]) => a + n * SDK_PRICES[k] * 1e3, 0),
       tokenDetails: Object.entries(counts).map(([k, n]) => ({ batchSize: 1e6, costPerBatch: SDK_PRICES[k] * 1e9, tokenCount: n, tokenType: k })) } } } };
@@ -77,12 +77,12 @@ function sdkTurn(t, text, { input, read, out = 300, dur = 2000, model } = {}) {
           sdkUsage(t + 10, dur, { input, read, out, model }), ev("assistant.turn_end", t + dur + 50, { turnId: "0" }),
           ev("session.usage_checkpoint", t + dur + 60)];
 }
-function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model } = {}) {
+function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model, auto } = {}) {
   return [ev("session.start", t0 - 100),
           ev("user.message", t0, { content: "Refactor the parser" }), ev("assistant.turn_start", t0 + 10, { turnId: "0" }),
-          sdkUsage(t0 + 50, 3000, { input: first, read: 0, out: 800, model }), ev("assistant.turn_end", t0 + 3900, { turnId: "0" }),
+          sdkUsage(t0 + 50, 3000, { input: first, read: 0, out: 800, model, auto }), ev("assistant.turn_end", t0 + 3900, { turnId: "0" }),
           ev("assistant.turn_start", t0 + 3950, { turnId: "1" }),
-          sdkUsage(t0 + 4000, 2000, { input: ctx, read: ctx - 1000, out: 300, model }),
+          sdkUsage(t0 + 4000, 2000, { input: ctx, read: ctx - 1000, out: 300, model, auto }),
           ev("assistant.message", t0 + 6000, { content: "Done: the parser is split in three files." }),
           ev("assistant.turn_end", t0 + 6500, { turnId: "1" }), ev("session.usage_checkpoint", t0 + 6510),
          ].map(e => JSON.stringify(e)).join("\n") + "\n";
@@ -141,7 +141,7 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -285,7 +285,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   fs.mkdirSync(chat, { recursive: true });
   if (kind === "sdk") {
     fs.writeFileSync(path.join(chat, "workspace.yaml"), `id: ${sdkId}\ncwd: ${sdkCwd || tmp}\nclient_name: vscode-agent-host\nsummary_count: 0\n`);
-    fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+    fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, auto: sdkAuto, ...(first ? { first } : {}) }));
   } else if (kind === "claude" || kind === "codex") {
     fs.writeFileSync(path.join(chat, logName), (kind === "claude" ? claudeChatLog : codexChatLog)(clock - 7000, { ctx, cwd, ...(first ? { first } : {}) }));
     // Copilot's price sheet, as a Local chat of the workspace has it (Claude and Codex logs carry no prices)
@@ -299,7 +299,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   }
   await ext._read();
   const h = {
-    sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
+    sent, warnings, commands, ran, dir: tmp, settings, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
     memento, globalStorage, sdkRoot, lists, logs, opened, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
@@ -1076,6 +1076,18 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("auto keep warm keeps going when the expiry estimate drops below minCredits", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(), settings: { autoKeepWarmCapPercent: 100 } });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.sent.length, 1, "first keep-alive");
+      h.settings.minCredits = 1e9;      // e.g. a cold call made the estimate drop under the floor
+      await h.run(320, () => h.sent.length > 1);
+      assert.strictEqual(h.sent.length, 2, "second keep-alive still sent");
+      assert.ok(!/expired/.test(h.status.text), h.status.text);
+    } finally { h.close(); }
+  });
+
   await check("expired chat with a handoff summary: tooltip gives the new-chat cost", async () => {
     const h = await harness({ answer: () => "Summarize", settings: { thresholdTokens: 30000 } });
     try {
@@ -1323,6 +1335,55 @@ const never = () => new Promise(() => {});
       await h.run(10);
       await h.commands["cacheKeeper.options"]();
       assert.ok(h.lists.at(-1)[0].description.startsWith("Copilot SDK"), h.lists.at(-1)[0].description);
+    } finally { h.close(); }
+  });
+
+  await check("Fusion: only models used since your last message count; cost of a cold message from the costliest", () => {
+    const now = Date.now(), m = 60000;
+    const P = { sol: { input: 140, cache_read: 7, cache_write: 175, output: 700 }, luna: { input: 7, cache_read: 0.7, cache_write: 8.75, output: 35 } };
+    const use = (t, model, input, read) => { const u = sdkUsage(t, 1000, { model, input, read, ttl: 1800, auto: true });
+      u.data.usage.copilotUsage.tokenDetails = Object.entries(P[model === "gpt-6.1-sol" ? "sol" : "luna"])
+        .map(([k, v]) => ({ batchSize: 1e6, costPerBatch: v * 1e9, tokenType: k, tokenCount: 1 })); return u; };
+    const turn = (t, text, model, input, read) => [ev("user.message", t, { content: text }), ev("assistant.turn_start", t + 5),
+      use(t + 10, model, input, read), ev("assistant.turn_end", t + 1100), ev("session.usage_checkpoint", t + 1110)];
+    const ka = core.KEEPALIVES_BY_LANG.it[1];
+    // you write (sol answers), 26 min later a keep-alive goes to luna: both models count
+    let log = [ev("session.start", now - 40 * m), ...turn(now - 28 * m, "Confronta le cartelle", "gpt-6.1-sol", 121000, 15000),
+               ...turn(now - 2 * m, ka, "gpt-6-luna", 93000, 0)].map(e => JSON.stringify(e)).join("\n") + "\n";
+    let x = core.analyzeSdk("/x/fusion", log, {}, now);
+    assert.strictEqual(x.routed, true);
+    assert.deepStrictEqual(x.models, ["gpt-6.1-sol", "gpt-6-luna"]);
+    // worst case: sol (the costlier) cold, at most what the next message re-sends (93k now)
+    assert.ok(Math.abs(x.cost.missExtra - 93000 * (175 - 7) / 1e6) < 0.01, String(x.cost.missExtra));
+    assert.strictEqual(x.lastMsgCall.firstForModel, true);     // the keep-alive: luna's first call, not a miss
+    // a new message from you: only the models used since then count
+    log += [...turn(now - 1 * m, "Vai avanti", "gpt-6-luna", 95000, 93000)].map(e => JSON.stringify(e)).join("\n") + "\n";
+    x = core.analyzeSdk("/x/fusion", log, {}, now);
+    assert.deepStrictEqual(x.models, ["gpt-6-luna"]);
+    assert.ok(Math.abs(x.cost.missExtra - 95000 * (8.75 - 0.7) / 1e6) < 0.01, String(x.cost.missExtra));
+  });
+
+  await check("Fusion (auto model) SDK chat: no countdown, no pop-ups, nothing automatic; Summarize on request", async () => {
+    const now = Date.now();
+    assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000, { auto: true }), {}, now).routed, true);
+    assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000), {}, now).routed, false);
+    const h = await harness({ kind: "sdk", sdkAuto: true, answer: never, ctx: 150000, settings: { thresholdTokens: 30000 } });
+    try {
+      await h.run(250);
+      assert.ok(/^\$\(versions\) Fusion · 150k/.test(h.status.text), h.status.text);
+      assert.ok(/no countdown, no keep-warm, nothing automatic/.test(h.status.tooltip.value), h.status.tooltip.value);
+      await h.run(150);                 // past the lifetime: no warning, no automatic summary, no expired notice
+      assert.strictEqual(h.warnings.length, 0, "no expiry warning");
+      assert.strictEqual(h.sent.length, 0, "nothing sent on its own");
+      assert.ok(!h.infos.some(m => /cache expired/.test(m)), h.infos.join(" | "));
+      assert.ok(/^\$\(versions\) Fusion/.test(h.status.text), h.status.text);
+      await h.commands["cacheKeeper.keepWarmNow"]();
+      assert.strictEqual(h.sent.length, 0, "no keep-alive");
+      assert.ok(h.infos.some(m => /no keep-warm for .*Fusion picks the model/.test(m)), h.infos.join(" | "));
+      await h.commands["cacheKeeper.options"]();
+      assert.ok(h.lists.at(-1).some(i => /Fusion/.test(i.label)), "listed");
+      await h.commands["cacheKeeper.summaryNow"]();   // on request: sent, no cost question about an expired cache
+      assert.ok(h.sent.some(x => x.text.includes("handoff summary")), h.sent.map(x => x.text).join(" | "));
     } finally { h.close(); }
   });
 
