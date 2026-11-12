@@ -359,7 +359,8 @@ function spendMarkdown(a, { days, where = [], date = new Date() } = {}) {
     (Object.keys(a.measured).length ? ` (${Object.entries(a.measured).map(([m, g]) => `${m} ≥${g} s`).join(", ")})` : "") +
     ", else the known values (Claude 5 min, Sol 6.1 30 min)." +
     (a.unknownLifetime.length ? ` No data for ${a.unknownLifetime.join(", ")}: no expiry judged for them.` : ""),
-    "- Read on this window's side (Windows, WSL, SSH host or container): Local chats of every workspace, and the Copilot SDK, " +
+    "- Read on this window's side (Windows, WSL, SSH host or container), on Windows too for a remote window, and in the " +
+    "running WSL distros for a Windows window: Local chats of every workspace, and the Copilot SDK, " +
     "Claude and Codex chats VS Code created. Your own Claude Code sessions are not Copilot spend and are left out.",
     "- For reasoning effort, tool definitions, older chats, Copilot CLI and OpenCode, run tools/spend-analyzer/analyze_spend.py " +
     "(Python) from the repository.");

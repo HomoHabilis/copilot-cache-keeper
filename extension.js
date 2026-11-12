@@ -643,24 +643,71 @@ function unmanagedWhy(s) {
  * window) and, for a remote window, Windows too (its own Local, Copilot SDK and harness chats, and
  * VS Code's chat files, which stay on Windows for every window).
  */
-function spendSides(context) {
+async function spendSides(context) {
   const user = context.globalStorageUri ? path.dirname(path.dirname(context.globalStorageUri.fsPath)) : null;   // .../Code/User
   const ui = user && { name: remote ? "this computer" : "", io: localIo,
     ws: context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : path.join(user, "workspaceStorage"),
     home: require("os").homedir(), data: path.dirname(user), db: path.join(user, "globalStorage", "agent-host.db") };
-  if (!remote) return { sides: ui ? [ui] : [], ui };
+  if (!remote) {
+    // a Windows window also reads the WSL distros that are running (their VS Code server and agent
+    // chats, seen through \\wsl.localhost), as the Python helper does: WSL windows' chats live there
+    const wsl = [], homes = await spendHooks.wslHomes();
+    if (homes.stopped && homes.stopped.length) wsl.stopped = homes.stopped;
+    for (const { distro, home } of homes) {
+      const server = path.join(home, ".vscode-server");
+      if (!(await localIo.stat(server))) continue;
+      const data = path.join(server, "data");
+      wsl.push({ name: `WSL ${distro} (${path.basename(home)})`, io: localIo, ws: path.join(data, "User", "workspaceStorage"),
+                 home, data, db: path.join(data, "User", "globalStorage", "agent-host.db") });
+    }
+    return { sides: [...(ui ? [ui] : []), ...wsl], ui, stopped: wsl.stopped };
+  }
   const win = { name: remote.authority, io, ws: workspaceStorageRoot(context), home: sdkLoc && sdkLoc.home,
     data: sdkLoc && sdkLoc.data, db: sdkLoc && sdkLoc.db };
   return { sides: [win, ...(ui ? [ui] : [])], ui };
 }
 
-const wsLabel = info => decodeURIComponent(String(info.folder || info.workspace || "").replace(/\/+$/, "").split("/").pop() || "");
+/** Home folders of the running WSL distros, seen from Windows (none elsewhere, or when WSL is stopped). */
+async function wslHomes() {
+  if (process.platform !== "win32") return [];
+  const list = flags => new Promise(resolve => {
+    require("child_process").execFile("wsl.exe", ["-l", "-q", ...flags], { encoding: "buffer", timeout: 15000, windowsHide: true },
+      (err, out) => {
+        if (err || !out) return resolve([]);
+        // UTF-16 by default; UTF-8 with WSL_UTF8 or newer wsl.exe versions
+        const text = out.includes(0) ? out.toString("utf16le") : out.toString("utf8");
+        resolve(text.replace(/\u0000/g, "").split(/\r?\n/).map(x => x.trim().replace(/^\ufeff/, "")).filter(Boolean));
+      });
+  });
+  const homes = [], running = await list(["--running"]);
+  homes.stopped = (await list([])).filter(d => !running.includes(d));
+  for (const distro of running) {
+    for (const prefix of ["\\\\wsl.localhost\\", "\\\\wsl$\\"]) {
+      const base = `${prefix}${distro}\\home`;
+      const users = await localIo.list(base);
+      if (!users.length) continue;
+      for (const u of users) homes.push({ distro, home: path.join(base, u) });
+      break;
+    }
+  }
+  return homes;
+}
+// replaced by the tests
+const spendHooks = { wslHomes };
+
+/** A workspace's name from its workspace.json; an untitled multi-folder workspace has none. */
+const wsLabel = info => {
+  const last = decodeURIComponent(String(info.folder || info.workspace || "").replace(/\/+$/, "").split("/").pop() || "");
+  return last === "workspace.json" ? "untitled workspace" : last;
+};
 
 async function gatherSpend(context, since, progress) {
   const chats = [], where = [];
   const step = m => progress && progress.report({ message: m });
   const withLog = new Set();     // chats that have a debug log (any age): their chat file is not counted again
-  const { sides, ui } = spendSides(context);
+  const { sides, ui, stopped } = await spendSides(context);
+  if (stopped) where.push(`WSL distros not running, not read: ${stopped.join(", ")} (start them to include their chats)`);
+  let newestSheet = null;    // the newest models.json read: Copilot's prices when this window has none yet
   for (const side of sides) {
     const fio = side.io, at = side.name ? `${side.name}: ` : "";
     // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json),
@@ -691,6 +738,7 @@ async function gatherSpend(context, since, progress) {
           if (!trace) continue;
           withLog.add(id);
           const models = await fio.readText(fio.join(dir, "models.json"));
+          if (models && (!newestSheet || st.mtime > newestSheet.mtime)) newestSheet = { mtime: st.mtime, text: models, from: fio.join(dir, "models.json") };
           const s = core.analyzeTrace("local", dir, trace, { priceFor });
           // its subagents' logs (the other .jsonl files) and the MCP share of its tool definitions
           const files = await fio.list(dir), subEvents = [];
@@ -811,7 +859,11 @@ async function gatherSpend(context, since, progress) {
       ` (${nFiles} chat file(s) changed in the period)` +
       (unbilled ? `; ${unbilled} message(s) left out: VS Code recorded no credits for them` : ""));
   }
-  if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
+  // a window with no folder open finds no price sheet of its own: the newest one read above serves
+  // (priceFor is only called once the chats are analysed, after this)
+  if (!priceBook.text && newestSheet) priceBook = { ...priceBook, text: newestSheet.text, from: newestSheet.from };
+  where.push(priceBook.from ? `Copilot prices: ${priceBook.from}` :
+    "Copilot prices: none found (no Local chat with a debug log on any side read): cache misses are not priced");
   return { chats, where };
 }
 
@@ -2186,4 +2238,4 @@ function activate(context) {
 function deactivate() {}
 
 // for tests
-module.exports = { activate, deactivate, _noOverlap: noOverlap, _read: async (c) => { await setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };
+module.exports = { activate, deactivate, _spendHooks: spendHooks, _noOverlap: noOverlap, _read: async (c) => { await setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };

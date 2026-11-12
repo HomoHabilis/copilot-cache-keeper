@@ -1664,6 +1664,34 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("spend report from a Windows window: running WSL distros are read too; prices from there when this window has none", async () => {
+    const h = await harness({ kind: "codex", answer: never, noPrices: true });
+    try {
+      await h.run(5);
+      // a WSL distro's VS Code server, with a Local chat's debug log (and Copilot's price sheet)
+      const home = path.join(h.dir, "wsl", "home", "dev");
+      const dl = path.join(home, ".vscode-server", "data", "User", "workspaceStorage", "wsl-ws", "GitHub.copilot-chat", "debug-logs", "wsl-chat");
+      fs.mkdirSync(dl, { recursive: true });
+      fs.writeFileSync(path.join(dl, "main.jsonl"), chatLog(h.clock - 3600000, { ctx: 60000 }));
+      fs.writeFileSync(path.join(dl, "models.json"), MODELS);
+      // its chat file stays on Windows: counted once, from the log
+      const cs = path.join(h.dir, "workspaceStorage", "ws1", "chatSessions");
+      fs.mkdirSync(cs, { recursive: true });
+      fs.writeFileSync(path.join(cs, "wsl-chat.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
+      const homes = [{ distro: "Ubuntu", home }];
+      homes.stopped = ["Debian"];
+      h.ext._spendHooks.wslHomes = async () => homes;
+      h.vscode.window.showInformationMessage = () => new Promise(() => {});
+      await h.commands["cacheKeeper.spendReport"](60);
+      const md = fs.readFileSync(h.ran.find(r => r.id === "markdown.showPreview").a.fsPath, "utf8");
+      assert.ok(/WSL Ubuntu \(dev\): Local chats: 1, in /.test(md), md);
+      assert.ok(/WSL distros not running, not read: Debian/.test(md), "stopped distros are named");
+      assert.ok(!/999/.test(md), "the WSL chat's file on Windows is not counted again");
+      assert.ok(/Copilot prices: .*wsl-chat.models\.json/.test(md), "the price sheet read there");
+      assert.ok(/\| Codex \| gpt-6\.1-sol \|/.test(md) && !/no known price/.test(md), "the Codex chat is priced");
+    } finally { h.close(); }
+  });
+
   // ---------------------------------------------------------------- Claude and Codex harnesses
   const harnesses = require("../harnesses");
   const ALL_KINDS = [["local", {}], ["sdk", {}], ["claude", {}], ["codex", { ttlSeconds: { "gpt-6.1-sol": 300 } }]];
