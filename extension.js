@@ -655,15 +655,16 @@ async function spendSides(context) {
     // a Windows window also reads the WSL distros that are running (their VS Code server and agent
     // chats, seen through \\wsl.localhost), as the Python helper does: WSL windows' chats live there
     const wsl = [], homes = await spendHooks.wslHomes();
-    if (homes.stopped && homes.stopped.length) wsl.stopped = homes.stopped;
+    const notes = [...(homes.notes || [])];
+    if (homes.stopped && homes.stopped.length) notes.push(`not running, not read: ${homes.stopped.join(", ")} (start them to include their chats)`);
     for (const { distro, home } of homes) {
       const server = path.join(home, ".vscode-server");
-      if (!(await localIo.stat(server))) continue;
+      if (!(await localIo.stat(server))) { notes.push(`${distro}: no VS Code server in ${home}`); continue; }
       const data = path.join(server, "data");
       wsl.push({ name: `WSL ${distro} (${path.basename(home)})`, io: localIo, ws: path.join(data, "User", "workspaceStorage"),
                  home, data, db: path.join(data, "User", "globalStorage", "agent-host.db") });
     }
-    return { sides: [...(ui ? [ui] : []), ...wsl], ui, stopped: wsl.stopped };
+    return { sides: [...(ui ? [ui] : []), ...wsl], ui, wslNotes: notes };
   }
   const win = { name: remote.authority, io, ws: workspaceStorageRoot(context), home: sdkLoc && sdkLoc.home,
     data: sdkLoc && sdkLoc.data, db: sdkLoc && sdkLoc.db };
@@ -672,26 +673,38 @@ async function spendSides(context) {
 
 /** Home folders of the running WSL distros, seen from Windows (none elsewhere, or when WSL is stopped). */
 async function wslHomes() {
-  if (process.platform !== "win32") return [];
-  const list = flags => new Promise(resolve => {
-    require("child_process").execFile("wsl.exe", ["-l", "-q", ...flags], { encoding: "buffer", timeout: 15000, windowsHide: true },
+  const homes = [];
+  homes.notes = [];
+  if (process.platform !== "win32") return homes;
+  const sys = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const exe = [path.join(sys, "System32", "wsl.exe"), path.join(sys, "Sysnative", "wsl.exe"), "wsl.exe"];
+  // `wsl -l -q [--running]`: one distro per line. Exits non-zero, with a message, when none is running.
+  const list = (flags, i = 0) => new Promise(resolve => {
+    require("child_process").execFile(exe[i], ["-l", "-q", ...flags], { encoding: "buffer", timeout: 15000, windowsHide: true },
       (err, out) => {
-        if (err || !out) return resolve([]);
+        if (err && err.code === "ENOENT" && i + 1 < exe.length) return resolve(list(flags, i + 1));
         // UTF-16 by default; UTF-8 with WSL_UTF8 or newer wsl.exe versions
-        const text = out.includes(0) ? out.toString("utf16le") : out.toString("utf8");
-        resolve(text.replace(/\u0000/g, "").split(/\r?\n/).map(x => x.trim().replace(/^\ufeff/, "")).filter(Boolean));
+        const text = !out ? "" : out.includes(0) ? out.toString("utf16le") : out.toString("utf8");
+        const names = text.replace(/\u0000/g, "").split(/\r?\n/).map(x => x.trim().replace(/^\ufeff/, "")).filter(Boolean);
+        resolve({ names: err ? [] : names, err: err && (err.code === "ENOENT" ? "wsl.exe not found" : names.join(" ") || err.message) });
       });
   });
-  const homes = [], running = await list(["--running"]);
-  homes.stopped = (await list([])).filter(d => !running.includes(d));
-  for (const distro of running) {
+  const installed = await list([]);
+  if (installed.err) { homes.notes.push(installed.err); return homes; }
+  if (!installed.names.length) return homes;
+  const running = await list(["--running"]);
+  homes.stopped = installed.names.filter(d => !running.names.includes(d));
+  for (const distro of running.names) {
+    let found = false;
     for (const prefix of ["\\\\wsl.localhost\\", "\\\\wsl$\\"]) {
       const base = `${prefix}${distro}\\home`;
       const users = await localIo.list(base);
       if (!users.length) continue;
       for (const u of users) homes.push({ distro, home: path.join(base, u) });
+      found = true;
       break;
     }
+    if (!found) homes.notes.push(`${distro}: \\\\wsl.localhost\\${distro}\\home could not be read`);
   }
   return homes;
 }
@@ -708,8 +721,8 @@ async function gatherSpend(context, since, progress) {
   const chats = [], where = [];
   const step = m => progress && progress.report({ message: m });
   const withLog = new Set();     // chats that have a debug log (any age): their chat file is not counted again
-  const { sides, ui, stopped } = await spendSides(context);
-  if (stopped) where.push(`WSL distros not running, not read: ${stopped.join(", ")} (start them to include their chats)`);
+  const { sides, ui, wslNotes } = await spendSides(context);
+  for (const n of wslNotes || []) where.push(`WSL: ${n}`);
   let newestSheet = null;    // the newest models.json read: Copilot's prices when this window has none yet
   for (const side of sides) {
     const fio = side.io, at = side.name ? `${side.name}: ` : "";

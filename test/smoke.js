@@ -1686,7 +1686,7 @@ const never = () => new Promise(() => {});
       await h.commands["cacheKeeper.spendReport"](60);
       const md = fs.readFileSync(h.ran.find(r => r.id === "markdown.showPreview").a.fsPath, "utf8");
       assert.ok(/WSL Ubuntu \(dev\): Local chats: 1, in /.test(md), md);
-      assert.ok(/WSL distros not running, not read: Debian/.test(md), "stopped distros are named");
+      assert.ok(/WSL: not running, not read: Debian/.test(md), "stopped distros are named");
       assert.ok(!/999/.test(md), "the WSL chat's file on Windows is not counted again");
       assert.ok(/Copilot prices: .*wsl-chat.models\.json/.test(md), "the price sheet read there");
       assert.ok(/\| Codex \| gpt-6\.1-sol \|/.test(md) && !/no known price/.test(md), "the Codex chat is priced");
