@@ -299,7 +299,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   }
   await ext._read();
   const h = {
-    sent, warnings, commands, ran, dir: tmp, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
+    sent, warnings, commands, ran, dir: tmp, settings, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
     memento, globalStorage, sdkRoot, lists, logs, opened, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
@@ -1073,6 +1073,18 @@ const never = () => new Promise(() => {});
       assert.strictEqual(h.warnings.length, 0);
       assert.strictEqual(h.sent.length, 0);
       assert.notStrictEqual((h.status.backgroundColor || {}).id, "statusBarItem.warningBackground");
+    } finally { h.close(); }
+  });
+
+  await check("auto keep warm keeps going when the expiry estimate drops below minCredits", async () => {
+    const h = await harness({ answer: (m, b, n) => n === 1 ? "Auto keep warm" : never(), settings: { autoKeepWarmCapPercent: 100 } });
+    try {
+      await h.run(300, () => h.sent.length > 0);
+      assert.strictEqual(h.sent.length, 1, "first keep-alive");
+      h.settings.minCredits = 1e9;      // e.g. a cold call made the estimate drop under the floor
+      await h.run(320, () => h.sent.length > 1);
+      assert.strictEqual(h.sent.length, 2, "second keep-alive still sent");
+      assert.ok(!/expired/.test(h.status.text), h.status.text);
     } finally { h.close(); }
   });
 

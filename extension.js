@@ -624,7 +624,7 @@ function noteWhy(id, why) {
 }
 function unmanagedWhy(s) {
   if (!s.lastRealUserTs) return "no message from you in its log";
-  if (s.cost && s.cost.missExtra < cfg("minCredits")) {
+  if (s.cost && !keptWarm(s) && s.cost.missExtra < cfg("minCredits")) {
     return `an expiry would add only ${core.fmt(s.cost.missExtra)} cr (below cacheKeeper.minCredits ${cfg("minCredits")}); ` +
       "rechecked on every read as the context grows";
   }
@@ -951,9 +951,12 @@ function currentChat() {
   return list.reduce((best, s) => !best || (s.lastRealUserTs || 0) > (best.lastRealUserTs || 0) ? s : best, null);
 }
 function managed(s) {
-  // minCredits filters everything (list, warnings, actions, orange status): a cheap expiry isn't worth a word
-  return s.lastRealUserTs && !(s.cost && s.cost.missExtra < cfg("minCredits"));
+  // minCredits filters everything (list, warnings, actions, orange status): a cheap expiry isn't worth a word.
+  // Except a chat you chose to keep warm: it stays listed and kept warm (within its cap) even if its
+  // expiry estimate drops below minCredits, e.g. after a cold call. Dropping it would stop keep-warm silently.
+  return !!s.lastRealUserTs && (keptWarm(s) || !(s.cost && s.cost.missExtra < cfg("minCredits")));
 }
+function keptWarm(s) { const m = sessions.has(s.id) && sessions.get(s.id).mode; return m === "auto" || m === "once"; }
 
 // ---------------------------------------------------------------- sending into a given chat
 
