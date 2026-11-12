@@ -433,13 +433,10 @@ Cache Keeper's storage (`spend-reports/spend-report-<date>-<days>d.md`, the noti
 where) and opened as a preview.
 
 It reads every chat, not just this window's, on the window's side (WSL, SSH host or container)
-and, for a remote window, on this computer too; a Windows window also reads the WSL distros that
-are running (`\\wsl.localhost`, which VS Code only allows once `wsl.localhost` is in the setting
-`security.allowedUNCHosts`), where WSL windows keep their logs, and names the stopped ones: Local chats of every workspace, Local chats with
-no Agent Debug Log (it is off by default, and VS Code removes old logs) from VS Code's own chat
-files, per message (`chatSessions/*.jsonl` or `*.json`, and `globalStorage/emptyWindowChatSessions`
-for windows with no folder open), and the Copilot SDK, Claude and Codex chats VS Code created.
-Messages whose chat file records no credits are left out, and the report says how many. Credits are as billed where the log says, else from
+and, for a remote window, on this computer too: Local chats of every workspace, older Local chats
+whose debug log VS Code has removed (from VS Code's own chat files, per message, including windows
+with no folder open), and the Copilot
+SDK, Claude and Codex chats VS Code created. Credits are as billed where the log says, else from
 Copilot's price sheet; calls with no known price are flagged. On this machine it matches the Python
 helper below within 0.3%; the helper also covers OpenCode and Copilot CLI.
 

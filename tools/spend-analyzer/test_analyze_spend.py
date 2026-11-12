@@ -144,54 +144,20 @@ class SessionTotalTests(unittest.TestCase):
 
 
 class ChatFileTests(unittest.TestCase):
-    """Local chats with no Agent Debug Log (off by default): VS Code's chat files, wherever VS Code keeps them."""
-
-    def setUp(self):
-        spend.UNBILLED.clear()
-        self.addCleanup(spend.UNBILLED.clear)
-
-    @staticmethod
-    def request(ts, text, credits, prompt=50_000):
-        r = {"timestamp": ts, "message": {"text": text}, "modelId": "copilot/claude-opus-5.5",
-             "promptTokens": prompt, "completionTokens": 200, "elapsedMs": 20_000}
-        if credits is not None:
-            r["copilotCredits"] = credits
-        return r
-
-    def op_log(self, *reqs):
+    def test_chats_of_windows_with_no_folder_are_read(self):
         import json as _json
-        lines = [{"kind": 0, "v": {"requests": []}}, {"kind": 2, "k": ["requests"], "v": list(reqs)}]
-        return "\n".join(_json.dumps(x) for x in lines) + "\n"
-
-    def test_every_place_and_format_is_read(self):
-        import json as _json
-        t0 = 1_800_000_000_000
+        req = {"timestamp": 1_800_000_000_000, "message": {"text": "No folder"}, "modelId": "copilot/claude-opus-5.5",
+               "promptTokens": 50_000, "completionTokens": 200, "elapsedMs": 20_000, "copilotCredits": 30}
         with tempfile.TemporaryDirectory() as d:
-            user = Path(d) / "User"
-            ws = user / "workspaceStorage"
-            (ws / "ws1/chatSessions").mkdir(parents=True)
-            (ws / "ws2/chatSessions").mkdir(parents=True)
-            (user / "globalStorage/emptyWindowChatSessions").mkdir(parents=True)
-            (ws / "ws1/chatSessions/op.jsonl").write_text(self.op_log(self.request(t0, "Op log", 10)), encoding="utf-8")
-            # VS Code before 1.109, or chat.useLogSessionStorage off: the whole chat as one object
-            (ws / "ws2/chatSessions/flat.json").write_text(_json.dumps({"version": 3, "requests": [self.request(t0, "Flat", 20)]}, indent=2),
-                                                         encoding="utf-8")
-            # a window with no folder open
-            (user / "globalStorage/emptyWindowChatSessions/empty.jsonl").write_text(
-                self.op_log(self.request(t0, "No folder", 30), self.request(t0 + 60_000, "No credits", None)), encoding="utf-8")
-            # a debug log with no model call in it: its chat is still counted from its chat file
-            log = ws / "ws1/GitHub.copilot-chat/debug-logs/op"
-            log.mkdir(parents=True)
-            (log / "main.jsonl").write_text(_json.dumps({"ts": t0, "type": "user_message", "attrs": {"content": "hi"}}) + "\n",
-                                            encoding="utf-8")
-
-            calls, covered = spend.collect_vscode_debug([ws], 0, {})
+            ws = Path(d) / "User/workspaceStorage"
+            ws.mkdir(parents=True)
+            empty = Path(d) / "User/globalStorage/emptyWindowChatSessions"
+            empty.mkdir(parents=True)
+            (empty / "empty.jsonl").write_text("\n".join(_json.dumps(x) for x in [
+                {"kind": 0, "v": {"requests": []}}, {"kind": 2, "k": ["requests"], "v": [req]}]) + "\n", encoding="utf-8")
             turns = spend.collect_vscode_turns([ws], 0, {})
-        self.assertEqual(covered, set(), "a log with no model call covers nothing")
-        msgs = spend.turns_as_calls(turns, covered)
-        self.assertEqual(sorted((c["session"], c["credits"]) for c in msgs), [("empty", 30.0), ("flat", 20.0), ("op", 10.0)])
-        self.assertEqual([c["workspace"] for c in msgs if c["session"] == "empty"], ["(no folder)"])
-        self.assertEqual(len(spend.UNBILLED), 1, "the message with no credits is said, not counted")
+        msgs = spend.turns_as_calls(turns, set())
+        self.assertEqual([(c["session"], c["workspace"], c["credits"]) for c in msgs], [("empty", "(no folder)", 30.0)])
 
 
 if __name__ == "__main__":

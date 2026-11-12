@@ -144,7 +144,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                          writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [], noFolder = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
-  // a window with no folder open: VS Code gives no workspace storage; workspaceStorage sits next to globalStorage
+  // a window with no folder open: no workspace storage of its own; workspaceStorage is next to globalStorage
   const storage = noFolder ? path.join(tmp, "data", "User", "workspaceStorage", "ws1") : path.join(tmp, "workspaceStorage", "ws1");
   const logs = path.join(storage, "GitHub.copilot-chat", "debug-logs");
   // Copilot SDK chats live under ~/.copilot: point the home folder at the temp dir
@@ -1590,23 +1590,6 @@ const never = () => new Promise(() => {});
     ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "elapsedMs"], v: 20000 })),
     ...msgs.map((m, i) => JSON.stringify({ kind: 1, k: ["requests", i, "copilotCredits"], v: m.credits }))].join("\n") + "\n";
 
-  // the same chat as one object: a .json chat file (VS Code before 1.109, or chat.useLogSessionStorage off)
-  const flatChatFile = (t0, msgs) => JSON.stringify({ version: 3, requests: msgs.map((m, i) => ({
-    timestamp: t0 + m.at * 1000, message: { text: m.text || `step ${i}` }, modelId: "copilot/claude-opus-5.5",
-    promptTokens: m.prompt, completionTokens: 200, elapsedMs: 20000, copilotCredits: m.credits })) }, null, 2);
-
-  await check("chat files: a whole-chat .json file reads like an op log; messages with no credits are counted as left out", () => {
-    const t0 = now - 7200000, msgs = [{ at: 0, prompt: 90000, credits: 40, text: "Flat chat" }, { at: 60, prompt: 91000, credits: 6 }];
-    const flat = report.chatFileMessages([flatChatFile(t0, msgs)]);
-    const log = report.chatFileMessages([chatFile(t0, msgs)]);
-    assert.strictEqual(flat.title, "Flat chat");
-    assert.deepStrictEqual(flat.events, log.events);
-    const noCredits = report.chatFileMessages([chatFile(t0, [{ at: 0, prompt: 90000, credits: undefined }, { at: 60, prompt: 1, credits: 3 }])]);
-    assert.strictEqual(noCredits.events.length, 1);
-    assert.strictEqual(noCredits.unbilled, 1);
-    assert.strictEqual(report.chatFileMessages([chatFile(t0, [{ at: 0, prompt: 90000, credits: undefined }])], now).unbilled, 0, "before the period");
-  });
-
   await check("chat files: replayed per message, copies merged, a pause past the lifetime is an expired cache", () => {
     const t0 = now - 7200000;
     const text = chatFile(t0, [{ at: 0, prompt: 90000, credits: 40, text: "Port the parser" }, { at: 60, prompt: 91000, credits: 6 },
@@ -1620,7 +1603,7 @@ const never = () => new Promise(() => {});
     assert.strictEqual(a.total, 91);
     const exp = a.factors.find(f => /Expired/.test(f.name));
     assert.strictEqual(exp.count, 1, "only the message after the long pause");
-    assert.ok(/\| Local, per message \| claude-opus-5\.5 \| 3 msgs \|/.test(report.spendMarkdown(a, { days: 60 })));
+    assert.ok(/\| Local, older chats \| claude-opus-5\.5 \| 3 msgs \|/.test(report.spendMarkdown(a, { days: 60 })));
   });
 
   await check("spend report command: asks the days (60), reads Local logs and older chat files, saves the file, shows its preview", async () => {
@@ -1632,19 +1615,10 @@ const never = () => new Promise(() => {});
       fs.mkdirSync(cs, { recursive: true });
       fs.writeFileSync(path.join(cs, "old-chat.jsonl"), chatFile(h.clock - 86400000, [{ at: 0, prompt: 80000, credits: 30, text: "Older work" }]));
       fs.writeFileSync(path.join(cs, "sess-1.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
-      // a .json chat file in another workspace, a chat of a window with no folder, and a chat whose
-      // debug log has no model call in it (its chat file counts it)
-      const cs2 = path.join(h.dir, "workspaceStorage", "ws2", "chatSessions");
-      fs.mkdirSync(cs2, { recursive: true });
-      fs.writeFileSync(path.join(cs2, "flat-chat.json"), flatChatFile(h.clock - 7200000, [{ at: 0, prompt: 50000, credits: 12, text: "Flat work" }]));
+      // a chat of a window with no folder open
       const empty = path.join(h.dir, "globalStorage", "emptyWindowChatSessions");
       fs.mkdirSync(empty, { recursive: true });
       fs.writeFileSync(path.join(empty, "no-folder.jsonl"), chatFile(h.clock - 7200000, [{ at: 0, prompt: 40000, credits: 7, text: "No folder work" }]));
-      const logless = path.join(h.dir, "workspaceStorage", "ws1", "GitHub.copilot-chat", "debug-logs", "logless");
-      fs.mkdirSync(logless, { recursive: true });
-      fs.writeFileSync(path.join(logless, "main.jsonl"), JSON.stringify({ ts: h.clock - 7000000, type: "user_message", attrs: { content: "hi" } }) + "\n");
-      fs.writeFileSync(path.join(cs, "logless.jsonl"), chatFile(h.clock - 7200000, [{ at: 0, prompt: 30000, credits: 5, text: "Logless work" },
-                                                                                  { at: 100, prompt: 31000, credits: undefined }]));
       // its "saved" notification is never clicked: the command must still finish
       h.vscode.window.showInformationMessage = () => new Promise(() => {});
       const done = await Promise.race([h.commands["cacheKeeper.spendReport"]().then(() => true),
@@ -1656,41 +1630,10 @@ const never = () => new Promise(() => {});
       const md = fs.readFileSync(shown.a.fsPath, "utf8");
       assert.ok(/^# Copilot spend, last 60 days/.test(md), md.slice(0, 200));
       assert.ok(/\| Local \| claude-opus-5\.5 \|/.test(md), md);
-      assert.ok(/\| Older work \| Local, per message \|/.test(md), "the older chat, from its chat file");
+      assert.ok(/\| Older work \| Local, older chats \|/.test(md), "the older chat, from its chat file");
       assert.ok(!/999/.test(md), "the chat with a debug log is not counted again from its chat file");
-      assert.ok(/\| Flat work \| Local, per message \|/.test(md), "a .json chat file");
-      assert.ok(/\| No folder work \| Local, per message \| \(no folder\) \|/.test(md), "a chat of a window with no folder");
-      assert.ok(/\| Logless work \| Local, per message \|/.test(md), "a debug log with no model call does not hide the chat file");
-      assert.ok(/Local chats with no debug log: 4, .*; 1 message\(s\) left out: VS Code recorded no credits for them/.test(md), "where it read");
-    } finally { h.close(); }
-  });
-
-  await check("spend report from a Windows window: running WSL distros are read too; prices from there when this window has none", async () => {
-    const h = await harness({ kind: "codex", answer: never, noPrices: true });
-    try {
-      await h.run(5);
-      // a WSL distro's VS Code server, with a Local chat's debug log (and Copilot's price sheet)
-      const home = path.join(h.dir, "wsl", "home", "dev");
-      const dl = path.join(home, ".vscode-server", "data", "User", "workspaceStorage", "wsl-ws", "GitHub.copilot-chat", "debug-logs", "wsl-chat");
-      fs.mkdirSync(dl, { recursive: true });
-      fs.writeFileSync(path.join(dl, "main.jsonl"), chatLog(h.clock - 3600000, { ctx: 60000 }));
-      fs.writeFileSync(path.join(dl, "models.json"), MODELS);
-      // its chat file stays on Windows: counted once, from the log
-      const cs = path.join(h.dir, "workspaceStorage", "ws1", "chatSessions");
-      fs.mkdirSync(cs, { recursive: true });
-      fs.writeFileSync(path.join(cs, "wsl-chat.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
-      // read through Node's fs, as when VS Code's file API refuses \\wsl.localhost
-      const homes = [{ distro: "Ubuntu", home, io: h.ext._spendHooks.nodeIo }];
-      homes.stopped = ["Debian"];
-      h.ext._spendHooks.wslHomes = async () => homes;
-      h.vscode.window.showInformationMessage = () => new Promise(() => {});
-      await h.commands["cacheKeeper.spendReport"](60);
-      const md = fs.readFileSync(h.ran.find(r => r.id === "markdown.showPreview").a.fsPath, "utf8");
-      assert.ok(/WSL Ubuntu \(dev\): Local chats: 1, in /.test(md), md);
-      assert.ok(/WSL: not running, not read: Debian/.test(md), "stopped distros are named");
-      assert.ok(!/999/.test(md), "the WSL chat's file on Windows is not counted again");
-      assert.ok(/Copilot prices: .*wsl-chat.models\.json/.test(md), "the price sheet read there");
-      assert.ok(/\| Codex \| gpt-6\.1-sol \|/.test(md) && !/no known price/.test(md), "the Codex chat is priced");
+      assert.ok(/\| No folder work \| Local, older chats \| \(no folder\) \|/.test(md), "a chat of a window with no folder open");
+      assert.ok(/Older Local chats \(no debug log left\): 2/.test(md), "where it read");
     } finally { h.close(); }
   });
 

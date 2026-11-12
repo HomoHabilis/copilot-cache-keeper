@@ -349,35 +349,16 @@ def workspace_labels(roots: list[Path]) -> dict[str, str]:
     return labels
 
 
-def debug_log_dirs(r: Path) -> list[tuple[Path, str | None]]:
-    """A workspaceStorage folder's chat debug logs, with their workspace id; the Agent Debug Log of a
-    window with no folder open is in globalStorage next to it (workspace None)."""
-    dirs = [(Path(d), Path(d).parent.parent.parent.name) for d in glob.glob(str(r / "*/GitHub.copilot-chat/debug-logs/*/"))]
-    seen = set()
-    for ext in ("github.copilot-chat", "GitHub.copilot-chat"):   # case-insensitive on Windows and macOS
-        for d in glob.glob(str(r.parent / "globalStorage" / ext / "debug-logs/*/")):
-            key = str(Path(d)).lower()
-            if key not in seen:
-                seen.add(key)
-                dirs.append((Path(d), None))
-    return dirs
-
-
 def collect_vscode_debug(roots: list[Path], since_ms: int, labels: dict) -> tuple[list[dict], set]:
-    """Model calls from the Agent Debug Logs (off by default in VS Code), and the chats they cover:
-    a chat whose log has no model call in it is left to its chat file (collect_vscode_turns)."""
     calls, sessions = [], set()
     for r in roots:
-        for d, ws in debug_log_dirs(r):
+        for d in glob.glob(str(r / "*/GitHub.copilot-chat/debug-logs/*/")):
+            d = Path(d)
             main = d / "main.jsonl"
-            if not main.exists():
+            if not main.exists() or main.stat().st_mtime * 1000 < since_ms:
                 continue
-            sid = d.name
-            if main.stat().st_mtime * 1000 < since_ms:
-                sessions.add(sid)
-                continue
-            label = labels.get(ws, ws[:8]) if ws else "(no folder)"
-            before = len(calls)
+            sid, ws = d.name, d.parent.parent.parent.name
+            sessions.add(sid)
             mcp_frac = mcp_fraction(d)
             for f in d.glob("*.jsonl"):
                 sub = f.name != "main.jsonl"
@@ -390,7 +371,7 @@ def collect_vscode_debug(roots: list[Path], since_ms: int, labels: dict) -> tupl
                         continue
                     if o.get("type") == "user_message" and not sub:
                         c = str((o.get("attrs") or {}).get("content", ""))
-                        calls.append(call(source="vscode", session=sid, workspace=label,
+                        calls.append(call(source="vscode", session=sid, workspace=labels.get(ws, ws[:8]),
                                           ts=o.get("ts", 0), kind="message", user_msg=not c.startswith("[cache-keeper]")))
                         continue
                     if o.get("type") != "llm_request" or o.get("ts", 0) < since_ms:
@@ -406,13 +387,11 @@ def collect_vscode_debug(roots: list[Path], since_ms: int, labels: dict) -> tupl
                     except ValueError:
                         opts = {}
                     effort = (opts.get("reasoning") or {}).get("effort") or (opts.get("output_config") or {}).get("effort")
-                    calls.append(call(source="vscode", session=sid, workspace=label, ts=o["ts"],
+                    calls.append(call(source="vscode", session=sid, workspace=labels.get(ws, ws[:8]), ts=o["ts"],
                                       model=a.get("model", "?"), effort=effort, ctx=a.get("inputTokens", 0),
                                       cached=a.get("cachedTokens", 0), out=a.get("outputTokens", 0),
                                       credits=(a.get("copilotUsageNanoAiu") or 0) / 1e9, exact=True, kind=kind,
                                       mcp_frac=mcp_frac))
-            if any(c["kind"] != "message" for c in calls[before:]):
-                sessions.add(sid)
     seen, unique = set(), []
     for c in calls:
         key = (c["session"], c["ts"], c["kind"], c["ctx"], c["out"])
@@ -479,17 +458,9 @@ def calls_per_message(c: dict) -> float:
 
 
 def replay_requests(path: Path) -> list[dict]:
-    """VS Code chat session files are an op log (.jsonl): rebuild the list of requests (one per message).
-    VS Code before 1.109, or with chat.useLogSessionStorage off, writes the whole chat as one object (.json)."""
+    """VS Code chat session files are an op log: rebuild the list of requests (one per message)."""
     reqs: list[dict] = []
-    text = path.read_text(encoding="utf-8", errors="ignore")
-    try:
-        whole = json.loads(text)
-        if isinstance(whole, dict) and isinstance(whole.get("requests"), list):
-            return list(whole["requests"])
-    except ValueError:
-        pass   # an op log: one change per line
-    for line in text.splitlines():
+    for line in path.open(encoding="utf-8", errors="ignore"):
         try:
             o = json.loads(line)
         except ValueError:
@@ -514,11 +485,9 @@ def collect_vscode_turns(roots: list[Path], since_ms: int, labels: dict) -> list
     the most complete copy, named after a plain folder when there is one."""
     copies = collections.defaultdict(list)
     for r in roots:
-        # <workspace>/chatSessions, and globalStorage/emptyWindowChatSessions for windows with no folder open
-        files = glob.glob(str(r / "*/chatSessions/*.json*")) + glob.glob(str(r.parent / "globalStorage/emptyWindowChatSessions/*.json*"))
-        for f in files:
-            if f.endswith((".json", ".jsonl")):
-                copies[Path(f).stem].append(Path(f))
+        # and globalStorage/emptyWindowChatSessions: chats of windows with no folder open
+        for f in glob.glob(str(r / "*/chatSessions/*.jsonl")) + glob.glob(str(r.parent / "globalStorage/emptyWindowChatSessions/*.jsonl")):
+            copies[Path(f).stem].append(Path(f))
     turns = []
     for sid, files in copies.items():
         per_msg = {}
@@ -541,9 +510,6 @@ def collect_vscode_turns(roots: list[Path], since_ms: int, labels: dict) -> list
     return turns
 
 
-UNBILLED: set = set()   # (chat, time, index) of messages left out because their chat file has no credits
-
-
 def session_turns(f: Path, since_ms: int, ws_name: str) -> list[dict]:
     """The messages of one chat session file."""
     turns = []
@@ -561,8 +527,6 @@ def session_turns(f: Path, since_ms: int, ws_name: str) -> list[dict]:
         det = {d.get("label"): d.get("percentageOfPrompt") for d in (q.get("promptTokenDetails") or [])}
         msg = q.get("message") or {}
         text = msg.get("text", "") if isinstance(msg, dict) else ""
-        if ts and ts >= since_ms and el and q.get("copilotCredits") is None and (q.get("promptTokens") or q.get("completionTokens")):
-            UNBILLED.add((f.stem, ts, i))   # finished, with tokens, but VS Code recorded no credits: said, not counted
         if ts >= since_ms and q.get("copilotCredits") is not None:
             turns.append(dict(source="vscode-turn", session=f.stem, workspace=ws_name, ts=ts,
                               turn=i, model=str(q.get("modelId", "")).split("/")[-1],
@@ -1132,8 +1096,7 @@ def main() -> None:
     calls = vs_calls + msg_calls + cli_calls + oc_calls + h_calls
     n = lambda cs: len([c for c in cs if c["kind"] != "message"])
     sources = {"VS Code debug logs": f"{n(vs_calls)} calls",
-               "VS Code chat sessions": f"{len(turns)} messages ({len(msg_calls)} from chats without debug logs)"
-                                        + (f", {len(UNBILLED)} left out (no credits recorded)" if UNBILLED else ""),
+               "VS Code chat sessions": f"{len(turns)} messages ({len(msg_calls)} from chats without debug logs)",
                "Copilot CLI": f"{n([c for c in cli_calls if c['source'] == 'cli'])} calls",
                "VS Code Copilot SDK chats": f"{n([c for c in cli_calls if c['source'] == 'copilot-sdk'])} calls",
                "VS Code Claude chats": f"{n([c for c in h_calls if c['source'] == 'claude-harness'])} calls",

@@ -162,35 +162,8 @@ function makeIo(remoteSide) {
   };
   return self;
 }
-/**
- * The same file access through Node's own fs, on this computer: for \\\\wsl.localhost paths, which
- * VS Code's file API may refuse (security.restrictUNCAccess) while Node reads them.
- */
-function makeNodeIo() {
-  const fsp = require("fs").promises;
-  const self = {
-    toUri: p => vscode.Uri.file(p),
-    join: (...parts) => path.join(...parts),
-    async stat(p) { try { const st = await fsp.stat(p); return { mtime: st.mtimeMs, size: st.size }; } catch { return null; } },
-    async readBytes(p) { try { return await fsp.readFile(p); } catch { return null; } },
-    async readText(p) {
-      const st = await self.stat(p);
-      if (!st) return null;
-      const key = `n|${p}`, hit = fileCache.get(key);
-      if (hit && hit.mtime === st.mtime && hit.size === st.size) return hit.text;
-      const b = await self.readBytes(p);
-      if (!b) return null;
-      const text = b.toString("utf8");
-      fileCache.set(key, { mtime: st.mtime, size: st.size, text });
-      return text;
-    },
-    async list(d) { try { return await fsp.readdir(d); } catch { return []; } },
-  };
-  return self;
-}
 const io = makeIo(true);       // the window's side: Copilot's logs and the workspace
 const localIo = makeIo(false); // Windows side: Copilot CLI sessions there, our own lock files
-const nodeIo = makeNodeIo();   // WSL distros seen from Windows, when VS Code's file API refuses them
 function toUri(p) { return io.toUri(p); }
 
 /**
@@ -512,7 +485,7 @@ async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null)
 // 30 min: this workspace's Local chats first, else the most recently used workspaces.
 let priceBook = { text: null, at: 0, from: "", wideAt: 0 };
 const PRICE_WIDE_MS = 60000;   // no price sheet yet: other workspaces are searched at most this often
-/** `wide`: search other workspaces now, whenever this one has no price sheet (the spend report). */
+/** `wide`: search other workspaces now when this one has no price sheet (the spend report). */
 async function refreshPrices(context, wide = false) {
   if (Date.now() - priceBook.at < 30 * 60 * 1000 && priceBook.text) return;
   priceBook.at = Date.now();
@@ -553,7 +526,7 @@ function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook
 function workspaceStorageRoot(context) {
   return remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
     : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath))
-    // a window with no folder open has no workspace storage: workspaceStorage sits next to globalStorage
+    // a window with no folder open has no workspace storage: workspaceStorage is next to globalStorage
     : context.globalStorageUri ? path.join(path.dirname(path.dirname(context.globalStorageUri.fsPath)), "workspaceStorage") : null;
 }
 
@@ -673,132 +646,42 @@ function unmanagedWhy(s) {
  * window) and, for a remote window, Windows too (its own Local, Copilot SDK and harness chats, and
  * VS Code's chat files, which stay on Windows for every window).
  */
-async function spendSides(context) {
+function spendSides(context) {
   const user = context.globalStorageUri ? path.dirname(path.dirname(context.globalStorageUri.fsPath)) : null;   // .../Code/User
   const ui = user && { name: remote ? "this computer" : "", io: localIo,
     ws: context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : path.join(user, "workspaceStorage"),
     home: require("os").homedir(), data: path.dirname(user), db: path.join(user, "globalStorage", "agent-host.db") };
-  if (!remote) {
-    // a Windows window also reads the WSL distros that are running (their VS Code server and agent
-    // chats, seen through \\wsl.localhost), as the Python helper does: WSL windows' chats live there
-    const wsl = [], homes = await spendHooks.wslHomes();
-    const notes = [...(homes.notes || [])];
-    if (homes.stopped && homes.stopped.length) notes.push(`not running, not read: ${homes.stopped.join(", ")} (start them to include their chats)`);
-    for (const { distro, home, io: hio = localIo } of homes) {
-      const server = path.join(home, ".vscode-server");
-      if (!(await hio.stat(server))) { notes.push(`${distro}: no VS Code server in ${home}`); continue; }
-      const data = path.join(server, "data");
-      wsl.push({ name: `WSL ${distro} (${path.basename(home)})`, io: hio, ws: path.join(data, "User", "workspaceStorage"),
-                 home, data, db: path.join(data, "User", "globalStorage", "agent-host.db") });
-    }
-    return { sides: [...(ui ? [ui] : []), ...wsl], ui, wslNotes: notes };
-  }
+  if (!remote) return { sides: ui ? [ui] : [], ui };
   const win = { name: remote.authority, io, ws: workspaceStorageRoot(context), home: sdkLoc && sdkLoc.home,
     data: sdkLoc && sdkLoc.data, db: sdkLoc && sdkLoc.db };
   return { sides: [win, ...(ui ? [ui] : [])], ui };
 }
 
-/** Home folders of the running WSL distros, seen from Windows (none elsewhere, or when WSL is stopped). */
-async function wslHomes() {
-  const homes = [];
-  homes.notes = [];
-  if (process.platform !== "win32") return homes;
-  const sys = process.env.SystemRoot || process.env.windir || "C:\\Windows";
-  const exe = [path.join(sys, "System32", "wsl.exe"), path.join(sys, "Sysnative", "wsl.exe"), "wsl.exe"];
-  // `wsl -l -q [--running]`: one distro per line. Exits non-zero, with a message, when none is running.
-  const list = (flags, i = 0) => new Promise(resolve => {
-    require("child_process").execFile(exe[i], ["-l", "-q", ...flags], { encoding: "buffer", timeout: 15000, windowsHide: true },
-      (err, out) => {
-        if (err && err.code === "ENOENT" && i + 1 < exe.length) return resolve(list(flags, i + 1));
-        // UTF-16 by default; UTF-8 with WSL_UTF8 or newer wsl.exe versions
-        const text = !out ? "" : out.includes(0) ? out.toString("utf16le") : out.toString("utf8");
-        const names = text.replace(/\u0000/g, "").split(/\r?\n/).map(x => x.trim().replace(/^\ufeff/, "")).filter(Boolean);
-        resolve({ names: err ? [] : names, err: err && (err.code === "ENOENT" ? "wsl.exe not found" : names.join(" ") || err.message) });
-      });
-  });
-  const installed = await list([]);
-  if (installed.err) { homes.notes.push(installed.err); return homes; }
-  if (!installed.names.length) return homes;
-  const running = await list(["--running"]);
-  homes.stopped = installed.names.filter(d => !running.names.includes(d));
-  // VS Code's file API first, else Node's (VS Code may refuse UNC hosts it hasn't been told to allow)
-  const tryList = async (fio, d) => {
-    try {
-      return fio === nodeIo ? { names: await require("fs").promises.readdir(d) }
-        : { names: (await vscode.workspace.fs.readDirectory(vscode.Uri.file(d))).map(([n]) => n) };
-    } catch (e) { return { names: [], err: String((e && (e.code || e.message)) || e).slice(0, 160) }; }
-  };
-  for (const distro of running.names) {
-    const errs = [];
-    let found = false;
-    for (const prefix of ["\\\\wsl.localhost\\", "\\\\wsl$\\"]) {
-      const base = `${prefix}${distro}\\home`;
-      for (const fio of [localIo, nodeIo]) {
-        const r = await tryList(fio, base);
-        if (r.err) { errs.push(`${base}: ${r.err}`); continue; }
-        for (const u of r.names) homes.push({ distro, home: path.join(base, u), io: fio });
-        found = true;
-        break;
-      }
-      if (found) break;
-    }
-    if (found) continue;
-    // VS Code blocks UNC hosts it hasn't been told to allow, for its file API and for Node's fs alike:
-    // that is the user's security setting, so say how to allow it rather than work around it
-    if (errs.some(e => /ERR_UNC_HOST_NOT_ALLOWED/.test(e)))
-      homes.notes.push(`${distro}: not read, VS Code blocks \\\\wsl.localhost here (security.restrictUNCAccess). To include it, add ` +
-        `"wsl.localhost" to the setting security.allowedUNCHosts and restart VS Code, or run the report from a WSL window`);
-    else homes.notes.push(`${distro}: its home folders could not be read (${errs.join("; ")})`);
-  }
-  return homes;
-}
-// replaced by the tests
-const spendHooks = { wslHomes, nodeIo };
-
-/** A workspace's name from its workspace.json; an untitled multi-folder workspace has none. */
-const wsLabel = info => {
-  const last = decodeURIComponent(String(info.folder || info.workspace || "").replace(/\/+$/, "").split("/").pop() || "");
-  return last === "workspace.json" ? "untitled workspace" : last;
-};
+const wsLabel = info => decodeURIComponent(String(info.folder || info.workspace || "").replace(/\/+$/, "").split("/").pop() || "");
 
 async function gatherSpend(context, since, progress) {
   const chats = [], where = [];
   const step = m => progress && progress.report({ message: m });
   const withLog = new Set();     // chats that have a debug log (any age): their chat file is not counted again
-  const { sides, ui, wslNotes } = await spendSides(context);
-  for (const n of wslNotes || []) where.push(`WSL: ${n}`);
-  let newestSheet = null;    // the newest models.json read: Copilot's prices when this window has none yet
+  const { sides, ui } = spendSides(context);
   for (const side of sides) {
     const fio = side.io, at = side.name ? `${side.name}: ` : "";
-    // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json),
-    // or, for a window with no folder open, the same under globalStorage/github.copilot-chat. The
-    // Agent Debug Log is off by default: without it, Local chats come from VS Code's chat files below.
+    // Local: workspaceStorage/<workspace>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl (+ models.json)
     if (side.ws) {
       step(`${at}Local chats`);
       let n = 0;
-      const logDirs = [];
       for (const w of await fio.list(side.ws)) {
         const dl = fio.join(side.ws, w, "GitHub.copilot-chat", "debug-logs");
         const dirs = await fio.list(dl);
         if (!dirs.length) continue;
-        logDirs.push({ dl, dirs, label: wsLabel(jsonOr(await fio.readText(fio.join(side.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) });
-      }
-      for (const ext of ["github.copilot-chat", "GitHub.copilot-chat"]) {
-        const dl = fio.join(side.ws, "..", "globalStorage", ext, "debug-logs");
-        const dirs = await fio.list(dl);
-        if (dirs.length && !logDirs.some(x => x.dl.toLowerCase() === dl.toLowerCase())) logDirs.push({ dl, dirs, label: "(no folder)" });
-      }
-      for (const { dl, dirs, label } of logDirs) {
+        const label = wsLabel(jsonOr(await fio.readText(fio.join(side.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
         for (const id of dirs) {
-          const dir = fio.join(dl, id), st = await fio.stat(fio.join(dir, "main.jsonl"));
-          if (!st) continue;
-          if (st.mtime < since) { withLog.add(id); continue; }
-          const trace = harnesses.localTrace(await fio.readText(fio.join(dir, "main.jsonl")));
-          // a log with no model call in it: the chat's file below still counts it
-          if (!trace) continue;
           withLog.add(id);
+          const dir = fio.join(dl, id), st = await fio.stat(fio.join(dir, "main.jsonl"));
+          if (!st || st.mtime < since) continue;
+          const trace = harnesses.localTrace(await fio.readText(fio.join(dir, "main.jsonl")));
+          if (!trace) continue;
           const models = await fio.readText(fio.join(dir, "models.json"));
-          if (models && (!newestSheet || st.mtime > newestSheet.mtime)) newestSheet = { mtime: st.mtime, text: models, from: fio.join(dir, "models.json") };
           const s = core.analyzeTrace("local", dir, trace, { priceFor });
           // its subagents' logs (the other .jsonl files) and the MCP share of its tool definitions
           const files = await fio.list(dir), subEvents = [];
@@ -874,33 +757,28 @@ async function gatherSpend(context, since, progress) {
   }
   // Older Local chats, whose debug log is gone: VS Code's own chat files, on the UI side (Windows for
   // a WSL window), one record per message with its billed credits. Copies of a chat are merged.
-  // Chat files: <chat id>.jsonl (an op log), or <chat id>.json (VS Code before 1.109, or with
-  // chat.useLogSessionStorage off); a window with no folder open keeps them in globalStorage.
+  // Chats of windows with no folder open are in globalStorage/emptyWindowChatSessions.
   if (ui) {
-    step("Local chats from VS Code's chat files");
+    step("older Local chats");
     const copies = new Map();
-    const folders = [];
-    for (const w of await localIo.list(ui.ws))
-      folders.push({ cs: path.join(ui.ws, w, "chatSessions"), labelOf: async () => wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) });
-    folders.push({ cs: path.join(ui.ws, "..", "globalStorage", "emptyWindowChatSessions"), labelOf: async () => "(no folder)" });
-    let nFiles = 0;
-    for (const { cs, labelOf } of folders) {
-      const files = (await localIo.list(cs)).filter(f => /\.jsonl?$/.test(f));
+    const folders = (await localIo.list(ui.ws)).map(w => [path.join(ui.ws, w, "chatSessions"), w]);
+    folders.push([path.join(ui.ws, "..", "globalStorage", "emptyWindowChatSessions"), null]);
+    for (const [cs, w] of folders) {
+      const files = (await localIo.list(cs)).filter(f => f.endsWith(".jsonl"));
       if (!files.length) continue;
-      const label = await labelOf();
+      const label = w ? wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) : "(no folder)";
       for (const f of files) {
-        const id = f.replace(/\.jsonl?$/, "");
+        const id = f.slice(0, -".jsonl".length);
         const st = await localIo.stat(path.join(cs, f));
         if (!st || st.mtime < since) continue;
-        nFiles++;
         if (!copies.has(id)) copies.set(id, { texts: [], labels: [] });
         copies.get(id).texts.push(await localIo.readText(path.join(cs, f)));
         copies.get(id).labels.push(label);
       }
     }
-    let older = 0, unbilled = 0;
+    let older = 0;
     for (const [id, c] of copies) {
-      const { title, events, unbilled: nb } = report.chatFileMessages(c.texts, since);
+      const { title, events } = report.chatFileMessages(c.texts);
       const toolShares = events.filter(e => e.toolShare).map(e => ({ ts: e.ts, share: e.toolShare }));
       // a chat that has a debug log: only its tool-definition share is taken from here
       if (withLog.has(id)) {
@@ -908,22 +786,15 @@ async function gatherSpend(context, since, progress) {
         if (ch) ch.toolShares = toolShares;
         continue;
       }
-      unbilled += nb;
       if (!events.length) continue;
       older++;
       // named after a plain folder when one copy is (another may be a multi-folder workspace)
       const label = c.labels.find(l => !/\.code-workspace$/.test(l)) || c.labels[0];
       chats.push({ kind: "local-msg", id, title, workspace: label, events, toolShares, sheetFor: priceFor });
     }
-    where.push(`Local chats with no debug log: ${older}, from VS Code's chat files in ${ui.ws}` +
-      ` (${nFiles} chat file(s) changed in the period)` +
-      (unbilled ? `; ${unbilled} message(s) left out: VS Code recorded no credits for them` : ""));
+    where.push(`Older Local chats (no debug log left): ${older}, from VS Code's chat files in ${ui.ws}`);
   }
-  // a window with no folder open finds no price sheet of its own: the newest one read above serves
-  // (priceFor is only called once the chats are analysed, after this)
-  if (!priceBook.text && newestSheet) priceBook = { ...priceBook, text: newestSheet.text, from: newestSheet.from };
-  where.push(priceBook.from ? `Copilot prices: ${priceBook.from}` :
-    "Copilot prices: none found (no Local chat with a debug log on any side read): cache misses are not priced");
+  if (priceBook.from) where.push(`Copilot prices: ${priceBook.from}`);
   return { chats, where };
 }
 
@@ -2298,4 +2169,4 @@ function activate(context) {
 function deactivate() {}
 
 // for tests
-module.exports = { activate, deactivate, _spendHooks: spendHooks, _noOverlap: noOverlap, _read: async (c) => { await setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };
+module.exports = { activate, deactivate, _noOverlap: noOverlap, _read: async (c) => { await setAll(await readAll(c || ctxRef)); }, _decide: (c) => decide(c || ctxRef) };
