@@ -1338,7 +1338,7 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
-  await check("Fusion: countdown follows the first cache to expire among models used since your last message", () => {
+  await check("Fusion: only models used since your last message count; cost of a cold message from the costliest", () => {
     const now = Date.now(), m = 60000;
     const P = { sol: { input: 140, cache_read: 7, cache_write: 175, output: 700 }, luna: { input: 7, cache_read: 0.7, cache_write: 8.75, output: 35 } };
     const use = (t, model, input, read) => { const u = sdkUsage(t, 1000, { model, input, read, ttl: 1800, auto: true });
@@ -1366,21 +1366,27 @@ const never = () => new Promise(() => {});
     assert.ok(Math.abs(x.remaining - 1740) < 2, String(x.remaining));
   });
 
-  await check("Fusion (auto model) SDK chat: no keep-warm offered or sent, Summarize still offered", async () => {
+  await check("Fusion (auto model) SDK chat: no countdown, no pop-ups, nothing automatic; Summarize on request", async () => {
     const now = Date.now();
     assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000, { auto: true }), {}, now).routed, true);
     assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000), {}, now).routed, false);
-    let buttons;
-    const h = await harness({ kind: "sdk", sdkAuto: true, answer: (m, b, n) => { if (n === 1) { buttons = b; return undefined; } return never(); } });
+    const h = await harness({ kind: "sdk", sdkAuto: true, answer: never, ctx: 150000, settings: { thresholdTokens: 30000 } });
     try {
-      await h.run(300);
-      assert.strictEqual(h.warnings.length, 1, "still warned");
-      assert.ok(/Fusion: keep-warm can't work here\./.test(h.warnings[0].msg), h.warnings[0].msg);
-      assert.ok(/^Summarize/.test(buttons[0]) && buttons[1] === "More…" && buttons.length === 2, buttons.join(" | "));
+      await h.run(250);
+      assert.ok(/^\$\(versions\) Fusion · 150k/.test(h.status.text), h.status.text);
+      assert.ok(/no countdown, no keep-warm, nothing automatic/.test(h.status.tooltip.value), h.status.tooltip.value);
+      await h.run(150);                 // past the lifetime: no warning, no automatic summary, no expired notice
+      assert.strictEqual(h.warnings.length, 0, "no expiry warning");
+      assert.strictEqual(h.sent.length, 0, "nothing sent on its own");
+      assert.ok(!h.infos.some(m => /cache expired/.test(m)), h.infos.join(" | "));
+      assert.ok(/^\$\(versions\) Fusion/.test(h.status.text), h.status.text);
       await h.commands["cacheKeeper.keepWarmNow"]();
       assert.strictEqual(h.sent.length, 0, "no keep-alive");
       assert.ok(h.infos.some(m => /no keep-warm for .*Fusion picks the model/.test(m)), h.infos.join(" | "));
-      assert.ok(/Fusion \(auto model\): no keep-warm/.test(h.status.tooltip.value), h.status.tooltip.value);
+      await h.commands["cacheKeeper.options"]();
+      assert.ok(h.lists.at(-1).some(i => /Fusion/.test(i.label)), "listed");
+      await h.commands["cacheKeeper.summaryNow"]();   // on request: sent, no cost question about an expired cache
+      assert.ok(h.sent.some(x => x.text.includes("handoff summary")), h.sent.map(x => x.text).join(" | "));
     } finally { h.close(); }
   });
 

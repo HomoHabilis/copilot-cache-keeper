@@ -1423,6 +1423,7 @@ async function keepWarmNow(context, s) {
  */
 async function summaryNow(context, s) {
   const st = stateFor(s.id);
+  if (s.routed) return summary(context, s, "on request", { allowCold: true });   // Fusion: no countdown to go by
   if (!s.busy && live(s) <= 0) {
     const price = s.cost ? ` The summary request re-sends the whole context: ~${core.fmt(s.cost.missExtra + s.cost.summary)} cr ` +
       `instead of ~${core.fmt(s.cost.summary)} cr while the cache is warm.` : " The summary request re-sends the whole context at full price.";
@@ -1498,6 +1499,7 @@ async function compactNow(context, s) {
       "(not tested there). Use Summarize instead.");
     return false;
   }
+  if (s.routed) return compact(context, s, "on request", { allowCold: true });   // Fusion: no countdown to go by
   if (!s.busy && live(s) <= 0) {
     const price = s.cost ? ` The compaction re-sends the whole context: ~${core.fmt(s.cost.missExtra + s.cost.compact)} cr ` +
       `instead of ~${core.fmt(s.cost.compact)} cr while the cache is warm.` : " The compaction re-sends the whole context at full price.";
@@ -1533,8 +1535,8 @@ async function choose(context, s, pick) {
   if (st.offer && st.offer.for === s.cacheFrom) st.offer.answered = true;
   // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
   // the next decision tick (within a second), or once the agent is done (decide()).
-  if (CHOICES[pick] === "summarize" && !s.busy && live(s) <= 0) { setMode(st, s, "ask"); await summaryNow(context, s); return; }
-  if (CHOICES[pick] === "compact" && (!canCompact(s) || (!s.busy && live(s) <= 0))) { setMode(st, s, "ask"); await compactNow(context, s); return; }
+  if (CHOICES[pick] === "summarize" && !s.routed && !s.busy && live(s) <= 0) { setMode(st, s, "ask"); await summaryNow(context, s); return; }
+  if (CHOICES[pick] === "compact" && (!canCompact(s) || (!s.routed && !s.busy && live(s) <= 0))) { setMode(st, s, "ask"); await compactNow(context, s); return; }
   // Keeping warm is for a warm cache: on an expired one, Keep warm is a cold keep-alive now (asks,
   // with the cost), never one armed for the window after your next message.
   if (KEEP_WARM_MODES.includes(CHOICES[pick]) && !s.busy && live(s) <= 0) {
@@ -1607,7 +1609,6 @@ function chatName(s) {
 const MORE = "More…";
 function warningButtons(s, withAuto = true) {
   const c = s.cost, cost = x => c ? ` (~${core.fmt(x)} cr)` : "";
-  if (s.routed) return [`Summarize${cost(c && c.summary)}`, MORE];
   const second = withAuto && c ? "Auto keep warm" : `Summarize${cost(c && c.summary)}`;
   return [`Keep warm${cost(c && c.heartbeat)}`, second, MORE];
 }
@@ -1622,7 +1623,7 @@ async function offer(context, s) {
   const msg = `${chatName(s)} expires in ${s.ttlAssumed ? "~" : ""}${Math.max(0, Math.round(live(s)))}s` +
     (s.ttlAssumed ? " (lifetime assumed: no data for this model)." : ".") +
     (c ? ` Expiry: +${core.fmt(c.missExtra)} cr.` : " No price for this model.") +
-    ` No click: ${noClickText(st, s)}.` + (s.routed ? " Fusion: keep-warm can't work here." : "");
+    ` No click: ${noClickText(st, s)}.`;
   const pick = choiceOf(await vscode.window.showWarningMessage(msg, ...warningButtons(s))) || undefined;
   // More...: the per-chat menu; a choice there answers the warning (choose()), closing it does not
   if (pick === MORE) { await chatMenu(context, all.find(x => x.id === s.id) || s); return; }
@@ -1678,10 +1679,10 @@ function expiredShown() {
  */
 function listChats() {
   const list = all.filter(managed);
-  const expired = new Set(list.filter(s => !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)
+  const expired = new Set(list.filter(s => !s.routed && !s.busy && live(s) <= 0).sort((x, y) => y.cacheFrom - x.cacheFrom)
     .slice(0, expiredShown()));
   const cur = currentChat();
-  const shown = list.filter(s => s.busy || live(s) > 0 || expired.has(s) || s === cur || stateFor(s.id).handoff);
+  const shown = list.filter(s => s.routed || s.busy || live(s) > 0 || expired.has(s) || s === cur || stateFor(s.id).handoff);
   // a chat whose warning waits for an answer in its last seconds goes first: the status bar points there
   const first = awaitingAnswer() || cur;
   return core.orderChats(shown, first && first.id, live).slice(0, 60);
@@ -1704,6 +1705,7 @@ function awaitingAnswer() {
 
 /** "3:12", or for a chat whose agent works past the cache lifetime, "possibly expired". */
 function clockText(s) {
+  if (s.routed) return "Fusion";             // no countdown: which model's cache the next message hits can't be known
   const r = live(s);
   return r > 0 ? countdown(s, r) : s.busy ? "possibly expired" : "expired";
 }
@@ -1712,9 +1714,9 @@ function chatItem(s, cur = currentChat()) {
   const r = live(s), st = stateFor(s.id);
   const clock = clockText(s);
   // while the agent works (a long tool run makes no model call), the cache can still run out
-  const when = s.busy ? `working · cache ${clock}` : clock;
+  const when = s.busy ? `working · ${s.routed ? "" : "cache "}${clock}` : clock;
   return {
-    label: `${s.busy ? "$(sync~spin)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
+    label: `${s.busy ? "$(sync~spin)" : s.routed ? "$(versions)" : r > 0 ? "$(flame)" : "$(circle-slash)"} ${when}  ${s.title || s.id.slice(0, 8)}`,
     description: `${KIND_LABEL[s.kind] || s.kind} · ${s.model} · ${Math.round(s.ctx / 1000)}k` + (s.cost ? ` · expiry +${core.fmt(s.cost.missExtra)} cr` : ""),
     detail: modeLabel(st.mode) +
       (st.mode === "auto" && st.cap !== null ? ` (${core.fmt(st.spent)} of ${core.fmt(st.cap)} cr)` : "") +
@@ -1771,7 +1773,7 @@ async function chatMenu(context, cs) {
  */
 function choiceItems(st, s) {
   const c = s.cost, cr = x => `~${core.fmt(x)} cr`;
-  const expired = !s.busy && live(s) <= 0;
+  const expired = !s.routed && !s.busy && live(s) <= 0;
   const extra = Math.round(core.keepAliveJitter(s.ttl, jitterPercent(), () => 1));
   const when = extra > 0 ? `${lead()}-${lead() + extra} s` : `${lead()} s`;
   const mark = mode => st.mode === mode ? "$(check) current" : undefined;
@@ -1801,7 +1803,7 @@ function choiceItems(st, s) {
           ". Changes the chat in place, no undo" }] : []),
     { label: "Ignore", description: mark("ignore"), detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
     { label: DEFAULT_CHOICE, description: mark("ask"),
-      detail: `Warn ${cfg("warnSeconds")} s before expiry; no click: ${noClickText(st, s)}` },
+      detail: s.routed ? `Fusion chat: nothing automatic, no warnings (${ROUTED_WHY})` : `Warn ${cfg("warnSeconds")} s before expiry; no click: ${noClickText(st, s)}` },
   ];
 }
 
@@ -1827,6 +1829,13 @@ async function decide(context) {
         st.skipFor = s.cacheFrom;
         logx(`keep-alive for ${s.id.slice(0, 8)} skipped: ${!managed(s) ? "not managed" : s.busy ? "agent working" : "previous message still pending"}`);
       }
+      continue;
+    }
+    // Fusion: no countdown, nothing automatic. Only a Summarize or Compact you asked for is sent
+    // (cold or not: which model answers, and what it has cached, can't be known).
+    if (s.routed) {
+      if (st.mode === "summarize") { if (await summary(context, s, "on request", { allowCold: true })) st.actedFor = s.cacheFrom; }
+      else if (st.mode === "compact") { if (await compact(context, s, "on request", { allowCold: true })) st.actedFor = s.cacheFrom; }
       continue;
     }
     // A new model call starts a new cache window. After "Ignore" or a summary, only a
@@ -2007,8 +2016,9 @@ function updateStatus(context) {
   // Coming back to an expired chat: make an expensive next message stand out (orange). Measured in
   // context tokens, since a cold send costs about context x the model's input price: the same
   // setting then fits a cheap model and an expensive one.
-  const costlyRestart = r <= 0 && !s.busy && s.ctx >= thresholdTokens();
+  const costlyRestart = !s.routed && r <= 0 && !s.busy && s.ctx >= thresholdTokens();
   if (s.busy) statusItem.text = `$(sync~spin) working · ${clockText(s)}${autoElsewhere}${others}`;
+  else if (s.routed) statusItem.text = `$(versions) Fusion · ${Math.round(s.ctx / 1000)}k${autoElsewhere}${others}`;
   else if (r > 0) {
     statusItem.text = `${st.mode === "auto" ? "$(zap)" : "$(flame)"} ${countdown(s, r)}` +
       (autoHere || (st.mode === "once" ? " · armed" : "")) + autoElsewhere + others;
@@ -2016,17 +2026,13 @@ function updateStatus(context) {
     (s.cost ? ` · +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
   // Tooltip: short Markdown lines rather than one long sentence.
   const md = [`**${s.title ? s.title.replace(/[\\`*_[\]<>]/g, "") : s.id.slice(0, 8)}**  `,
-              `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s (${s.ttlFrom})`, ""];
-  if (s.busy && r <= 0) md.push("**Agent working past the cache lifetime:** the cache has possibly expired. The countdown " +
+              s.routed ? `Fusion (${(s.caches || []).map(x => x.model).join(", ") || s.model} since your last message) · ${Math.round(s.ctx / 1000)}k context`
+                : `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s (${s.ttlFrom})`, ""];
+  if (s.busy && r <= 0 && !s.routed) md.push("**Agent working past the cache lifetime:** the cache has possibly expired. The countdown " +
     "runs from the last model call's start; a long answer can still leave it cached. The next call's cache hit is logged " +
     "in the Output panel (Cache Keeper).", "");
-  if (s.routed) {
-    md.push(`Fusion (auto model): no keep-warm. ${ROUTED_WHY}.  `);
-    if (s.caches && s.caches.length > 1) md.push("Models since your last message (the countdown follows the first to expire):  ",
-      ...s.caches.map(x => { const left = x.ttl - (Date.now() + (clockOffset || 0) - x.cacheFrom) / 1000;
-        return `${x.model}: ${left > 0 ? mmss(left) : "expired"} (lifetime ${x.ttl} s)  `; }));
-    md.push("");
-  }
+  if (s.routed) md.push(`**Fusion (auto model):** no countdown, no keep-warm, nothing automatic. ${ROUTED_WHY}, ` +
+    "and which model's cache your next message hits can't be known. Click to summarize or compact it yourself.", "");
   if (st.mode === "once" && r > 0) md.push("Keep-alive armed: one is sent just before expiry.", "");
   if (costlyRestart) {
     md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +
@@ -2038,8 +2044,8 @@ function updateStatus(context) {
   }
   if (s.cost) {
     md.push("| | |", "|---|--:|",
-      `| Keep-alive | ~${core.fmt(s.cost.heartbeat)} cr |`,
-      `| Expiry adds | ~${core.fmt(s.cost.missExtra)} cr |`,
+      ...(s.routed ? [`| Cold message, worst case | ~${core.fmt(s.cost.missExtra)} cr |`]
+        : [`| Keep-alive | ~${core.fmt(s.cost.heartbeat)} cr |`, `| Expiry adds | ~${core.fmt(s.cost.missExtra)} cr |`]),
       `| Handoff summary | ~${core.fmt(s.cost.summary)} cr |`,
       `| Session so far | ${core.fmt(s.credits)} cr |`, "");
   } else md.push("No price for this model in Copilot's price sheet.", "");
@@ -2051,7 +2057,7 @@ function updateStatus(context) {
   const tip = new vscode.MarkdownString(md.join("\n"), true);
   statusItem.tooltip = tip;
   statusItem.backgroundColor = red ||
-    (costlyRestart || (r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
+    (costlyRestart || (!s.routed && r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
   statusItem.show();
 }
 

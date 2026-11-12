@@ -612,8 +612,15 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   }
   let cost = null, words = summaryWords(stats);      // cost null = price unknown for this model
   if (r) ({ cost, words } = priceChat(r, fresh, ctx, firstCtx, heartbeatNew, stats));
-  // Fusion: an expiry loses what that model has cached, the prompt of its last call
-  if (cost && routed && !compactedIdle) cost.missExtra = Math.min(ctx, focus.input || 0) * (r.write - r.read);
+  // Fusion: what a cold message could add, at worst: the costliest of the models used since your
+  // last message, losing what it cached (its last prompt, at most what the next message re-sends).
+  // Used for cacheKeeper.minCredits: a Fusion chat is listed like any other once that is reached.
+  if (cost && routed && !compactedIdle) {
+    cost.missExtra = Math.max(0, ...caches.map(m => {
+      const rm = (m.call.rates && toR(m.call.rates)) || r;
+      return Math.min(ctx, m.prefix) * (rm.write - rm.read);
+    }));
+  }
   // Credits spent: billed per call when the log says, otherwise estimated from the prices.
   let credits = 0, creditsEstimated = false;
   for (const c of calls) {
