@@ -485,7 +485,8 @@ def collect_vscode_turns(roots: list[Path], since_ms: int, labels: dict) -> list
     the most complete copy, named after a plain folder when there is one."""
     copies = collections.defaultdict(list)
     for r in roots:
-        for f in glob.glob(str(r / "*/chatSessions/*.jsonl")):
+        # and globalStorage/emptyWindowChatSessions: chats of windows with no folder open
+        for f in glob.glob(str(r / "*/chatSessions/*.jsonl")) + glob.glob(str(r.parent / "globalStorage/emptyWindowChatSessions/*.jsonl")):
             copies[Path(f).stem].append(Path(f))
     turns = []
     for sid, files in copies.items():
@@ -494,7 +495,8 @@ def collect_vscode_turns(roots: list[Path], since_ms: int, labels: dict) -> list
             return old is None or (t["complete"], t["credits"]) > (old["complete"], old["credits"])
         names = []
         for f in files:
-            ws_name = labels.get(f.parent.parent.name, f.parent.parent.name[:8])
+            ws_name = ("(no folder)" if f.parent.name == "emptyWindowChatSessions"
+                       else labels.get(f.parent.parent.name, f.parent.parent.name[:8]))
             names.append(ws_name)
             for t in session_turns(f, since_ms, ws_name):
                 k = (t["ts"], t["turn"])

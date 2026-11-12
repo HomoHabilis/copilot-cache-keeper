@@ -141,10 +141,11 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [] }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [], noFolder = false }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
-  const storage = path.join(tmp, "workspaceStorage", "ws1");
+  // a window with no folder open: no workspace storage of its own; workspaceStorage is next to globalStorage
+  const storage = noFolder ? path.join(tmp, "data", "User", "workspaceStorage", "ws1") : path.join(tmp, "workspaceStorage", "ws1");
   const logs = path.join(storage, "GitHub.copilot-chat", "debug-logs");
   // Copilot SDK chats live under ~/.copilot: point the home folder at the temp dir
   const realHome = process.env.HOME;
@@ -195,7 +196,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                  onDidChangeTextDocument: f => { changeListeners.push(f); return { dispose() { changeListeners.splice(changeListeners.indexOf(f), 1); } }; },
                  applyEdit: async e => { for (const [u, t] of e.edits) setText([chatInput, otherInput].find(d => d.uri.toString() === u.toString()), t); return true; },
                  // more folders = a multi-root workspace: tmp, tmp/repo2, ...
-                 workspaceFolders: Array.from({ length: folders }, (_, i) => {
+                 workspaceFolders: noFolder ? undefined : Array.from({ length: folders }, (_, i) => {
                    const f = i ? path.join(tmp, `repo${i + 1}`) : tmp;
                    return { uri: { scheme: "file", fsPath: f, path: f, with(o) { return { ...this, ...o, fsPath: o.path || this.fsPath }; } } };
                  }) },
@@ -277,7 +278,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   const ext = require("../extension");
   fs.mkdirSync(logs, { recursive: true });
   const memento = new Map();
-  ext.activate({ storageUri: { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
+  ext.activate({ storageUri: noFolder ? undefined : { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
                  globalStorageUri: { fsPath: path.join(globalStorage, "local.copilot-cache-keeper") },
                  globalState: { get: k => memento.get(k), update: async (k, v) => { memento.set(k, v); } } });
   await ext._read();                                  // first read: no chats yet
@@ -1614,6 +1615,10 @@ const never = () => new Promise(() => {});
       fs.mkdirSync(cs, { recursive: true });
       fs.writeFileSync(path.join(cs, "old-chat.jsonl"), chatFile(h.clock - 86400000, [{ at: 0, prompt: 80000, credits: 30, text: "Older work" }]));
       fs.writeFileSync(path.join(cs, "sess-1.jsonl"), chatFile(h.clock - 3600000, [{ at: 0, prompt: 80000, credits: 999 }]));
+      // a chat of a window with no folder open
+      const empty = path.join(h.dir, "globalStorage", "emptyWindowChatSessions");
+      fs.mkdirSync(empty, { recursive: true });
+      fs.writeFileSync(path.join(empty, "no-folder.jsonl"), chatFile(h.clock - 7200000, [{ at: 0, prompt: 40000, credits: 7, text: "No folder work" }]));
       // its "saved" notification is never clicked: the command must still finish
       h.vscode.window.showInformationMessage = () => new Promise(() => {});
       const done = await Promise.race([h.commands["cacheKeeper.spendReport"]().then(() => true),
@@ -1627,8 +1632,23 @@ const never = () => new Promise(() => {});
       assert.ok(/\| Local \| claude-opus-5\.5 \|/.test(md), md);
       assert.ok(/\| Older work \| Local, older chats \|/.test(md), "the older chat, from its chat file");
       assert.ok(!/999/.test(md), "the chat with a debug log is not counted again from its chat file");
-      assert.ok(/Older Local chats \(no debug log left\): 1/.test(md), "where it read");
+      assert.ok(/\| No folder work \| Local, older chats \| \(no folder\) \|/.test(md), "a chat of a window with no folder open");
+      assert.ok(/Older Local chats \(no debug log left\): 2/.test(md), "where it read");
     } finally { h.close(); }
+  });
+
+  await check("spend report in a window with no folder open: Copilot's prices found in other workspaces, right after it opens", async () => {
+    for (const kind of ["claude", "codex"]) {
+      const h = await harness({ kind, answer: never, noFolder: true });
+      try {
+        await h.run(5);
+        h.vscode.window.showInformationMessage = () => new Promise(() => {});
+        await h.commands["cacheKeeper.spendReport"](60);
+        const md = fs.readFileSync(h.ran.find(r => r.id === "markdown.showPreview").a.fsPath, "utf8");
+        assert.ok(/Copilot prices: .*price-src.models\.json/.test(md), md.slice(md.indexOf("Read:")));
+        assert.ok(!/no known price/.test(md) && !/\*\*0\.00 credits\*\*/.test(md), md.split("\n")[2]);
+      } finally { h.close(); }
+    }
   });
 
   // ---------------------------------------------------------------- Claude and Codex harnesses

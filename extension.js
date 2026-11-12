@@ -485,7 +485,8 @@ async function readAgentChat(kind, vscId, row, now = Date.now(), skipped = null)
 // 30 min: this workspace's Local chats first, else the most recently used workspaces.
 let priceBook = { text: null, at: 0, from: "", wideAt: 0 };
 const PRICE_WIDE_MS = 60000;   // no price sheet yet: other workspaces are searched at most this often
-async function refreshPrices(context) {
+/** `wide`: search other workspaces now when this one has no price sheet (the spend report). */
+async function refreshPrices(context, wide = false) {
   if (Date.now() - priceBook.at < 30 * 60 * 1000 && priceBook.text) return;
   priceBook.at = Date.now();
   const newest = async dirs => {
@@ -501,7 +502,7 @@ async function refreshPrices(context) {
   };
   let best = logRootPath ? await newest([logRootPath]) : null;
   // other workspaces: every workspaceStorage folder, so not on every read while none has prices
-  if (!best && Date.now() - priceBook.wideAt >= PRICE_WIDE_MS) {
+  if (!best && (wide || Date.now() - priceBook.wideAt >= PRICE_WIDE_MS)) {
     priceBook.wideAt = Date.now();
     const ws = workspaceStorageRoot(context);
     if (ws) {
@@ -524,7 +525,9 @@ function priceFor(model) { return priceBook.text ? core.priceSheetFrom(priceBook
 /** VS Code's workspaceStorage folder on the window's side (every workspace's Local chat logs). */
 function workspaceStorageRoot(context) {
   return remote ? (remoteServer || (sdkLoc && `${sdkLoc.home}/.vscode-server`)) + "/data/User/workspaceStorage"
-    : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath)) : null;
+    : context.storageUri ? path.dirname(path.dirname(context.storageUri.fsPath))
+    // a window with no folder open has no workspace storage: workspaceStorage is next to globalStorage
+    : context.globalStorageUri ? path.join(path.dirname(path.dirname(context.globalStorageUri.fsPath)), "workspaceStorage") : null;
 }
 
 // ---------------------------------------------------------------- cache lifetimes
@@ -754,14 +757,16 @@ async function gatherSpend(context, since, progress) {
   }
   // Older Local chats, whose debug log is gone: VS Code's own chat files, on the UI side (Windows for
   // a WSL window), one record per message with its billed credits. Copies of a chat are merged.
+  // Chats of windows with no folder open are in globalStorage/emptyWindowChatSessions.
   if (ui) {
     step("older Local chats");
     const copies = new Map();
-    for (const w of await localIo.list(ui.ws)) {
-      const cs = path.join(ui.ws, w, "chatSessions");
+    const folders = (await localIo.list(ui.ws)).map(w => [path.join(ui.ws, w, "chatSessions"), w]);
+    folders.push([path.join(ui.ws, "..", "globalStorage", "emptyWindowChatSessions"), null]);
+    for (const [cs, w] of folders) {
       const files = (await localIo.list(cs)).filter(f => f.endsWith(".jsonl"));
       if (!files.length) continue;
-      const label = wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8);
+      const label = w ? wsLabel(jsonOr(await localIo.readText(path.join(ui.ws, w, "workspace.json")), {}) || {}) || w.slice(0, 8) : "(no folder)";
       for (const f of files) {
         const id = f.slice(0, -".jsonl".length);
         const st = await localIo.stat(path.join(cs, f));
@@ -804,7 +809,7 @@ async function spendReport(context, daysArg) {
   const since = Date.now() - days * 86400000;
   const text = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Cache Keeper: reading chat logs" },
     async progress => {
-      await refreshPrices(context);
+      await refreshPrices(context, true);
       const { chats, where } = await gatherSpend(context, since, progress);
       const a = report.analyzeSpend(chats, { since, ttlOverrides: cfg("ttlSeconds") || {} });
       logx(`spend report, ${days} days: ${core.fmt(a.total)} cr, ${a.calls} calls in ${a.chats} chats` +

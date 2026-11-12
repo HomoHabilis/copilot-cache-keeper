@@ -143,5 +143,22 @@ class SessionTotalTests(unittest.TestCase):
         self.assertEqual([c["credits"] for c in billed if c["kind"] == "compaction"], [8])
 
 
+class ChatFileTests(unittest.TestCase):
+    def test_chats_of_windows_with_no_folder_are_read(self):
+        import json as _json
+        req = {"timestamp": 1_800_000_000_000, "message": {"text": "No folder"}, "modelId": "copilot/claude-opus-5.5",
+               "promptTokens": 50_000, "completionTokens": 200, "elapsedMs": 20_000, "copilotCredits": 30}
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d) / "User/workspaceStorage"
+            ws.mkdir(parents=True)
+            empty = Path(d) / "User/globalStorage/emptyWindowChatSessions"
+            empty.mkdir(parents=True)
+            (empty / "empty.jsonl").write_text("\n".join(_json.dumps(x) for x in [
+                {"kind": 0, "v": {"requests": []}}, {"kind": 2, "k": ["requests"], "v": [req]}]) + "\n", encoding="utf-8")
+            turns = spend.collect_vscode_turns([ws], 0, {})
+        msgs = spend.turns_as_calls(turns, set())
+        self.assertEqual([(c["session"], c["workspace"], c["credits"]) for c in msgs], [("empty", "(no folder)", 30.0)])
+
+
 if __name__ == "__main__":
     unittest.main()

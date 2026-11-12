@@ -434,7 +434,8 @@ where) and opened as a preview.
 
 It reads every chat, not just this window's, on the window's side (WSL, SSH host or container)
 and, for a remote window, on this computer too: Local chats of every workspace, older Local chats
-whose debug log VS Code has removed (from VS Code's own chat files, per message), and the Copilot
+whose debug log VS Code has removed (from VS Code's own chat files, per message, including windows
+with no folder open), and the Copilot
 SDK, Claude and Codex chats VS Code created. Credits are as billed where the log says, else from
 Copilot's price sheet; calls with no known price are flagged. On this machine it matches the Python
 helper below within 0.3%; the helper also covers OpenCode and Copilot CLI.
