@@ -1530,7 +1530,6 @@ async function choose(context, s, pick) {
   const st = stateFor(s.id);
   if (!pick) return;
   pick = choiceOf(pick);
-  if ((KEEP_WARM_MODES.includes(CHOICES[pick]) || pick === KEEP_WARM_NOW) && s.routed) { noKeepWarmRouted(s); return; }
   // answered here (status-bar list) counts as answering this window's warning too
   if (st.offer && st.offer.for === s.cacheFrom) st.offer.answered = true;
   // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
@@ -1818,11 +1817,6 @@ async function decide(context) {
   await verifyPending();
   for (const s of all) {
     const st = stateFor(s.id);
-    // kept warm, then Fusion took over the chat (or the price became known as Fusion): stop, keep-alives can't help
-    if (s.routed && KEEP_WARM_MODES.includes(st.mode) && !st.pending) {
-      setMode(st, s, "ask");
-      logx(`keeping ${s.id.slice(0, 8)} warm stopped: ${ROUTED_WHY}`);
-    }
     if (!managed(s) || s.busy || st.pending) {
       // (a pending message is our own keep-alive still being answered: expected, not worth logging)
       if (!st.pending && (st.mode === "auto" || st.mode === "once") && live(s) > 0 && live(s) <= lead() && st.skipFor !== s.cacheFrom) {
@@ -1834,6 +1828,10 @@ async function decide(context) {
     // Fusion: no countdown, nothing automatic. Only a Summarize or Compact you asked for is sent
     // (cold or not: which model answers, and what it has cached, can't be known).
     if (s.routed) {
+      if (KEEP_WARM_MODES.includes(st.mode)) {      // kept warm, then Fusion took over the chat
+        setMode(st, s, "ask");
+        logx(`keeping ${s.id.slice(0, 8)} warm stopped: ${ROUTED_WHY}`);
+      }
       if (st.mode === "summarize") { if (await summary(context, s, "on request", { allowCold: true })) st.actedFor = s.cacheFrom; }
       else if (st.mode === "compact") { if (await compact(context, s, "on request", { allowCold: true })) st.actedFor = s.cacheFrom; }
       continue;
@@ -2026,7 +2024,7 @@ function updateStatus(context) {
     (s.cost ? ` · +${core.fmt(s.cost.missExtra)} cr` : "") + autoElsewhere + others;
   // Tooltip: short Markdown lines rather than one long sentence.
   const md = [`**${s.title ? s.title.replace(/[\\`*_[\]<>]/g, "") : s.id.slice(0, 8)}**  `,
-              s.routed ? `Fusion (${(s.caches || []).map(x => x.model).join(", ") || s.model} since your last message) · ${Math.round(s.ctx / 1000)}k context`
+              s.routed ? `Fusion (${(s.models || []).join(", ") || s.model} since your last message) · ${Math.round(s.ctx / 1000)}k context`
                 : `${s.model} · ${Math.round(s.ctx / 1000)}k context · cache lifetime ${s.ttl} s (${s.ttlFrom})`, ""];
   if (s.busy && r <= 0 && !s.routed) md.push("**Agent working past the cache lifetime:** the cache has possibly expired. The countdown " +
     "runs from the last model call's start; a long answer can still leave it cached. The next call's cache hit is logged " +

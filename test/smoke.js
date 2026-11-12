@@ -1347,23 +1347,20 @@ const never = () => new Promise(() => {});
     const turn = (t, text, model, input, read) => [ev("user.message", t, { content: text }), ev("assistant.turn_start", t + 5),
       use(t + 10, model, input, read), ev("assistant.turn_end", t + 1100), ev("session.usage_checkpoint", t + 1110)];
     const ka = core.KEEPALIVES_BY_LANG.it[1];
-    // you write (sol answers), 28 min later a keep-alive goes to luna: sol's cache still decides
+    // you write (sol answers), 26 min later a keep-alive goes to luna: both models count
     let log = [ev("session.start", now - 40 * m), ...turn(now - 28 * m, "Confronta le cartelle", "gpt-6.1-sol", 121000, 15000),
                ...turn(now - 2 * m, ka, "gpt-6-luna", 93000, 0)].map(e => JSON.stringify(e)).join("\n") + "\n";
     let x = core.analyzeSdk("/x/fusion", log, {}, now);
     assert.strictEqual(x.routed, true);
-    assert.strictEqual(x.model, "gpt-6.1-sol");
-    assert.ok(Math.abs(x.remaining - 120) < 2, String(x.remaining));        // 28 min after sol's call
-    // at most what the next message re-sends (93k now)
+    assert.deepStrictEqual(x.models, ["gpt-6.1-sol", "gpt-6-luna"]);
+    // worst case: sol (the costlier) cold, at most what the next message re-sends (93k now)
     assert.ok(Math.abs(x.cost.missExtra - 93000 * (175 - 7) / 1e6) < 0.01, String(x.cost.missExtra));
-    assert.strictEqual(x.lastMsgCall.firstForModel, true);
-    assert.deepStrictEqual(x.caches.map(c => c.model), ["gpt-6.1-sol", "gpt-6-luna"]);
+    assert.strictEqual(x.lastMsgCall.firstForModel, true);     // the keep-alive: luna's first call, not a miss
     // a new message from you: only the models used since then count
     log += [...turn(now - 1 * m, "Vai avanti", "gpt-6-luna", 95000, 93000)].map(e => JSON.stringify(e)).join("\n") + "\n";
     x = core.analyzeSdk("/x/fusion", log, {}, now);
-    assert.strictEqual(x.model, "gpt-6-luna");
-    assert.deepStrictEqual(x.caches.map(c => c.model), ["gpt-6-luna"]);
-    assert.ok(Math.abs(x.remaining - 1740) < 2, String(x.remaining));
+    assert.deepStrictEqual(x.models, ["gpt-6-luna"]);
+    assert.ok(Math.abs(x.cost.missExtra - 95000 * (8.75 - 0.7) / 1e6) < 0.01, String(x.cost.missExtra));
   });
 
   await check("Fusion (auto model) SDK chat: no countdown, no pop-ups, nothing automatic; Summarize on request", async () => {

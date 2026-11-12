@@ -499,28 +499,9 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const calls = events.filter(e => e.t === "call");
   if (!calls.length) return null;
   const last = calls[calls.length - 1];
-  const slack = info.stepTurns ? 1000 : 0;           // call starts derived from end - duration
-  const users = events.filter(e => e.t === "user");
-  const isOurs = u => isOwnMessage(u.text);
-  const real = users.filter(u => !isOurs(u));
-  // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
-  const cacheStart = c => c.expiresAt && c.ttl ? c.expiresAt - c.ttl * 1000 : c.ts;
-  const ttlOf = c => ttlOverrides[c.model || "?"] || (c.ttl > 0 ? c.ttl : 0) || ttlFor(c.model || "?", ttlOverrides);
-  // Fusion (auto model): Copilot picks the model for each call, and each model has its own cache.
-  // Every model used since your last message may answer the next one, so the chat is as warm as the
-  // first of their caches to expire: that call (its model, lifetime, prices) drives the countdown.
+  const model = last.model || "?";
+  // Fusion (auto model): Copilot picks the model for each call, and each model has its own cache
   const routed = !!last.auto;
-  let focus = last, caches = null;
-  if (routed) {
-    const since = Math.max(0, ...real.map(u => u.ts || 0)) - slack;
-    const latest = new Map();
-    for (const c of calls) if (c.ts >= since) latest.set(c.model || "?", c);
-    if (!latest.size) latest.set(last.model || "?", last);
-    caches = [...latest.values()].map(c => ({ model: c.model || "?", ttl: ttlOf(c), cacheFrom: cacheStart(c), prefix: c.input || 0, call: c }))
-      .sort((x, y) => (x.cacheFrom + x.ttl * 1000) - (y.cacheFrom + y.ttl * 1000));
-    focus = caches[0].call;
-  }
-  const model = focus.model || "?";
   // Compacted since the last call (the /compact command, or an idle compaction): the next message
   // re-sends the compacted chat, not what the last call read. Its size is known only once a call
   // has run on it, so until then it is estimated.
@@ -535,6 +516,9 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // Size of a fresh chat's first prompt: about the chat's first call, minus any big attachments in
   // that first message (capped).
   const firstCtx = Math.min(calls[0].input, 40000);
+  const users = events.filter(e => e.t === "user");
+  const isOurs = u => isOwnMessage(u.text);
+  const real = users.filter(u => !isOurs(u));
   // Busy: a turn is still open. Turns nest (a subagent logs its own turn inside the agent's turn), so
   // count depth rather than comparing the last start with the last end; a message waiting for its
   // turn also counts. (Not "the log changed": VS Code also appends discovery lines to a Local chat's
@@ -555,11 +539,11 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // for hours is taken as one that never logged its end.
   const busy = (depth > 0 || pending || between) && now - lastActivity < BUSY_CAP_MS;
   // Cache lifetime: a setting wins, then what the chat's own log says, then learned or default.
-  const logTtl = routed ? (focus.ttl > 0 ? focus.ttl : undefined) : [...calls].reverse().map(c => c.ttl).find(t => t > 0);
+  const logTtl = [...calls].reverse().map(c => c.ttl).find(t => t > 0);
   const ttl = ttlOverrides[model] || logTtl || ttlFor(model, ttlOverrides);
   const ttlFrom = ttlOverrides[model] ? "setting" : logTtl ? "this chat's log" : ttlSource(model, ttlOverrides);
   // The cache is refreshed when a call starts (the prompt is read), not when its answer ends.
-  const cacheFrom = cacheStart(focus);
+  const cacheFrom = last.expiresAt && last.ttl ? last.expiresAt - last.ttl * 1000 : last.ts;
   // What the chat contains, for sizing a handoff summary.
   const files = new Set(events.filter(e => e.t === "edit").flatMap(e => e.files || []));
   const compactions = Math.max(info.compactions || 0, events.filter(e => e.t === "compaction").length);
@@ -570,6 +554,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // not cached yet. (Your own messages are a poor yardstick: they often bring files and tool output.)
   // Learn only the fixed part (what a keep-alive added minus the agent's reply just before it), then
   // add the current last reply: a keep-alive after a long answer adds more than one after "OK".
+  const slack = info.stepTurns ? 1000 : 0;           // call starts derived from end - duration
   const pairs = [];
   for (const u of users.filter(isOurs)) {
     const i = calls.findIndex(c => c.ts >= u.ts - slack);
@@ -595,7 +580,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // with the write price corrected from what calls with a known cost were billed. Observed on Local
   // chats: a cold call is billed near the input price, below the sheet's cache_write_price, so the
   // sheet alone over-estimates an expiry by ~15%.
-  const per = routed && focus.rates ? focus.rates : Object.assign({}, ...calls.map(c => c.rates || {}));
+  const per = Object.assign({}, ...calls.map(c => c.rates || {}));
   const toR = p => p.cache_read === undefined && p.input === undefined ? null
     : { read: p.cache_read || 0, write: p.cache_write || p.input || 0, out: p.output || 0 };
   let r = toR(per), fresh = r && (toR({ ...per, ...(calls[0].rates || {}) }) || r);
@@ -615,11 +600,19 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   // Fusion: what a cold message could add, at worst: the costliest of the models used since your
   // last message, losing what it cached (its last prompt, at most what the next message re-sends).
   // Used for cacheKeeper.minCredits: a Fusion chat is listed like any other once that is reached.
-  if (cost && routed && !compactedIdle) {
-    cost.missExtra = Math.max(0, ...caches.map(m => {
-      const rm = (m.call.rates && toR(m.call.rates)) || r;
-      return Math.min(ctx, m.prefix) * (rm.write - rm.read);
-    }));
+  let models = null;
+  if (routed) {
+    const since = Math.max(0, ...real.map(u => u.ts || 0)) - slack;
+    const latest = new Map();                         // model -> its last call since your last message
+    for (const c of calls) if (c.ts >= since) latest.set(c.model || "?", c);
+    if (!latest.size) latest.set(model, last);
+    models = [...latest.keys()];
+    if (cost && !compactedIdle) {
+      cost.missExtra = Math.max(0, ...[...latest.values()].map(c => {
+        const rm = (c.rates && toR(c.rates)) || r;
+        return Math.min(ctx, c.input || 0) * (rm.write - rm.read);
+      }));
+    }
   }
   // Credits spent: billed per call when the log says, otherwise estimated from the prices.
   let credits = 0, creditsEstimated = false;
@@ -643,8 +636,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
-    // Fusion (auto model): the next message, a keep-alive included, may go to another model with its own cache
-    routed, caches: caches && caches.map(({ call, ...x }) => x),
+    routed, models,                                   // Fusion, and the models used since your last message
     remaining: ttl - (now - cacheFrom) / 1000,
     lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,
