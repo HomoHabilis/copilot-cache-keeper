@@ -615,6 +615,8 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     // lifetimes are only worth measuring where the log doesn't state them
     hitGaps: logTtl ? {} : provenGaps(calls, refreshes),
     cacheFrom,
+    // Fusion (auto model): the next message, a keep-alive included, may go to another model with its own cache
+    routed: !!last.auto,
     remaining: ttl - (now - cacheFrom) / 1000,
     lastUserText: lastUser ? String(lastUser.text || "") : "",
     lastUserTs: lastUser ? lastUser.ts : 0,

@@ -1393,8 +1393,16 @@ async function keepAlive(context, s, opts = {}) {
   return ok;
 }
 
+const ROUTED_WHY = "Fusion picks the model for each message, so a keep-alive can go to another model, " +
+  "with its own cache, and can't keep this one warm";
+function noKeepWarmRouted(s) {
+  vscode.window.showInformationMessage(`Cache Keeper: no keep-warm for ${chatName(s)}: ${ROUTED_WHY}. ` +
+    "Summarize still works, or pick a fixed model for this chat.");
+}
+
 /** "Keep warm now" from the command palette: on an expired cache, say what it costs first. */
 async function keepWarmNow(context, s) {
+  if (s.routed) { noKeepWarmRouted(s); return; }
   if (!s.busy && live(s) <= 0) {
     const price = s.cost ? ` It re-sends the whole context: ~${core.fmt(s.cost.heartbeat + s.cost.missExtra)} cr ` +
       `instead of ~${core.fmt(s.cost.heartbeat)} cr for a warm one.` : " It re-sends the whole context at full price.";
@@ -1519,6 +1527,7 @@ async function choose(context, s, pick) {
   const st = stateFor(s.id);
   if (!pick) return;
   pick = choiceOf(pick);
+  if ((KEEP_WARM_MODES.includes(CHOICES[pick]) || pick === KEEP_WARM_NOW) && s.routed) { noKeepWarmRouted(s); return; }
   // answered here (status-bar list) counts as answering this window's warning too
   if (st.offer && st.offer.for === s.cacheFrom) st.offer.answered = true;
   // Summarize on an expired cache: ask about the cost first, then write it. Otherwise it goes out on
@@ -1597,6 +1606,7 @@ function chatName(s) {
 const MORE = "More…";
 function warningButtons(s, withAuto = true) {
   const c = s.cost, cost = x => c ? ` (~${core.fmt(x)} cr)` : "";
+  if (s.routed) return [`Summarize${cost(c && c.summary)}`, MORE];
   const second = withAuto && c ? "Auto keep warm" : `Summarize${cost(c && c.summary)}`;
   return [`Keep warm${cost(c && c.heartbeat)}`, second, MORE];
 }
@@ -1611,7 +1621,7 @@ async function offer(context, s) {
   const msg = `${chatName(s)} expires in ${s.ttlAssumed ? "~" : ""}${Math.max(0, Math.round(live(s)))}s` +
     (s.ttlAssumed ? " (lifetime assumed: no data for this model)." : ".") +
     (c ? ` Expiry: +${core.fmt(c.missExtra)} cr.` : " No price for this model.") +
-    ` No click: ${noClickText(st, s)}.`;
+    ` No click: ${noClickText(st, s)}.` + (s.routed ? " Fusion: keep-warm can't work here." : "");
   const pick = choiceOf(await vscode.window.showWarningMessage(msg, ...warningButtons(s))) || undefined;
   // More...: the per-chat menu; a choice there answers the warning (choose()), closing it does not
   if (pick === MORE) { await chatMenu(context, all.find(x => x.id === s.id) || s); return; }
@@ -1765,7 +1775,7 @@ function choiceItems(st, s) {
   const when = extra > 0 ? `${lead()}-${lead() + extra} s` : `${lead()} s`;
   const mark = mode => st.mode === mode ? "$(check) current" : undefined;
   const cap = c ? core.autoCap(s, capPercent()) : null;
-  const keep = expired
+  const keep = s.routed ? [] : expired
     ? [{ label: KEEP_WARM_NOW, detail: "The cache has expired: one keep-alive now re-sends the whole context" +
         (c ? ` (${cr(c.heartbeat + c.missExtra)}); asks first` : "; asks first") }]
     : [{ label: "Keep warm", description: mark("once"),
@@ -1805,6 +1815,11 @@ async function decide(context) {
   await verifyPending();
   for (const s of all) {
     const st = stateFor(s.id);
+    // kept warm, then Fusion took over the chat (or the price became known as Fusion): stop, keep-alives can't help
+    if (s.routed && KEEP_WARM_MODES.includes(st.mode) && !st.pending) {
+      setMode(st, s, "ask");
+      logx(`keeping ${s.id.slice(0, 8)} warm stopped: ${ROUTED_WHY}`);
+    }
     if (!managed(s) || s.busy || st.pending) {
       // (a pending message is our own keep-alive still being answered: expected, not worth logging)
       if (!st.pending && (st.mode === "auto" || st.mode === "once") && live(s) > 0 && live(s) <= lead() && st.skipFor !== s.cacheFrom) {
@@ -2004,6 +2019,7 @@ function updateStatus(context) {
   if (s.busy && r <= 0) md.push("**Agent working past the cache lifetime:** the cache has possibly expired. The countdown " +
     "runs from the last model call's start; a long answer can still leave it cached. The next call's cache hit is logged " +
     "in the Output panel (Cache Keeper).", "");
+  if (s.routed) md.push(`Fusion (auto model): no keep-warm. ${ROUTED_WHY}.`, "");
   if (st.mode === "once" && r > 0) md.push("Keep-alive armed: one is sent just before expiry.", "");
   if (costlyRestart) {
     md.push(`$(warning) **Cache expired.** Your next message here re-sends the whole ${Math.round(s.ctx / 1000)}k-token context` +

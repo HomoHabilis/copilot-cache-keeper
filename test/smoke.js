@@ -63,10 +63,10 @@ function chatLog(t0, { model = "claude-opus-5.5", ctx = 150000, first = ctx - 20
 // Copilot SDK chat log (~/.copilot/session-state/<id>/events.jsonl), same prices as Opus above.
 const SDK_PRICES = { input: 400, cache_read: 20, cache_write: 500, output: 2000 };   // credits per 1M tokens
 const iso = t => new Date(t).toISOString();
-function sdkUsage(start, dur, { model = "claude-opus-5.5", input, read, write = input - read, out = 300, ttl = 300 }) {
+function sdkUsage(start, dur, { model = "claude-opus-5.5", input, read, write = input - read, out = 300, ttl = 300, auto }) {
   const counts = { input: input - read - write, cache_read: read, cache_write: write, output: out };
   return { type: "session.usage_record", timestamp: iso(start + dur), data: { usage: {
-    model, inputTokens: input, cacheReadTokens: read, cacheWriteTokens: write, outputTokens: out, duration: dur,
+    model, isAuto: auto, inputTokens: input, cacheReadTokens: read, cacheWriteTokens: write, outputTokens: out, duration: dur,
     cacheExpiresAt: iso(start + ttl * 1000), cacheTtlSeconds: ttl,
     copilotUsage: { totalNanoAiu: Object.entries(counts).reduce((a, [k, n]) => a + n * SDK_PRICES[k] * 1e3, 0),
       tokenDetails: Object.entries(counts).map(([k, n]) => ({ batchSize: 1e6, costPerBatch: SDK_PRICES[k] * 1e9, tokenCount: n, tokenType: k })) } } } };
@@ -77,12 +77,12 @@ function sdkTurn(t, text, { input, read, out = 300, dur = 2000, model } = {}) {
           sdkUsage(t + 10, dur, { input, read, out, model }), ev("assistant.turn_end", t + dur + 50, { turnId: "0" }),
           ev("session.usage_checkpoint", t + dur + 60)];
 }
-function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model } = {}) {
+function sdkChatLog(t0, { ctx = 150000, first = ctx - 20000, model, auto } = {}) {
   return [ev("session.start", t0 - 100),
           ev("user.message", t0, { content: "Refactor the parser" }), ev("assistant.turn_start", t0 + 10, { turnId: "0" }),
-          sdkUsage(t0 + 50, 3000, { input: first, read: 0, out: 800, model }), ev("assistant.turn_end", t0 + 3900, { turnId: "0" }),
+          sdkUsage(t0 + 50, 3000, { input: first, read: 0, out: 800, model, auto }), ev("assistant.turn_end", t0 + 3900, { turnId: "0" }),
           ev("assistant.turn_start", t0 + 3950, { turnId: "1" }),
-          sdkUsage(t0 + 4000, 2000, { input: ctx, read: ctx - 1000, out: 300, model }),
+          sdkUsage(t0 + 4000, 2000, { input: ctx, read: ctx - 1000, out: 300, model, auto }),
           ev("assistant.message", t0 + 6000, { content: "Done: the parser is split in three files." }),
           ev("assistant.turn_end", t0 + 6500, { turnId: "1" }), ev("session.usage_checkpoint", t0 + 6510),
          ].map(e => JSON.stringify(e)).join("\n") + "\n";
@@ -141,7 +141,7 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   const storage = path.join(tmp, "workspaceStorage", "ws1");
@@ -285,7 +285,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   fs.mkdirSync(chat, { recursive: true });
   if (kind === "sdk") {
     fs.writeFileSync(path.join(chat, "workspace.yaml"), `id: ${sdkId}\ncwd: ${sdkCwd || tmp}\nclient_name: vscode-agent-host\nsummary_count: 0\n`);
-    fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, ...(first ? { first } : {}) }));
+    fs.writeFileSync(path.join(chat, "events.jsonl"), sdkChatLog(clock - 7000, { ctx, auto: sdkAuto, ...(first ? { first } : {}) }));
   } else if (kind === "claude" || kind === "codex") {
     fs.writeFileSync(path.join(chat, logName), (kind === "claude" ? claudeChatLog : codexChatLog)(clock - 7000, { ctx, cwd, ...(first ? { first } : {}) }));
     // Copilot's price sheet, as a Local chat of the workspace has it (Claude and Codex logs carry no prices)
@@ -1335,6 +1335,24 @@ const never = () => new Promise(() => {});
       await h.run(10);
       await h.commands["cacheKeeper.options"]();
       assert.ok(h.lists.at(-1)[0].description.startsWith("Copilot SDK"), h.lists.at(-1)[0].description);
+    } finally { h.close(); }
+  });
+
+  await check("Fusion (auto model) SDK chat: no keep-warm offered or sent, Summarize still offered", async () => {
+    const now = Date.now();
+    assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000, { auto: true }), {}, now).routed, true);
+    assert.strictEqual(core.analyzeSdk("/x/f", sdkChatLog(now - 60000), {}, now).routed, false);
+    let buttons;
+    const h = await harness({ kind: "sdk", sdkAuto: true, answer: (m, b, n) => { if (n === 1) { buttons = b; return undefined; } return never(); } });
+    try {
+      await h.run(300);
+      assert.strictEqual(h.warnings.length, 1, "still warned");
+      assert.ok(/Fusion: keep-warm can't work here\./.test(h.warnings[0].msg), h.warnings[0].msg);
+      assert.ok(/^Summarize/.test(buttons[0]) && buttons[1] === "More…" && buttons.length === 2, buttons.join(" | "));
+      await h.commands["cacheKeeper.keepWarmNow"]();
+      assert.strictEqual(h.sent.length, 0, "no keep-alive");
+      assert.ok(h.infos.some(m => /no keep-warm for .*Fusion picks the model/.test(m)), h.infos.join(" | "));
+      assert.ok(/Fusion \(auto model\): no keep-warm/.test(h.status.tooltip.value), h.status.tooltip.value);
     } finally { h.close(); }
   });
 
