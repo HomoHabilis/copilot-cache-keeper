@@ -63,6 +63,10 @@ function localTrace(mainText) {
       ev.push({ t: "abort", ts }, { t: "user", ts, text: String(a.content || "") });
     } else if (e.type === "turn_start" || e.type === "turn_end") ev.push({ t: e.type, ts });
     else if (e.type === "llm_request") {
+      if (e.status === "error" && /^cancell?ed$/i.test(String(a.error || "").trim())) {
+        if (String(a.debugName || "").startsWith("panel/")) ev.push({ t: "abort", ts: ts + (e.dur || 0) });
+        continue;
+      }
       const credits = a.copilotUsageNanoAiu ? a.copilotUsageNanoAiu / 1e9 : undefined;
       if (String(a.debugName || "").startsWith("panel/") && "inputTokens" in a) {
         ev.push({ t: "call", ts, end: ts + (e.dur || 0), model: a.model || "?", input: a.inputTokens || 0,
