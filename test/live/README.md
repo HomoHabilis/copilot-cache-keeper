@@ -61,12 +61,46 @@ Claude and Codex harnesses enabled if you test them (their SDKs download on firs
 other messages are cached and cost little. Picking a cheap model in each harness first keeps a full
 run around 2-3 credits.
 
+## Visual check of the nudges (free)
+
+```bash
+test/live/preview.sh                 # screenshots in ./preview-shots (not committed)
+```
+
+Opens a real VS Code window with this working tree and shows every nudge, one after the other, on a
+made-up costly chat: the split nudge, the Auto keep warm offer, the "agent may be waiting" warning,
+the context-size tip, the digest, then the status bar after a commit and its tooltip. The made-up
+chat goes through the real code (`cacheKeeper.previewNudges`, a command that is not in the Command
+Palette), so the wording, the buttons and the wrapping are what a real chat would get. **No chat
+is opened and nothing is sent: it costs no credits.** It takes a screenshot of that window at each
+step and closes it after about a minute.
+
+It also shows the status bar on its own: after a commit, with the usual expiry warning, and as
+with `cacheKeeper.notifications` off (stages `quiet-warning`, `quiet-split`, `quiet-waiting`,
+`quiet-expired`), where the bar does all the telling. For each it also photographs the tooltip:
+the mouse is moved over Cache Keeper's entry for a second, then put back. To look at one yourself:
+
+```bash
+test/live/preview.sh --show quiet-split      # that stage only, on screen for 2 minutes: hover the status bar
+```
+
+Use it after changing a nudge's text: a notification with no button is cut to one line, long ones
+wrap to four or five, and a button label that is too long is cut. Look at the screenshots.
+
+While it runs, leave the keyboard and the mouse alone: to photograph the window it is brought to the front (with
+a bare Alt key press, which Windows requires), and the tooltip only shows while that window has the
+focus. Run a stage by hand from another extension or a keybinding with
+`cacheKeeper.previewNudges` and one of `split`, `keepWarm`, `waiting`, `tip`, `digest`, `commit`,
+`off`; a preview ends by itself after 2 minutes.
+
 ## Files
 
 - `run.sh`: copies the working tree and the driver where Windows VS Code can load them, sets up the
   scratch folder (Cache Keeper's log mirrored to a file with the hidden `cacheKeeper.debugLogFile`
   setting, `minCredits` 0 so cheap chats count), writes the plan, opens the window, waits, checks.
 - `plan.js`: the steps per harness.
+- `preview.sh`, `preview-driver/`, `shot.ps1`: the visual check above (launcher, the extension that
+  steps through the stages, the window screenshot).
 - `driver/`: a tiny extension that runs the plan in the window (only loaded for that window, never
   installed). How each harness starts a chat: Local and Copilot SDK have a command; Claude and Codex
   chats start by opening an untitled chat of their scheme (`agent-host-claude:/untitled-<uuid>`).

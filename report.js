@@ -357,6 +357,52 @@ function keptWarm(timeline, k) {
   }
 }
 
+/**
+ * The what-ifs for one live chat, from its event list (harnesses.js): what it was billed, the expiries
+ * it paid, what keeping warm and splitting would have saved, and what each call now costs just to
+ * re-read the context. Null when it has fewer than two priced agent calls.
+ * { billed, calls, ctx, maxCtx, growing, paid: { pause: { count, credits }, wait: { count, credits } },
+ *   keeperSaving, split: { saving, share, chats } | null (the bill is not explained well enough),
+ *   carry: { perCall, newPerCall }, lastCommit }
+ */
+function liveInsight(events, { sheetFor = () => null, ttl = 0 } = {}) {
+  const users = events.filter(e => e.t === "user").map(e => ({ ts: e.ts, own: ownKind(e.text) }));
+  const series = [], paid = { pause: { count: 0, credits: 0 }, wait: { count: 0, credits: 0 } };
+  let prev = null, billed = 0, mi = 0, ui = 0;
+  for (const c of events) {
+    if (c.t !== "call" || c.side) continue;
+    const sheet = sheetFor(c.model || "?"), r = callRates(c, sheet), ctx = c.input || 0, cached = c.cached || 0, life = c.ttl || ttl;
+    let cold = null, pause = 0;
+    if (prev && r && ctx >= MISS_MIN_CTX && cached < MISS_CACHED_BELOW * ctx) {
+      pause = (c.ts - prev.ts) / 1000;
+      const expired = !!life && pause >= life - 5;
+      const waited = expired && users.length > 0 && !users.some(u => u.ts > prev.ts && u.ts <= c.ts);
+      cold = waited ? "wait" : expired ? "pause" : "other";
+      if (cold !== "other") { paid[cold].count++; paid[cold].credits += Math.max(0, ctx - cached - TYPICAL_NEW) * Math.max(0, r.write - r.read); }
+    }
+    prev = c;
+    if (!ctx || !r) continue;
+    for (; ui < users.length && users[ui].ts <= c.ts; ui++) if (!users[ui].own) mi++;
+    const last = series[series.length - 1];
+    series.push({ mi, k: !last || last.mi !== mi ? 0 : 1, ts: c.ts, ctx, new: cold && last ? Math.max(0, ctx - last.ctx) : Math.max(0, ctx - cached),
+                  out: c.out || 0, cold, gap: pause, ttl: life, sheet, fixed: c.rates ? r : null });
+    billed += callCredits(c, sheet) || 0;
+  }
+  if (series.length < 2) return null;
+  const base = simTotal(series), scale = base ? billed / base : 0, fits = scale >= FIT_RANGE[0] && scale <= FIT_RANGE[1];
+  const lastCall = series[series.length - 1], r = ratesOf(lastCall), maxCtx = Math.max(...series.map(c => c.ctx));
+  const fresh = Math.min(Math.min(series[0].ctx, NEW_CHAT_MAX) + SUMMARY_TOK + REREAD, lastCall.ctx);
+  let split = null;
+  if (fits) {
+    const b = bestSplit(series, false);
+    split = { saving: (base - b.total) * scale, share: billed ? (base - b.total) * scale / billed : 0, chats: b.cuts.length + 1 };
+  }
+  return { billed, calls: series.length, ctx: lastCall.ctx, maxCtx, growing: lastCall.ctx >= 0.9 * maxCtx, paid,
+           keeperSaving: fits ? (base - simTotal(series, true)) * scale : 0, split,
+           carry: { perCall: lastCall.ctx * r.read, newPerCall: fresh * r.read },
+           lastCommit: Math.max(0, ...events.filter(e => e.t === "commit").map(e => e.ts)) };
+}
+
 function analyzeSpend(chats, { since = 0, now = Date.now(), ttlOverrides = {} } = {}) {
   const recs = [], misses = [], perChat = [], compactionEvents = { count: 0 };
   const measured = measuredLifetimes(chats);
@@ -794,5 +840,6 @@ function mcpFraction(toolsText) {
   } catch { return null; }
 }
 
-module.exports = { analyzeSpend, spendMarkdown, callCredits, chatFileRequests, chatFileMessages, mcpFraction, subagentCalls, mergeChatEvents,
+// _sim: the call-by-call model itself, for the figures of the guide (docs/make-figures.js) and for tests
+module.exports = { _sim: { modelCost, simTotal, simReshape, bestSplit, ratesOf }, analyzeSpend, spendMarkdown, liveInsight, tierMax, callCredits, chatFileRequests, chatFileMessages, mcpFraction, subagentCalls, mergeChatEvents,
   sdkSessionTotal };

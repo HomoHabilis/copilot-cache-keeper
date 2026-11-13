@@ -5,6 +5,7 @@
   "version": "0.0.0-dev",
   "publisher": "local",
   "license": "UNLICENSED",
+  "icon": "assets/icon.jpg",
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -25,12 +26,20 @@
         "title": "Cache Keeper: Manage chats in this window"
       },
       {
+        "command": "cacheKeeper.documentation",
+        "title": "Cache Keeper: Documentation"
+      },
+      {
         "command": "cacheKeeper.keepWarmNow",
         "title": "Cache Keeper: Keep warm now"
       },
       {
         "command": "cacheKeeper.summaryNow",
         "title": "Cache Keeper: Write handoff summary now"
+      },
+      {
+        "command": "cacheKeeper.continueInNewChat",
+        "title": "Cache Keeper: Continue in new chat (handoff summary, then a new chat from it)"
       },
       {
         "command": "cacheKeeper.compactNow",
@@ -49,116 +58,210 @@
         "title": "Cache Keeper: Show which chats are tracked (diagnostics)"
       }
     ],
-    "configuration": {
-      "title": "Copilot Cache Keeper",
-      "properties": {
-        "cacheKeeper.warnSeconds": {
-          "type": "number",
-          "default": 60,
-          "description": "Warn this many seconds before the cache expires."
-        },
-        "cacheKeeper.thresholdTokens": {
-          "type": "number",
-          "default": 100000,
-          "minimum": 0,
-          "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary or compacts the chat (cacheKeeper.autoAction, when the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
-        },
-        "cacheKeeper.autoAction": {
-          "type": "string",
-          "enum": ["summary", "compact", "off"],
-          "enumDescriptions": [
-            "Write a handoff summary file. The chat is left as it is; start a new chat from the file when you are back.",
-            "Compact the chat (/compact): older turns are summarized in place, the recent ones kept. You just go on in the same chat. It changes the chat and can't be undone. Local chats only for now; others get a summary.",
-            "Nothing automatic: the cache just expires."
-          ],
-          "default": "summary",
-          "description": "Above the threshold, what happens if nobody answers the warning, and when keeping warm ends (with cacheKeeper.summaryAfterKeepWarm). Only when it and your next message after it cost clearly less than continuing the chat cold."
-        },
-        "cacheKeeper.autoKeepWarmCapPercent": {
-          "type": "number",
-          "default": 50,
-          "enum": [
-            25,
-            50,
-            75,
-            100
-          ],
-          "enumDescriptions": [
-            "25% of an expiry's cost",
-            "50% of an expiry's cost",
-            "75% of an expiry's cost",
-            "100%: never spend more than the expiry would have cost"
-          ],
-          "description": "Auto keep warm stops once its keep-alives, plus the closing handoff summary (when cacheKeeper.summaryAfterKeepWarm is on), would cost more than this share of what letting the cache expire would have added, priced when auto keep warm started."
-        },
-        "cacheKeeper.autoKeepWarmMaxMinutes": {
-          "type": "number",
-          "default": 120,
-          "minimum": 1,
-          "description": "Auto keep warm stops once its next keep-alive would keep the chat warm past this many minutes of keep-warm time. 120 is a hard cap: you can set it lower, never higher (a higher value counts as 120). Keep-warm time counts Keep warm once and Auto keep warm together, from the first keep-warm choice, until the cache expires, you pick another option (default, Ignore, Summarize, Stop keeping warm) or close the warning; your own message in the chat starts it again from then. Picking Auto keep warm again once the limit is reached starts a new period.",
-          "maximum": 120
-        },
-        "cacheKeeper.summaryAfterKeepWarm": {
-          "type": "boolean",
-          "default": true,
-          "description": "Write a handoff summary (or compact, with cacheKeeper.autoAction set to compact) when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap, if it costs clearly less than continuing this chat cold. Off: the cache just expires."
-        },
-        "cacheKeeper.minCredits": {
-          "type": "number",
-          "default": 5,
-          "description": "Ignore chats where letting the cache expire would add less than this many credits: no listing, warnings, automatic actions or orange status for them."
-        },
-        "cacheKeeper.ttlSeconds": {
-          "type": "object",
-          "default": {},
-          "additionalProperties": {
-            "type": "number"
+    "configuration": [
+      {
+        "title": "Copilot Cache Keeper",
+        "properties": {
+          "cacheKeeper.notifications": {
+            "type": "boolean",
+            "default": true,
+            "order": 0,
+            "description": "Off: nothing pops up on its own. No expiry warning, no \"cache expired\" notice, no nudge, no digest. The status bar still counts down, turns orange and asks you to click and choose before an expiry (for the whole cacheKeeper.warnSeconds), and its tooltip carries what a notification would have said (a light bulb marks it). What happens with no click is unchanged. Still shown: a question before something that costs credits, something that went wrong, and the answer to what you clicked or ran yourself."
           },
-          "description": "Cache lifetime override per model id, in seconds, e.g. {\"claude-opus-5.5\": 300}. Otherwise: what the chat's own log says (Copilot SDK chats), else the newest value from Copilot CLI and Copilot SDK logs (all chats, Local included: same backend), else the longest pause after which a Local chat still hit the cache (only if longer than the default), else built-in defaults (Claude 300, Sol 6.1 1800, others 300). Learned and measured values older than 60 days are not used."
-        },
-        "cacheKeeper.afterSend": {
-          "type": "string",
-          "default": "restoreLastTyped",
-          "enum": [
-            "restoreLastTyped",
-            "closeTab",
-            "keepTab"
-          ],
-          "enumDescriptions": [
-            "Put the chat where you last typed back into the Chat view; close the other tabs. Right as long as you type in the chat you are looking at.",
-            "Just close the tab. If the chat was in the Chat view, the view falls back to the sessions list.",
-            "Leave the tab open; nothing is moved or closed."
-          ],
-          "description": "What to do with the chat tab Cache Keeper opened to send a keep-alive or summary, once the reply is in. (VS Code does not tell extensions which chat the Chat view shows, so only where you last typed is known.)"
-        },
-        "cacheKeeper.expiredChats": {
-          "type": "number",
-          "default": 5,
-          "minimum": 0,
-          "maximum": 50,
-          "description": "How many expired chats the status-bar list keeps, most recently expired first (warm and working chats are always listed, as are the chat where you last typed and chats with a handoff summary ready). Only chats active within cacheKeeper.lookbackHours are read at all."
-        },
-        "cacheKeeper.lookbackHours": {
-          "type": "number",
-          "default": 48,
-          "minimum": 1,
-          "maximum": 168,
-          "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."
-        },
-        "cacheKeeper.handoffMaxAgeDays": {
-          "type": "number",
-          "default": 7,
-          "minimum": 0,
-          "description": "Delete handoff summaries in .copilot-handoff/ older than this many days, except the newest cacheKeeper.handoffKeep ones, which always stay. 0 = never delete. Deleted files go to the trash where possible."
-        },
-        "cacheKeeper.handoffKeep": {
-          "type": "number",
-          "default": 5,
-          "minimum": 0,
-          "description": "How many of the newest handoff summaries in each .copilot-handoff/ folder are always kept, however old (see cacheKeeper.handoffMaxAgeDays)."
+          "cacheKeeper.warnSeconds": {
+            "type": "number",
+            "default": 60,
+            "description": "Warn this many seconds before the cache expires."
+          },
+          "cacheKeeper.thresholdTokens": {
+            "type": "number",
+            "default": 100000,
+            "minimum": 0,
+            "description": "From this context size (in tokens) a chat is expensive to let expire, since its next message re-sends all of it at full price: an unanswered warning writes a handoff summary or compacts the chat (cacheKeeper.autoAction, when the model's price is known), and once expired the status bar turns orange. Counted in tokens so one value fits cheap and expensive models alike (100k is about 40 credits with Opus 5.5)."
+          },
+          "cacheKeeper.autoAction": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "compact",
+              "off"
+            ],
+            "enumDescriptions": [
+              "Write a handoff summary file. The chat is left as it is; start a new chat from the file when you are back.",
+              "Compact the chat (/compact): older turns are summarized in place, the recent ones kept. You just go on in the same chat. It changes the chat and can't be undone. Local chats only for now; others get a summary.",
+              "Nothing automatic: the cache just expires."
+            ],
+            "default": "summary",
+            "description": "Above the threshold, what happens if nobody answers the warning, and when keeping warm ends (with cacheKeeper.summaryAfterKeepWarm). Only when it and your next message after it cost clearly less than continuing the chat cold."
+          },
+          "cacheKeeper.autoKeepWarmCapPercent": {
+            "type": "number",
+            "default": 50,
+            "enum": [
+              25,
+              50,
+              75,
+              100
+            ],
+            "enumDescriptions": [
+              "25% of an expiry's cost",
+              "50% of an expiry's cost",
+              "75% of an expiry's cost",
+              "100%: never spend more than the expiry would have cost"
+            ],
+            "description": "Auto keep warm stops once its keep-alives, plus the closing handoff summary (when cacheKeeper.summaryAfterKeepWarm is on), would cost more than this share of what letting the cache expire would have added, priced when auto keep warm started."
+          },
+          "cacheKeeper.autoKeepWarmMaxMinutes": {
+            "type": "number",
+            "default": 120,
+            "minimum": 1,
+            "description": "Auto keep warm stops once its next keep-alive would keep the chat warm past this many minutes of keep-warm time. 120 is a hard cap: you can set it lower, never higher (a higher value counts as 120). Keep-warm time counts Keep warm once and Auto keep warm together, from the first keep-warm choice, until the cache expires, you pick another option (default, Ignore, Summarize, Stop keeping warm) or close the warning; your own message in the chat starts it again from then. Picking Auto keep warm again once the limit is reached starts a new period.",
+            "maximum": 120
+          },
+          "cacheKeeper.summaryAfterKeepWarm": {
+            "type": "boolean",
+            "default": true,
+            "description": "Write a handoff summary (or compact, with cacheKeeper.autoAction set to compact) when keeping warm ends: before the expiry that follows a Keep warm once, and when auto keep warm reaches its cap, if it costs clearly less than continuing this chat cold. Off: the cache just expires."
+          },
+          "cacheKeeper.minCredits": {
+            "type": "number",
+            "default": 5,
+            "description": "Ignore chats where letting the cache expire would add less than this many credits: no listing, warnings, automatic actions or orange status for them."
+          },
+          "cacheKeeper.ttlSeconds": {
+            "type": "object",
+            "default": {},
+            "additionalProperties": {
+              "type": "number"
+            },
+            "description": "Cache lifetime override per model id, in seconds, e.g. {\"claude-opus-5.5\": 300}. Otherwise: what the chat's own log says (Copilot SDK chats), else the newest value from Copilot CLI and Copilot SDK logs (all chats, Local included: same backend), else the longest pause after which a Local chat still hit the cache (only if longer than the default), else built-in defaults (Claude 300, Sol 6.1 1800, others 300). Learned and measured values older than 60 days are not used."
+          },
+          "cacheKeeper.afterSend": {
+            "type": "string",
+            "default": "restoreLastTyped",
+            "enum": [
+              "restoreLastTyped",
+              "closeTab",
+              "keepTab"
+            ],
+            "enumDescriptions": [
+              "Put the chat where you last typed back into the Chat view; close the other tabs. Right as long as you type in the chat you are looking at.",
+              "Just close the tab. If the chat was in the Chat view, the view falls back to the sessions list.",
+              "Leave the tab open; nothing is moved or closed."
+            ],
+            "description": "What to do with the chat tab Cache Keeper opened to send a keep-alive or summary, once the reply is in. (VS Code does not tell extensions which chat the Chat view shows, so only where you last typed is known.)"
+          },
+          "cacheKeeper.expiredChats": {
+            "type": "number",
+            "default": 5,
+            "minimum": 0,
+            "maximum": 50,
+            "description": "How many expired chats the status-bar list keeps, most recently expired first (warm and working chats are always listed, as are the chat where you last typed and chats with a handoff summary ready). Only chats active within cacheKeeper.lookbackHours are read at all."
+          },
+          "cacheKeeper.lookbackHours": {
+            "type": "number",
+            "default": 48,
+            "minimum": 1,
+            "maximum": 168,
+            "description": "Read chats whose log changed within this many hours. Older chats are not listed, even with a higher cacheKeeper.expiredChats."
+          },
+          "cacheKeeper.handoffMaxAgeDays": {
+            "type": "number",
+            "default": 7,
+            "minimum": 0,
+            "description": "Delete handoff summaries in .copilot-handoff/ older than this many days, except the newest cacheKeeper.handoffKeep ones, which always stay. 0 = never delete. Deleted files go to the trash where possible."
+          },
+          "cacheKeeper.handoffKeep": {
+            "type": "number",
+            "default": 5,
+            "minimum": 0,
+            "description": "How many of the newest handoff summaries in each .copilot-handoff/ folder are always kept, however old (see cacheKeeper.handoffMaxAgeDays)."
+          }
+        }
+      },
+      {
+        "title": "Nudges (only for real spending)",
+        "properties": {
+          "cacheKeeper.nudges.enabled": {
+            "type": "boolean",
+            "default": true,
+            "order": 0,
+            "description": "All nudges below, active and passive. Off: none of them is ever shown, whatever their own switches say. Nudges tell you when a chat is costing real money that a different habit would save; each is shown only above cacheKeeper.nudges.minCredits, once, with a \"Mute for this chat\"."
+          },
+          "cacheKeeper.nudges.split": {
+            "type": "boolean",
+            "default": true,
+            "order": 1,
+            "description": "Notification, once the agent is done: this chat would have cost at least nudges.splitMinPercent and nudges.splitMinCredits less in 2 or 3 chats. Offers Continue in new chat."
+          },
+          "cacheKeeper.nudges.autoKeepWarmOffer": {
+            "type": "boolean",
+            "default": true,
+            "order": 2,
+            "description": "Notification: this chat has paid for 2 expired caches after pauses and keeping it warm would have saved at least nudges.minCredits. Offers Auto keep warm."
+          },
+          "cacheKeeper.nudges.waitingWarning": {
+            "type": "boolean",
+            "default": true,
+            "order": 3,
+            "description": "Warning, while the agent works: no model call for almost a whole cache lifetime (it may be waiting for your approval, or running a long command) and the expiry would add at least nudges.minCredits. Once per message of yours."
+          },
+          "cacheKeeper.nudges.costPerCall": {
+            "type": "boolean",
+            "default": true,
+            "order": 4,
+            "description": "Passive, in the status-bar tooltip: what each model call costs to re-read the context and what it would cost in a new chat, when 50 more calls would cost nudges.minCredits more than in a new chat. Also adds Continue in new chat to the chat's menu."
+          },
+          "cacheKeeper.nudges.commitHint": {
+            "type": "boolean",
+            "default": true,
+            "order": 5,
+            "description": "Passive, on the status bar: \"new chat?\" after the agent committed or pushed, until you write again. Same amount as nudges.costPerCall."
+          },
+          "cacheKeeper.nudges.contextSizeTip": {
+            "type": "boolean",
+            "default": true,
+            "order": 6,
+            "description": "Notification, once ever: a Local chat has grown past the model's smaller context-size option and an expiry there would add at least nudges.minCredits."
+          },
+          "cacheKeeper.nudges.digest": {
+            "type": "boolean",
+            "default": true,
+            "order": 7,
+            "description": "Notification, every nudges.digestDays: what keeping warm and shorter chats would have saved over that period, when it is at least 5 times nudges.minCredits. The spend analysis runs in the background for it."
+          },
+          "cacheKeeper.nudges.minCredits": {
+            "type": "number",
+            "default": 100,
+            "order": 8,
+            "description": "Real spending, in credits (100 = $1): no nudge is shown for less. Each nudge's description says what it compares with this.",
+            "minimum": 0
+          },
+          "cacheKeeper.nudges.splitMinCredits": {
+            "type": "number",
+            "default": 300,
+            "order": 9,
+            "description": "nudges.split needs a saving of at least this many credits (300 = $3)...",
+            "minimum": 0
+          },
+          "cacheKeeper.nudges.splitMinPercent": {
+            "type": "number",
+            "default": 25,
+            "order": 10,
+            "description": "... and of at least this share (percent) of what the chat has cost so far.",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "cacheKeeper.nudges.digestDays": {
+            "type": "number",
+            "default": 7,
+            "order": 11,
+            "description": "nudges.digest looks back over this many days, and comes at most that often. 0 = never.",
+            "minimum": 0
+          }
         }
       }
-    }
+    ]
   },
   "repository": {
     "type": "git",

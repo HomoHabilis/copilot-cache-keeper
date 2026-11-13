@@ -48,17 +48,31 @@ jobs:
           set -e
           VSIX=$(ls copilot-cache-keeper-*.vsix)
           python3 - "$VSIX" <<'EOF'
-          import json, sys, zipfile
+          import base64, json, pathlib, re, sys, zipfile
           z = zipfile.ZipFile(sys.argv[1])
           names = set(z.namelist())
           need = {"[Content_Types].xml", "extension.vsixmanifest", "extension/package.json",
-                  "extension/extension.js", "extension/core.js", "extension/sqlite.js", "extension/harnesses.js"}
+              "extension/extension.js", "extension/core.js", "extension/sqlite.js", "extension/harnesses.js",
+              "extension/README.md", "extension/README-offline.md"}
           missing = need - names
           assert not missing, f"missing in vsix: {missing}"
           pkg = json.loads(z.read("extension/package.json"))
           manifest = z.read("extension.vsixmanifest").decode()
           assert f'Version="{pkg["version"]}"' in manifest, "manifest version differs from package.json"
           assert pkg["main"] == "./extension.js"
+          readme = z.read("extension/README-offline.md").decode()
+          source = pathlib.Path("README.md").read_text(encoding="utf-8")
+          details = z.read("extension/README.md").decode()
+          assert not re.search(r'!\[[^\]]*\]\(', details), "images cannot load in the extension Details tab"
+          assert "Cache Keeper: Documentation" in details
+          pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+          source_images = re.findall(pattern, source)
+          images = re.findall(pattern, readme)
+          assert images and len(images) == len(source_images), "README images missing"
+          for (source_alt, source_path), (alt, image) in zip(source_images, images):
+              assert alt == source_alt, "README image caption changed"
+              assert image.startswith("data:image/png;base64,"), "README image must be embedded"
+              assert base64.b64decode(image.split(",", 1)[1], validate=True) == pathlib.Path(source_path).read_bytes(), source_path
           print(f"{sys.argv[1]}: {len(names)} files, version {pkg['version']}, OK")
           EOF
 

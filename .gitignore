@@ -1,3 +1,4 @@
 *.vsix
 __pycache__/
 spend-report-*.md
+preview-shots/
