@@ -5,6 +5,7 @@
   "version": "0.0.0-dev",
   "publisher": "local",
   "license": "UNLICENSED",
+  "icon": "assets/icon.jpg",
   "engines": {
     "vscode": "^1.100.0"
   },

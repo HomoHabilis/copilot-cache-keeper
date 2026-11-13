@@ -42,6 +42,7 @@ manifest = f"""<?xml version="1.0" encoding="utf-8"?>
     <Identity Language="en-US" Id="{pkg['name']}" Version="{pkg['version']}" Publisher="{pkg['publisher']}"/>
     <DisplayName>{pkg['displayName']}</DisplayName>
     <Description xml:space="preserve">{pkg['description']}</Description>
+        <Icon>extension/{pkg['icon']}</Icon>
     <Categories>Other</Categories>
     <Properties>
       <Property Id="Microsoft.VisualStudio.Code.Engine" Value="{pkg['engines']['vscode']}"/>
@@ -50,12 +51,16 @@ manifest = f"""<?xml version="1.0" encoding="utf-8"?>
   </Metadata>
   <Installation><InstallationTarget Id="Microsoft.VisualStudio.Code"/></Installation>
   <Dependencies/>
-  <Assets><Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/></Assets>
+    <Assets>
+        <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
+        <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/{pkg['icon']}" Addressable="true"/>
+    </Assets>
 </PackageManifest>"""
 types = """<?xml version="1.0" encoding="utf-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".md" ContentType="text/markdown"/><Default Extension=".vsixmanifest" ContentType="text/xml"/>
+    <Default Extension="jpg" ContentType="image/jpeg"/>
 </Types>"""
 
 
@@ -78,6 +83,7 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr("[Content_Types].xml", types)
     z.writestr("extension.vsixmanifest", manifest)
     z.writestr("extension/package.json", json.dumps(pkg, indent=2) + "\n")   # with the build's version
+    z.write(here / pkg["icon"], f"extension/{pkg['icon']}")
     for f in ("extension.js", "core.js", "sqlite.js", "harnesses.js", "report.js", "nudges.js"):
         if (here / f).exists():
             z.write(here / f, f"extension/{f}")
