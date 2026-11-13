@@ -38,15 +38,20 @@ with `--input <folder>`.
 ## What the report contains
 
 1. **Spending factors**, ranked by estimated avoidable credits, each with what to do about it.
-2. **By tool and model:** calls, credits, median context, cached share.
-3. **Cache misses:** the most expensive ones, with the pause before them and the cause
-   (expired after a pause, or compaction/changed prompt).
-4. **Reasoning effort:** per model and effort level, output tokens and the extra cost of
+2. **What Cache Keeper and shorter chats would have saved:** your 30 costliest chats priced again
+   call by call: what expired caches cost (after pauses, and while the agent waited), and what
+   keeping warm, splitting into at most 3 chats with a handoff summary, both, or a 200k context
+   window would have saved. Then **what Cache Keeper did so far:** its keep-alives, their cost and
+   the expiries they avoided.
+3. **By tool and model:** calls, credits, median context, cached share.
+4. **Cache misses:** the most expensive ones, with the pause before them and the cause
+   (expired after a pause, expired while the agent waited, or compaction/changed prompt).
+5. **Reasoning effort:** per model and effort level, output tokens and the extra cost of
    xhigh/max over the lowest level you used.
-5. **Context size:** credits by context size, the VS Code context-size setting you used, and
+6. **Context size:** credits by context size, the VS Code context-size setting you used, and
    cost per 100k context after a pause vs within the cache lifetime.
-6. **Most expensive sessions,** with their models, effort, maximum context, compactions and misses.
-7. **Method:** how each figure is computed.
+7. **Most expensive sessions,** with their models, effort, maximum context, compactions and misses.
+8. **Method:** how each figure is computed.
 
 ## How the estimates work
 
@@ -62,6 +67,22 @@ with `--input <folder>`.
   a minute longer than 5 min (a shorter one only proves a minimum). Otherwise the known
   values (Claude 300 s, Sol 6.1 1800 s). A model with no data gets no lifetime, and no expiry is
   judged for it (its misses show as "unknown cache lifetime").
+- **Expired caches in older chats** (one record per message) are read from the bill, not guessed
+  from the pause. The message's calls (its tool-call rounds, timed in the chat file) are priced
+  warm from the price sheet; when the message was billed about one full re-send more than that,
+  one call was cold: the one after the longest wait. Before the message, it is a pause; between
+  two of its calls, the agent waited (a tool approval, a long command), which keeping warm cannot
+  prevent. Pauses run from the start of the previous message's last call, as the cache lifetime
+  does. A chat file without rounds falls back to the pause, capped by what the message cost.
+- **What-ifs** price each chat's series of calls by the price sheet and scale the result to its
+  bill; a chat the model misses by too much is left out and counted. Kept warm follows Cache
+  Keeper's rules (one keep-alive per cache lifetime, each a read of the whole context; pauses up to
+  2 h; keep-alives at most 50% of the expiry). A split pays a summary, the new chat's first
+  prompt, 25k tokens of files read again and 4 extra calls. What a summary or compaction loses is
+  not priced. The constants are at the top of the "series of calls" section of the script.
+- **Cache Keeper's own messages** (keep-alives, summary requests, `/compact`) are recognised by
+  the extension's lists, copied in the script (`KEEPALIVES`, `OWN_PREFIXES`); a test compares
+  them with `core.js`.
 - **Factors overlap**, for example an expired cache on a large context, so they aren't meant to
   be added up.
 - **Duplicates:** VS Code keeps copies of a chat's file under several workspace folders, for

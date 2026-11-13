@@ -630,7 +630,7 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
   const title = firstReal ? String(firstReal.text).replace(/\s+/g, " ").trim() : "";
   const lastUser = users[users.length - 1];
   const refreshes = events.filter(e => e.t === "call" || e.t === "aux");
-  return {
+  const state = {
     id: String(dir).split(/[\\/]/).filter(Boolean).pop(), kind, dir, model, ctx, ttl, ttlFrom, ttlAssumed: ttlFrom === ASSUMED,
     lastEnd: last.end || last.ts, compactedAt, compactStartedAt, compactedIdle, busy, credits, creditsEstimated, cost, stats, summaryWords: words, billedWrite, lang,
     // lifetimes are only worth measuring where the log doesn't state them
@@ -646,6 +646,9 @@ function analyzeTrace(kind, dir, trace, opts = {}) {
     lastRealUserTs: Math.max(0, ...real.map(u => u.ts || 0)),
     cwd: info.cwd || "", gitRoot: info.gitRoot || "",
   };
+  // the chat's events, for the live what-ifs (report.liveInsight): carried along, not one of its fields
+  Object.defineProperty(state, "events", { value: events, enumerable: false });
+  return state;
 }
 
 // Logs are read every few seconds and most have not changed: the same text gives the same trace, so

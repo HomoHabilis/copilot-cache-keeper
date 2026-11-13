@@ -43,7 +43,7 @@ if [ $YES -eq 0 ]; then read -r -p "Spend those credits? [y/N] " ok; [ "$ok" = "
 
 # Working-tree copy of the extension and the driver, where Windows VS Code can load them
 rm -rf "$LIVE"; mkdir -p "$LIVE/dev" "$LIVE/driver"
-cp package.json extension.js core.js sqlite.js harnesses.js "$LIVE/dev/"
+cp package.json extension.js core.js sqlite.js harnesses.js report.js nudges.js "$LIVE/dev/"
 cp test/live/driver/package.json test/live/driver/extension.js "$LIVE/driver/"
 
 # Test folder: Cache Keeper's log mirrored to a file, every chat counted (cheap models too)

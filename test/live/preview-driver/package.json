@@ -1,0 +1,11 @@
+{
+  "name": "cache-keeper-preview-driver",
+  "displayName": "Cache Keeper preview driver",
+  "description": "Shows Cache Keeper's nudges on a made-up chat, one after the other, in a real VS Code window (test/live/preview.sh). Never install it.",
+  "publisher": "local",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.100.0" },
+  "extensionKind": ["ui"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js"
+}
