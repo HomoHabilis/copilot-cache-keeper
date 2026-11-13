@@ -6,6 +6,7 @@ const vscode = require("vscode");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const RESULT = path.join(os.tmpdir(), "ck-preview-result.txt");
 // preview.sh --show <stage>: only that stage, left on screen for you to look at and hover (no screenshots)
@@ -20,6 +21,31 @@ async function main() {
   for (let i = 0; i < 40 && !(await vscode.commands.getCommands(true)).includes("cacheKeeper.previewNudges"); i++) await sleep(500);
   if (!(await vscode.commands.getCommands(true)).includes("cacheKeeper.previewNudges")) { say("ERROR Cache Keeper's preview command is not there"); return; }
   await sleep(2000);
+  if (SHOW === "documentation") {
+    const extension = vscode.extensions.getExtension("local.copilot-cache-keeper");
+    const file = vscode.Uri.joinPath(extension.extensionUri, "README-offline.md");
+    const markdown = Buffer.from(await vscode.workspace.fs.readFile(file)).toString("utf8");
+    const html = await vscode.commands.executeCommand("markdown.api.render", markdown);
+    const expected = Array.from(markdown.matchAll(/!\[[^\]]*\]\((data:image\/png;base64,[^)]+)\)/g)).length;
+    const images = Array.from(html.matchAll(/<img\b[^>]*\bsrc="([^"]+)"/g), match => match[1]);
+    if (!expected || images.length !== expected || images.some(image => !image.startsWith("data:image/png;base64,"))) {
+      throw new Error(`Markdown renderer preserved ${images.length} of ${expected} embedded images`);
+    }
+    fs.writeFileSync(path.join(__dirname, "..", "shots", "documentation.html"), html);
+    say(`NOTE Markdown renderer preserved all ${images.length} embedded images`);
+    await vscode.commands.executeCommand("cacheKeeper.documentation");
+    await sleep(5000);
+    const title = vscode.workspace.getConfiguration("window").get("title", "Extension Development Host");
+    const capture = execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+      path.join(__dirname, "..", "shot.ps1"), "-Title", title.includes("${") ? "Extension Development Host" : title,
+      "-Front", "-Escape", "-Out", path.join(__dirname, "..", "shots", "documentation-window.png")], { encoding: "utf8" });
+    say(`NOTE screenshot: ${capture.trim()}`);
+    say("STAGE documentation-1");
+    await sleep(HOLD_MS);
+    say("DONE");
+    await sleep(1500); await run("workbench.action.closeWindow");
+    return;
+  }
   if (SHOW === "readme") {
     // the extension's own page, as VS Code shows the README (do its pictures load?), top and further down
     const x = vscode.extensions.getExtension("local.copilot-cache-keeper-readme");
@@ -65,5 +91,8 @@ async function main() {
   if (!process.env.CK_PREVIEW_KEEP_OPEN) { await sleep(1500); await run("workbench.action.closeWindow"); }
 }
 
-function activate() { main().catch(e => say("ERROR " + (e.stack || e.message))); }
+function activate() { main().catch(async e => {
+  say("ERROR " + (e.stack || e.message));
+  if (SHOW === "documentation" || SHOW === "readme") await run("workbench.action.closeWindow");
+}); }
 module.exports = { activate, deactivate() {} };

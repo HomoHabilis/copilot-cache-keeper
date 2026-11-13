@@ -1,6 +1,6 @@
 """Package the extension as a .vsix (a zip with a manifest) without needing vsce or network.
 The version is taken from git tags (see build_version), not from package.json."""
-import json, os, re, subprocess, zipfile, pathlib
+import base64, json, os, re, subprocess, zipfile, pathlib
 here = pathlib.Path(__file__).parent
 pkg = json.loads((here / "package.json").read_text())
 
@@ -61,13 +61,15 @@ types = """<?xml version="1.0" encoding="utf-8"?>
   <Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".md" ContentType="text/markdown"/><Default Extension=".vsixmanifest" ContentType="text/xml"/>
     <Default Extension="jpg" ContentType="image/jpeg"/>
-    <Default Extension="png" ContentType="image/png"/>
 </Types>"""
 
 
 readme = (here / "README.md").read_text(encoding="utf-8")
-details = re.sub(r"!\[([^\]]*)\]\(docs/img/[\w.-]+\.png\)", r"\1", readme)
+image_pattern = r"!\[([^\]]*)\]\((docs/img/[\w.-]+\.png)\)"
+details = re.sub(image_pattern, r"\1", readme)
 details = details.replace("\n\n", "\n\nOpen **Cache Keeper: Documentation** for the illustrated offline version.\n\n", 1)
+offline = re.sub(image_pattern, lambda match:
+        f"![{match[1]}](data:image/png;base64,{base64.b64encode((here / match[2]).read_bytes()).decode('ascii')})", readme)
 out = here / f"{pkg['name']}-{pkg['version']}.vsix"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr("[Content_Types].xml", types)
@@ -78,7 +80,5 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         if (here / f).exists():
             z.write(here / f, f"extension/{f}")
     z.writestr("extension/README.md", details)
-    z.write(here / "README.md", "extension/README-offline.md")
-    for image in sorted((here / "docs/img").glob("*.png")):
-        z.write(image, f"extension/{image.relative_to(here).as_posix()}")
+    z.writestr("extension/README-offline.md", offline)
 print(out)

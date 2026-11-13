@@ -16,17 +16,19 @@ LIVE="$WINTEMP/ck-preview"; RESULT="$WINTEMP/ck-preview-result.txt"
 rm -rf "$LIVE" "$RESULT"; mkdir -p "$LIVE/dev" "$LIVE/driver" "$LIVE/shots"
 rm -f "$WINTEMP/ck-preview-show.txt"; [ -n "$SHOW" ] && printf '%s' "$SHOW" > "$WINTEMP/ck-preview-show.txt"
 cp package.json extension.js core.js sqlite.js harnesses.js report.js nudges.js "$LIVE/dev/"
-# --show readme: the README as it is packaged (its pictures inside it), in a throwaway extension of its own
-# (another name, nothing but the README), so its page shows this working tree's README and not the installed one
+python3 - "$LIVE/dev" <<'PY'
+import pathlib, runpy, sys, zipfile
+build = runpy.run_path("build.py")
+with zipfile.ZipFile(build["out"]) as archive:
+    for name in ("README.md", "README-offline.md"):
+        (pathlib.Path(sys.argv[1]) / name).write_bytes(archive.read(f"extension/{name}"))
+PY
 if [ "$SHOW" = readme ]; then
   mkdir -p "$LIVE/readme"
   python3 - "$LIVE/readme" <<'PY'
 import json, pathlib, sys
-src = pathlib.Path("build.py").read_text(encoding="utf-8")
-ns = {}
-exec(src[src.index("def readme_with_pictures"):src.index("out = here")], ns)
 out = pathlib.Path(sys.argv[1])
-(out / "README.md").write_text(ns["readme_with_pictures"](pathlib.Path(".")), encoding="utf-8")
+(out / "README.md").write_bytes((out.parent / "dev" / "README.md").read_bytes())
 (out / "package.json").write_text(json.dumps({"name": "copilot-cache-keeper-readme", "publisher": "local", "version": "0.0.1",
     "displayName": "Copilot Cache Keeper (README check)", "description": "Only the README, to see how VS Code shows it.",
     "engines": {"vscode": "^1.100.0"}}), encoding="utf-8")
@@ -46,13 +48,13 @@ until grep -q 'DONE\|ERROR' "$RESULT" 2>/dev/null; do
   n=$(grep -c '^STAGE ' "$RESULT" 2>/dev/null || true)
   if [ "${n:-0}" -gt "$seen" ]; then
     seen=$n; stage=$(grep '^STAGE ' "$RESULT" | sed -n "${n}p" | cut -d' ' -f2)
-    front=(-Front); case "$stage" in tooltip*) front=(-Hover) ;; readme-1) front=(-Front) ;; readme-*) front=(-PageDown) ;; esac      # the tooltip: the mouse over the entry (a key press would close it)
+    front=(-Front); case "$stage" in tooltip*) front=(-Hover) ;; readme-1|documentation-1) front=(-Front) ;; readme-*|documentation-*) front=(-PageDown) ;; esac      # the tooltip: the mouse over the entry (a key press would close it)
     (cd /mnt/c && powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(wslpath -w "$LIVE/shot.ps1")" "${front[@]}" \
       -Out "$(wslpath -w "$LIVE/shots/$(printf '%02d' "$n")-$stage.png")" 2>&1 | tr -d '\r' | sed "s/^/$stage: /")
   fi
   sleep 0.4
 done
-if [ -n "$SHOW" ] && [ "$SHOW" != readme ]; then rm -f "$WINTEMP/ck-preview-show.txt"; exit 0; fi     # (the window loads from $LIVE: left in place)
+if [ -n "$SHOW" ] && [ "$SHOW" != readme ] && [ "$SHOW" != documentation ]; then rm -f "$WINTEMP/ck-preview-show.txt"; exit 0; fi     # (the window loads from $LIVE: left in place)
 cat "$RESULT" | grep -v '^STAGE' || true
 cp "$LIVE"/shots/*.png "$OUT"/ 2>/dev/null || true
 rm -rf "$LIVE" "$RESULT" "$WINTEMP/ck-preview-show.txt"

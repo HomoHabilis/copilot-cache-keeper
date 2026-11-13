@@ -1,5 +1,5 @@
 # Screenshot of one window (by part of its title) into a PNG. Used by preview.sh.
-param([string]$Title = "Extension Development Host", [string]$Out = "shot.png", [switch]$Front, [switch]$Hover, [switch]$PageDown)
+param([string]$Title = "Extension Development Host", [string]$Out = "shot.png", [switch]$Front, [switch]$Hover, [switch]$PageDown, [switch]$Escape)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -23,6 +23,10 @@ if (-not $p) { Write-Output "NOWINDOW"; exit 1 }
 if ($Front) {
   [CkWin]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [CkWin]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
   [CkWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+  Start-Sleep -Milliseconds 250
+}
+if ($Escape) {
+  [CkWin]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero); [CkWin]::keybd_event(0x1B, 0, 2, [UIntPtr]::Zero)
   Start-Sleep -Milliseconds 250
 }
 $r = New-Object CkWin+RECT
