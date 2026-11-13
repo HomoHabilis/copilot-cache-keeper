@@ -2242,6 +2242,15 @@ function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).pa
 /** A chat's countdown; "~" when its cache lifetime is a guess (a model with no lifetime data). */
 function countdown(s, r = live(s)) { return (s.ttlAssumed ? "~" : "") + mmss(r); }
 
+function setStatusTooltip(tooltip) {
+  const previous = statusItem.tooltip;
+  if (typeof tooltip === "string" ? previous === tooltip :
+    previous instanceof vscode.MarkdownString && previous.value === tooltip.value &&
+    previous.supportThemeIcons === tooltip.supportThemeIcons &&
+    JSON.stringify(previous.isTrusted) === JSON.stringify(tooltip.isTrusted)) return;
+  statusItem.tooltip = tooltip;
+}
+
 function updateStatus(context) {
   if (preview && preview.hold) return;              // a preview's hover is being looked at
   const list = all.filter(managed);
@@ -2260,7 +2269,7 @@ function updateStatus(context) {
   if (sending) {
     // a chat is being opened as a tab and sent to: typing in the Chat view now would go elsewhere
     statusItem.text = "$(loading~spin) sending… don't type";
-    statusItem.tooltip = "Cache Keeper is sending into a chat it opened: what you type now could land there.";
+    setStatusTooltip("Cache Keeper is sending into a chat it opened: what you type now could land there.");
     statusItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
     statusItem.show();
     return;
@@ -2270,8 +2279,8 @@ function updateStatus(context) {
   const asking = awaitingAnswer();
   if (asking) {
     statusItem.text = `$(bell) ${chatName(asking).slice(1, -1).slice(0, 20)} ${countdown(asking)} · click to choose${autoElsewhere}`;
-    statusItem.tooltip = new vscode.MarkdownString(`**Cache expires in ${Math.round(live(asking))} s:** ${describe(asking).replace(/[\\`*_[\]<>]/g, "")}.  \n` +
-      `No click: ${noClickText(stateFor(asking.id), asking)}. Click to keep it warm, summarize or ignore.`, true);
+    setStatusTooltip(new vscode.MarkdownString(`**Cache expires in ${Math.round(live(asking))} s:** ${describe(asking).replace(/[\\`*_[\]<>]/g, "")}.  \n` +
+      `No click: ${noClickText(stateFor(asking.id), asking)}. Click to keep it warm, summarize or ignore.`, true));
     statusItem.backgroundColor = red || new vscode.ThemeColor("statusBarItem.warningBackground");
     statusItem.show();
     return;
@@ -2318,7 +2327,8 @@ function updateStatus(context) {
     md.unshift(`$(${hinted.urgent ? "warning" : "lightbulb"}) ${hinted.text.replace(/^Cache Keeper: /, "")}`, "");
     statusItem.text += hinted.urgent ? " · $(warning)" : " · $(lightbulb)";
   }
-  if (carry) md.push(carry + (committed || s.busy ? "" : " " + nudges.continueLink(s)), "");
+  const continueLink = carry && !committed && !s.busy ? " " + nudges.continueLink(s) : "";
+  if (carry) md.push(carry + continueLink, "");
   if (s.cost) {
     md.push("| | |", "|---|--:|",
       ...(s.routed ? [`| Cold message, worst case | ~${core.fmt(s.cost.missExtra)} cr |`]
@@ -2332,8 +2342,8 @@ function updateStatus(context) {
   if (costlyRestart) md.push(`*Orange: expired with at least ${Math.round(thresholdTokens() / 1000)}k tokens of context.*  `);
   md.push(`Click to manage the ${shownInList} chat(s) in the list.`);
   const tip = new vscode.MarkdownString(md.join("\n"), true);
-  tip.isTrusted = { enabledCommands: [nudges.CONTINUE_COMMAND] };   // the tooltip's "Continue in new chat" link
-  statusItem.tooltip = tip;
+  if (continueLink) tip.isTrusted = { enabledCommands: [nudges.CONTINUE_COMMAND] };
+  setStatusTooltip(tip);
   statusItem.backgroundColor = red ||
     (costlyRestart || (hinted && hinted.urgent) || (!s.routed && r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
   statusItem.show();
