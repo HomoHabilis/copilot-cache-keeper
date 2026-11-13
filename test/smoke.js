@@ -435,6 +435,44 @@ const never = () => new Promise(() => {});
     assert.strictEqual(s.busy, false);
   });
 
+  await check("Local cancellation: an interrupted model request ends an unmatched turn without refreshing its cache", () => {
+    const base = chatLog(now - 60000);
+    for (const error of ["Canceled", "Cancelled"]) {
+      const extra = [
+        { type: "turn_start", ts: now - 10000 },
+        { type: "llm_request", ts: now - 9000, dur: 6000, status: "error",
+          attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5", error } },
+      ];
+      const s = core.analyze("/logs/canceled", base + extra.map(event => JSON.stringify(event)).join("\n") + "\n", MODELS, now);
+      assert.strictEqual(s.busy, false, error);
+      assert.strictEqual(s.cacheFrom, now - 60000 + 4000, "a canceled call did not refresh the cache");
+    }
+  });
+
+  await check("Local cancellation: a canceled background request does not end the agent's turn", () => {
+    const base = chatLog(now - 60000);
+    const extra = [
+      { type: "turn_start", ts: now - 10000 },
+      { type: "llm_request", ts: now - 9000, dur: 6000, status: "error",
+        attrs: { debugName: "summarizeConversationHistory-full", model: "claude-opus-5.5", error: "Canceled" } },
+    ];
+    const s = core.analyze("/logs/canceled-title", base + extra.map(event => JSON.stringify(event)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, true);
+    assert.strictEqual(s.cacheFrom, now - 60000 + 4000);
+  });
+
+  await check("Local cancellation: a new turn after cancellation is still working", () => {
+    const base = chatLog(now - 60000);
+    const extra = [
+      { type: "turn_start", ts: now - 10000 },
+      { type: "llm_request", ts: now - 9000, dur: 6000, status: "error",
+        attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5", error: "Canceled" } },
+      { type: "turn_start", ts: now - 2000 },
+    ];
+    const s = core.analyze("/logs/retry", base + extra.map(event => JSON.stringify(event)).join("\n") + "\n", MODELS, now);
+    assert.strictEqual(s.busy, true);
+  });
+
   await check("analyze: busy while a turn is open, and unknown model has no cost", () => {
     const busy = chatLog(now - 5000).replace(/.*"turn_end".*\n$/, "");
     assert.strictEqual(core.analyze("/logs/b", busy, MODELS, now).busy, true);
