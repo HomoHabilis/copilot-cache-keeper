@@ -141,7 +141,8 @@ function codexChatLog(t0, { ctx = 150000, first = ctx - 20000, cwd = "/w" } = {}
  */
 async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyOnOpen = false, menu = () => undefined, folders = 1,
                          kind = "local", sdkCwd, sdkId = "sdk-0007", draft = "", noPrices = false, ignorePreserve = false,
-                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [], noFolder = false }) {
+                         writesHandoff = true, commandList = [], compactUnlogged = false, sdkAuto, handoffs = [], noFolder = false,
+                         infoAnswer = null }) {
   const now = Date.now();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ck-smoke-"));
   // a window with no folder open: no workspace storage of its own; workspaceStorage is next to globalStorage
@@ -204,7 +205,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
       createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
       showWarningMessage: async (msg, ...buttons) => { warnings.push({ at: clock, msg }); return answer(msg, buttons, warnings.length); },
-      showInformationMessage: async m => { infos.push(m); return undefined; },
+      showInformationMessage: async (m, ...buttons) => { infos.push(m); return infoAnswer ? infoAnswer(m, buttons) : undefined; },
       showErrorMessage: async m => { throw new Error("unexpected error message: " + m); },
       showQuickPick: async items => menu(items),
       showTextDocument: async () => undefined,
@@ -1661,6 +1662,156 @@ const never = () => new Promise(() => {});
                  { t: "user", ts: t0 + 900000, text: "next" }, call(t0 + 901000, 0)];                   // then a pause
     const a = report.analyzeSpend([{ kind: "local", id: "l", events: evs, sheetFor: () => opus }], { since: 0, now });
     assert.deepStrictEqual(a.misses.map(x => [!!x.waited, x.expired]), [[true, false], [false, true]]);
+  });
+
+  // ---- nudges: only for real spending
+  // A long Local chat as its debug log: `msgs` messages of yours, `per` model calls each, the context
+  // growing evenly from `from` to `to`; a pause longer than the cache lifetime before the messages in
+  // `coldAt` (their first call re-sends everything). Billed by Copilot's price sheet. Ends at `end`.
+  const longChatLog = (end, { msgs = 6, per = 25, from = 50000, to = 400000, coldAt = [], commitLast = false } = {}) => {
+    const n = msgs * per, lines = [];
+    let t = end - (n * 10 + msgs * 60 + coldAt.length * 400) * 1000, prev = 0;
+    for (let m = 0; m < msgs; m++) {
+      t += (coldAt.includes(m) ? 460 : 60) * 1000;
+      lines.push({ type: "user_message", ts: t, attrs: { content: m ? `Step ${m}` : "Build the importer" } }, { type: "turn_start", ts: t + 5 });
+      for (let i = 0; i < per; i++) {
+        const j = m * per + i, ctx = Math.round(from + (to - from) * j / (n - 1)), cached = j === 0 || (i === 0 && coldAt.includes(m)) ? 0 : prev;
+        t += 10000;
+        if (commitLast && m === msgs - 1 && i === per - 2) lines.push({ type: "tool_call", name: "run_in_terminal", ts: t - 2000, dur: 900,
+          attrs: { args: JSON.stringify({ command: "git add -A && git commit -m 'importer'" }) } });
+        lines.push({ type: "llm_request", ts: t, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5", inputTokens: ctx,
+          cachedTokens: cached, outputTokens: 500, copilotUsageNanoAiu: (cached * 20 + (ctx - cached) * 500 + 500 * 2000) * 1e3 } });
+        prev = ctx;
+      }
+      lines.push({ type: "turn_end", ts: t + 2500 });
+    }
+    return lines.map(e => JSON.stringify(e)).join("\n") + "\n";
+  };
+  const nudges = require("../nudges");
+  const localEvents = text => require("../harnesses").localTrace(text).events;
+  const opusSheet = core.priceSheetFrom(MODELS, "claude-opus-5.5");
+
+  await check("nudges: a long chat's what-ifs; each nudge only above its amount, once, never while the agent works", () => {
+    const end = now - 20000;
+    const ins = report.liveInsight(localEvents(longChatLog(end, { coldAt: [2, 4] })), { sheetFor: () => opusSheet, ttl: 300 });
+    assert.strictEqual(ins.calls, 150);
+    assert.strictEqual(ins.paid.pause.count, 2, "the two pauses, paid");
+    assert.strictEqual(ins.paid.wait.count, 0);
+    assert.ok(ins.split && ins.split.share > 0.25 && ins.split.saving > 300, JSON.stringify(ins.split));
+    assert.ok(ins.keeperSaving > 100 && ins.keeperSaving < ins.paid.pause.credits, `keep-alives are paid for: ${ins.keeperSaving}`);
+    assert.ok(Math.abs(ins.carry.perCall - 400000 * 20e-6) < 0.01 && ins.carry.newPerCall < 2, JSON.stringify(ins.carry));
+    const o = nudges.options(() => undefined), s = { id: "chat-1", title: "Build the importer", busy: false, routed: false, ttl: 300, model: "claude-opus-5.5",
+      ctx: 400000, cost: { missExtra: 190 }, lastRealUserTs: end - 300000 };
+    assert.deepStrictEqual([o.on, o.minCredits, o.splitMinCredits, o.splitMinPercent], [true, 100, 300, 25]);
+    // the split nudge
+    const sp = nudges.splitNudge(s, ins, {}, o);
+    assert.ok(sp && /would have been about/.test(sp.text) && /% less/.test(sp.text) && sp.buttons[0] === nudges.CONTINUE, sp && sp.text);
+    assert.strictEqual(nudges.splitNudge({ ...s, busy: true }, ins, {}, o), null, "never while the agent works");
+    assert.strictEqual(nudges.splitNudge(s, ins, { splitNever: true }, o), null, "not for this chat");
+    assert.strictEqual(nudges.splitNudge(s, ins, { splitAt: ins.billed * 0.8 }, o), null, "already said");
+    assert.ok(nudges.splitNudge(s, ins, { splitAt: ins.billed * 0.4 }, o), "again once the chat has cost twice as much");
+    assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, splitMinCredits: 1e6 }), null, "below the amount");
+    assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, splitMinPercent: 95 }), null, "below the share");
+    assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, on: false }), null, "cacheKeeper.nudges off");
+    // a small chat: nothing at all, not even the passive lines
+    const small = report.liveInsight(localEvents(longChatLog(end, { msgs: 3, per: 5, from: 30000, to: 45000 })), { sheetFor: () => opusSheet, ttl: 300 });
+    assert.strictEqual(nudges.splitNudge(s, small, {}, o), null);
+    assert.strictEqual(nudges.carryLine(small, o), null);
+    assert.strictEqual(nudges.commitHint(s, { ...small, lastCommit: end }, o), null);
+    // Auto keep warm after two paid expiries, on a warm cache, once
+    const kw = nudges.keepWarmOffer(s, ins, {}, o, 200);
+    assert.ok(kw && /paid for 2 expired caches/.test(kw.text) && kw.buttons[0] === nudges.AUTO_KEEP_WARM, kw && kw.text);
+    assert.strictEqual(nudges.keepWarmOffer(s, ins, { keepOffered: true }, o, 200), null);
+    assert.strictEqual(nudges.keepWarmOffer(s, ins, {}, o, -5), null, "expired: nothing to keep warm");
+    const one = report.liveInsight(localEvents(longChatLog(end, { coldAt: [2] })), { sheetFor: () => opusSheet, ttl: 300 });
+    assert.strictEqual(nudges.keepWarmOffer(s, one, {}, o, 200), null, "one expiry is not a habit");
+    // the agent may be waiting for you: busy, almost a whole lifetime without a call, a costly expiry
+    const busy = { ...s, busy: true };
+    assert.ok(/may be waiting for your approval/.test(nudges.waitingWarning(busy, {}, o, 50, 60).text));
+    assert.strictEqual(nudges.waitingWarning(busy, {}, o, 200, 60), null, "not yet");
+    assert.strictEqual(nudges.waitingWarning(busy, { waitFor: busy.lastRealUserTs }, o, 50, 60), null, "once per message of yours");
+    assert.strictEqual(nudges.waitingWarning({ ...busy, cost: { missExtra: 40 } }, {}, o, 50, 60), null, "a cheap expiry: not a word");
+    assert.strictEqual(nudges.waitingWarning(s, {}, o, 50, 60), null, "not working: the usual warning covers it");
+    // passive: cost per call, the commit hint, the context-size tip, the digest
+    assert.ok(/re-reads 400k tokens: \*\*8\.0 cr\*\*/.test(nudges.carryLine(ins, o)), nudges.carryLine(ins, o));
+    assert.strictEqual(nudges.commitHint(s, ins, o), null, "no commit");
+    const done = report.liveInsight(localEvents(longChatLog(end, { commitLast: true })), { sheetFor: () => opusSheet, ttl: 300 });
+    assert.ok(done.lastCommit > 0 && /Just committed/.test(nudges.commitHint(s, done, o)));
+    assert.strictEqual(nudges.commitHint({ ...s, lastRealUserTs: done.lastCommit + 1 }, done, o), null, "you wrote since: the moment has passed");
+    assert.strictEqual(report.tierMax(opusSheet), 200000);
+    assert.ok(/past claude-opus-5\.5's 200K context-size option/.test(nudges.contextTip(s, 200000, o, false).text));
+    assert.strictEqual(nudges.contextTip(s, 200000, o, true), null, "shown once, ever");
+    assert.strictEqual(nudges.contextTip({ ...s, ctx: 150000 }, 200000, o, false), null);
+    assert.strictEqual(nudges.contextTip(s, null, o, false), null, "a model with one context size");
+    const a = { total: 5000, whatIf: { rows: [1, 2], billed: 4000, coldPause: 300, coldWait: 50, both: 900 } };
+    assert.ok(/would have saved about 900 cr \(23%/.test(nudges.digest(a, 7, o).text), nudges.digest(a, 7, o).text);
+    assert.strictEqual(nudges.digest({ ...a, whatIf: { ...a.whatIf, both: 200 } }, 7, o), null, "small savings: no digest");
+  });
+
+  await check("extension: a costly long chat gets the split nudge once the agent is done; Continue in new chat summarizes, then opens the new chat", async () => {
+    const h = await harness({ answer: never, ctx: 600000, infoAnswer: (m, b) => b.includes("Continue in new chat") ? "Continue in new chat" : undefined });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2], per: 40, to: 600000 }));
+      await h.run(12);
+      const said = h.infos.filter(m => /would have been about/.test(m));
+      assert.strictEqual(said.length, 1, h.infos.join("\n"));
+      assert.ok(/"Build the importer" has cost/.test(said[0]) && /From here, a new chat saves about/.test(said[0]), said[0]);
+      await h.run(20);
+      assert.strictEqual(h.sent.filter(x => x.text.startsWith("[summary]")).length, 1, "the handoff summary is asked for");
+      assert.ok(h.ran.some(x => x.id === "workbench.action.chat.open" && x.a && x.a.attachFiles), "then the new chat opens with it");
+      assert.strictEqual(h.infos.filter(m => /would have been about/.test(m)).length, 1, "said once");
+      assert.ok(h.memento.get("nudgeMemory")["sess-1"].splitAt > 0, "remembered across restarts");
+      assert.ok(h.status.tooltip.includes("Each model call re-reads"), "the cost per call, in the tooltip");
+    } finally { h.close(); }
+  });
+
+  await check("extension: a cheap chat gets no nudge and no cost-per-call line; cacheKeeper.nudges off silences a costly one", async () => {
+    const h = await harness({ answer: never });
+    try {
+      h.userTypes();
+      await h.run(12);
+      assert.strictEqual(h.infos.filter(m => /would have been|expired caches after pauses|context-size option/.test(m)).length, 0, h.infos.join("\n"));
+      assert.ok(!h.status.tooltip.includes("Each model call re-reads"));
+    } finally { h.close(); }
+    const off = await harness({ answer: never, settings: { nudges: false } });
+    try {
+      fs.writeFileSync(off.logFile, longChatLog(off.clock - 20000, { coldAt: [2, 4], commitLast: true }));
+      await off.run(12);
+      assert.strictEqual(off.infos.filter(m => /would have been|expired caches after pauses|context-size option/.test(m)).length, 0, off.infos.join("\n"));
+      assert.ok(!off.status.tooltip.includes("Each model call re-reads") && !off.status.tooltip.includes("Just committed"));
+    } finally { off.close(); }
+  });
+
+  await check("extension: two paid expiries, then the Auto keep warm offer (once the split nudge was declined for the chat); a commit shows on the status bar", async () => {
+    const h = await harness({ answer: never, infoAnswer: (m, b) => b.includes("Auto keep warm") ? "Auto keep warm" : b.includes("Not for this chat") ? "Not for this chat" : undefined });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2, 4], commitLast: true }));
+      await h.run(8);
+      assert.strictEqual(h.memento.get("nudgeMemory")["sess-1"].splitNever, true, "Not for this chat");
+      assert.ok(/\$\(git-commit\) new chat\?/.test(h.status.text) && h.status.tooltip.includes("Just committed"), h.status.text);
+      h.userTypes();                       // a new cache window: at most one nudge per window
+      await h.run(8);
+      const offers = h.infos.filter(m => /paid for 2 expired caches after pauses/.test(m));
+      assert.strictEqual(offers.length, 1, h.infos.join("\n"));
+      assert.ok(h.infos.some(m => /will send a keep-alive/.test(m)), "Auto keep warm is on");
+      assert.ok(!/git-commit/.test(h.status.text), "you wrote since the commit");
+    } finally { h.close(); }
+  });
+
+  await check("extension: the agent quiet in the middle of a turn on a costly context: one warning before the cache expires; none on a cheap one", async () => {
+    for (const [ctx, expected] of [[300000, 1], [40000, 0]]) {
+      const h = await harness({ answer: never, ctx });
+      try {
+        h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Run the migration" } }, { type: "turn_start", ts: h.clock + 5 },
+                  { type: "llm_request", ts: h.clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+                    inputTokens: ctx + 2000, cachedTokens: ctx, outputTokens: 300, copilotUsageNanoAiu: 8e9 } }]);
+        await h.run(300);
+        const w = h.warnings.filter(x => /may be waiting for your approval/.test(x.msg));
+        assert.strictEqual(w.length, expected, h.warnings.map(x => x.msg).join("\n"));
+        if (expected) assert.ok(/expires in \d+s/.test(w[0].msg) && /\+\d+ cr/.test(w[0].msg), w[0].msg);
+        assert.strictEqual(h.sent.length, 0, "nothing is ever sent while the agent works");
+      } finally { h.close(); }
+    }
   });
 
   await check("spend report command: asks the days (60), reads Local logs and older chat files, saves the file, shows its preview", async () => {

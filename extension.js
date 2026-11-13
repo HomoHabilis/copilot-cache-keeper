@@ -9,6 +9,7 @@ const core = require("./core");
 const sqlite = require("./sqlite");
 const harnesses = require("./harnesses");
 const report = require("./report");
+const nudges = require("./nudges");
 
 const READ_MS = 5000;          // re-read the logs
 const DECIDE_MS = 1000;        // decide and redraw the countdown
@@ -1224,7 +1225,7 @@ async function verifyPending() {
     }
     const done = p.landed && (p.unlogged ? Date.now() - p.sentAt > UNLOGGED_COMPACT_MS : !(pool.find(x => x.id === p.landed) || {}).busy);
     // a summary is done when the agent is, and then its file must be there
-    if (done && p.label === "summary request" && !p.fileChecked) { p.fileChecked = true; checkHandoffWritten(st); }
+    if (done && p.label === "summary request" && !p.fileChecked) { p.fileChecked = true; checkHandoffWritten(st).then(() => openIfAsked(st)).catch(e => logx("handoff: " + e.message)); }
     // Not landed after 90 s: give up. Landed: wait for the reply, however long (a handoff summary on
     // a large context can take minutes), so its tab is not closed or moved while the agent writes;
     // the busy cap still ends a turn that never logs its end.
@@ -1795,9 +1796,14 @@ async function chatMenu(context, cs) {
   const handoff = await findHandoff(st) ? [{ label: NEW_FROM_HANDOFF,
     detail: `Open a new chat with ${path.posix.basename(st.handoff.path)} attached` +
       (cs.cost ? ` (first message ≈ ${core.fmt(cs.cost.restart)} cr)` : "") }] : [];
-  const pick = await vscode.window.showQuickPick([...handoff, ...choiceItems(st, cs)],
+  // carrying this context costs real money: going on in a new chat, in one step
+  const ins = insightFor(cs), per = nudges.perCallSaving(ins);
+  const fresh = !handoff.length && !cs.routed && nudges.carryMatters(ins, nudgeOptions()) ? [{ label: nudges.CONTINUE,
+    detail: `Write the handoff summary, then open a new chat from it (about ${core.fmt(per)} cr less on every model call)` }] : [];
+  const pick = await vscode.window.showQuickPick([...handoff, ...fresh, ...choiceItems(st, cs)],
     { placeHolder: `${describe(cs)}: what should happen before its cache expires? (now: ${modeLabel(st.mode)})` });
-  if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || cs.kind);
+  if (pick && pick.label === nudges.CONTINUE) await continueInNewChat(context, all.find(x => x.id === cs.id) || cs);
+  else if (pick && pick.label === NEW_FROM_HANDOFF) await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || cs.kind);
   else if (pick && pick.label === KEEP_WARM_NOW) { setMode(st, cs, "ask"); await keepWarmNow(context, all.find(x => x.id === cs.id) || cs); }
   else if (pick) await choose(context, all.find(x => x.id === cs.id) || cs, pick.label);
 }
@@ -1850,10 +1856,127 @@ function modeLabel(m) {
 
 // ---------------------------------------------------------------- decisions
 
+// ---------------------------------------------------------------- nudges (only for real spending)
+// What to say is decided in nudges.js; here: the chat's what-ifs, what each chat was already told
+// (kept across restarts, so nothing is said twice), and showing it.
+const NUDGE_KEY = "nudgeMemory", NUDGE_KEEP = 200;
+function nudgeMem(id) { return ((globalState && globalState.get(NUDGE_KEY)) || {})[id] || {}; }
+function rememberNudge(id, patch) {
+  if (!globalState) return;
+  const m = { ...(globalState.get(NUDGE_KEY) || {}) };
+  m[id] = { ...(m[id] || {}), ...patch, at: Date.now() };
+  const ids = Object.keys(m);
+  if (ids.length > NUDGE_KEEP) for (const old of ids.sort((a, b) => m[a].at - m[b].at).slice(0, ids.length - NUDGE_KEEP)) delete m[old];
+  globalState.update(NUDGE_KEY, m);
+}
+function nudgeOptions() { return nudges.options(cfg); }
+
+/** A chat's what-ifs (report.liveInsight), computed again only when it has made a new call; while the agent works, the last ones. */
+const insights = new Map();    // id -> { key, ins }
+function insightFor(s) {
+  const had = insights.get(s.id);
+  if (!s.events) return had ? had.ins : null;
+  const key = `${s.events.length}|${s.cacheFrom}`;
+  if (had && (had.key === key || s.busy)) return had.ins;
+  if (s.busy) return null;
+  let ins = null;
+  try { ins = report.liveInsight(s.events, { sheetFor: priceFor, ttl: s.ttl }); } catch (e) { logx("what-ifs: " + e.message); }
+  insights.set(s.id, { key, ins });
+  return ins;
+}
+
+/** Summarize, then open the new chat from the handoff as soon as it is written. */
+async function continueInNewChat(context, s) {
+  const st = stateFor(s.id);
+  if (await findHandoff(st) && st.handoffCovers === s.lastRealUserTs) {
+    await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || s.kind);
+    return;
+  }
+  // only for the summary asked for here: the one of this message of yours, within the next minutes
+  st.openWhenWritten = { for: s.lastRealUserTs, until: Date.now() + 15 * 60000 };
+  await choose(context, s, "Summarize");
+}
+async function openIfAsked(st) {
+  const ask = st.openWhenWritten;
+  st.openWhenWritten = null;
+  if (!ask || Date.now() > ask.until || st.handoffCovers !== ask.for || !(await findHandoff(st))) return;
+  await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind);
+}
+
+/**
+ * At most one nudge per chat and cache window. While the agent works, only the warning that it may be
+ * waiting for you. The others once it is done, on a warm cache, away from the expiry warning.
+ */
+function nudge(context, s, st) {
+  const o = nudgeOptions();
+  if (!o.on || !managed(s) || st.mode === "ignore" || !seenLive(s) || st.pending) return;
+  const mem = nudgeMem(s.id), r = live(s), cur = () => all.find(x => x.id === s.id) || s;
+  const notThisChat = (a, what) => { if (a === nudges.NOT_THIS_CHAT) rememberNudge(s.id, { [what]: true }); };
+  const wait = nudges.waitingWarning(s, mem, o, r, cfg("warnSeconds"));
+  if (wait) {
+    rememberNudge(s.id, { waitFor: s.lastRealUserTs });
+    logx(`${s.id.slice(0, 8)}: agent quiet, cache about to expire in the middle of a turn: warned`);
+    vscode.window.showWarningMessage(wait.text, ...wait.buttons).then(a => notThisChat(a, "waitNever"));
+    return;
+  }
+  if (s.busy || core.isOwnMessage(s.lastUserText) || st.nudgedFor === s.cacheFrom || !(r > cfg("warnSeconds") + 10)) return;
+  const ins = insightFor(s);
+  const split = nudges.splitNudge(s, ins, mem, o);
+  if (split) {
+    st.nudgedFor = s.cacheFrom;
+    rememberNudge(s.id, { splitAt: split.billed });
+    logx(`${s.id.slice(0, 8)}: split nudge (${split.text})`);
+    vscode.window.showInformationMessage(split.text, ...split.buttons).then(a => {
+      notThisChat(a, "splitNever");
+      if (a === nudges.CONTINUE) continueInNewChat(context, cur()).catch(e => logx("continue in new chat: " + e.message));
+    });
+    return;
+  }
+  const keep = st.mode === "ask" && nudges.keepWarmOffer(s, ins, mem, o, r);
+  if (keep) {
+    st.nudgedFor = s.cacheFrom;
+    rememberNudge(s.id, { keepOffered: true });
+    logx(`${s.id.slice(0, 8)}: auto keep warm offered after ${ins.paid.pause.count} paid expiries`);
+    vscode.window.showInformationMessage(keep.text, ...keep.buttons).then(a => {
+      if (a === nudges.AUTO_KEEP_WARM) choose(context, cur(), "Auto keep warm").catch(e => logx("auto keep warm: " + e.message));
+    });
+    return;
+  }
+  // once ever: the model's smaller context-size option (Local chats: the option is VS Code's)
+  const tip = s.kind === "local" && nudges.contextTip(s, report.tierMax(priceFor(s.model)), o, globalState && globalState.get("contextTipShown"));
+  if (tip) {
+    st.nudgedFor = s.cacheFrom;
+    if (globalState) globalState.update("contextTipShown", true);
+    logx(`${s.id.slice(0, 8)}: context-size tip shown (once)`);
+    vscode.window.showInformationMessage(tip.text);
+  }
+}
+
+// The digest: every cacheKeeper.digestDays (default 7, 0 = never), the spend analysis of that period
+// runs in the background; one notification, only when keeping warm and shorter chats would have saved
+// real money. One window does it (the date is taken before the logs are read).
+const DIGEST_CHECK_MS = 10 * 60000;
+async function maybeDigest(context) {
+  const days = Number(cfg("digestDays") === undefined ? 7 : cfg("digestDays")), o = nudgeOptions();
+  if (!o.on || !(days > 0) || !globalState || globalState.get("digestOff")) return;
+  if (Date.now() - (globalState.get("digestAt") || 0) < days * 86400000) return;
+  await globalState.update("digestAt", Date.now());
+  const since = Date.now() - days * 86400000;
+  await refreshPrices(context, true);
+  const { chats } = await gatherSpend(context, since, null);
+  const d = nudges.digest(report.analyzeSpend(chats, { since, ttlOverrides: cfg("ttlSeconds") || {} }), days, o);
+  logx(`digest, ${days} days: ${d ? d.text : "nothing worth a notification"}`);
+  if (!d) return;
+  const a = await vscode.window.showInformationMessage(d.text, ...d.buttons);
+  if (a === nudges.DONT_SHOW_AGAIN) await globalState.update("digestOff", true);
+  if (a === nudges.OPEN_REPORT) await spendReport(context, days);
+}
+
 async function decide(context) {
   await verifyPending();
   for (const s of all) {
     const st = stateFor(s.id);
+    try { nudge(context, s, st); } catch (e) { logx("nudge: " + (e.stack || e.message)); }
     if (!managed(s) || s.busy || st.pending) {
       // (a pending message is our own keep-alive still being answered: expected, not worth logging)
       if (!st.pending && (st.mode === "auto" || st.mode === "once") && live(s) > 0 && live(s) <= lead() && st.skipFor !== s.cacheFrom) {
@@ -2077,6 +2200,12 @@ function updateStatus(context) {
         "Click here, pick this chat, then *New chat from handoff*."
       : "Consider starting a new chat from a handoff summary instead.", "");
   }
+  // only when the carried context costs real money (cacheKeeper.nudgeMinCredits): what each call costs, and
+  // a finished piece of work as a good moment for a new chat
+  const ins = s.routed ? null : insightFor(s), nopt = nudgeOptions();
+  const committed = nudges.commitHint(s, ins, nopt), carry = nudges.carryLine(ins, nopt);
+  if (committed) { md.push(committed, ""); if (r > 0 && !s.busy) statusItem.text += " · $(git-commit) new chat?"; }
+  if (carry) md.push(carry, "");
   if (s.cost) {
     md.push("| | |", "|---|--:|",
       ...(s.routed ? [`| Cold message, worst case | ~${core.fmt(s.cost.missExtra)} cr |`]
@@ -2160,6 +2289,7 @@ function activate(context) {
     setInterval(noOverlap("read", () => readAll(context).then(setAll).catch(e => logx("read error: " + e.message))), READ_MS),
     setInterval(noOverlap("decide", () => decide(context).catch(e => console.error("cache-keeper", e))), DECIDE_MS),
     setInterval(() => { if (logRootPath || sdkLoc) learnLifetimes(); }, 30 * 60 * 1000),
+    setInterval(noOverlap("digest", () => maybeDigest(context).catch(e => logx("digest: " + e.message))), DIGEST_CHECK_MS),
   ];
   readAll(context).then(setAll).catch(e => logx("read error: " + e.message));
   cleanupHandoffs().catch(e => logx("handoff cleanup: " + e.message));

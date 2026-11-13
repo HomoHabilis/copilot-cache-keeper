@@ -65,7 +65,11 @@
         },
         "cacheKeeper.autoAction": {
           "type": "string",
-          "enum": ["summary", "compact", "off"],
+          "enum": [
+            "summary",
+            "compact",
+            "off"
+          ],
           "enumDescriptions": [
             "Write a handoff summary file. The chat is left as it is; start a new chat from the file when you are back.",
             "Compact the chat (/compact): older turns are summarized in place, the recent ones kept. You just go on in the same chat. It changes the chat and can't be undone. Local chats only for now; others get a summary.",
@@ -156,6 +160,36 @@
           "default": 5,
           "minimum": 0,
           "description": "How many of the newest handoff summaries in each .copilot-handoff/ folder are always kept, however old (see cacheKeeper.handoffMaxAgeDays)."
+        },
+        "cacheKeeper.nudges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Tell you when a chat is costing real money that a different habit would save: a chat that would have cost much less in two or three chats, a chat that has paid for two expired caches, an agent that may be waiting for your approval while its cache expires, and (passively, in the status-bar tooltip) what each call costs to re-read the context. Each is shown only above cacheKeeper.nudgeMinCredits, once, and has a \"Not for this chat\". Off: none of them."
+        },
+        "cacheKeeper.nudgeMinCredits": {
+          "type": "number",
+          "default": 100,
+          "minimum": 0,
+          "description": "Real spending, in credits (100 = $1): no nudge, tip or tooltip line is shown for less. The waiting-for-approval warning needs an expiry that would add this much; the Auto keep warm offer needs keeping warm to have saved this much; the tooltip's cost per call and the commit hint need 50 more calls to cost this much more than in a new chat; the digest needs 5 times this."
+        },
+        "cacheKeeper.splitNudgeMinCredits": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "description": "The \"this chat would have cost less in 2 or 3 chats\" nudge needs a saving of at least this many credits (300 = $3), and of at least cacheKeeper.splitNudgeMinPercent of what the chat cost."
+        },
+        "cacheKeeper.splitNudgeMinPercent": {
+          "type": "number",
+          "default": 25,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "... and of at least this share of what the chat has cost so far (percent)."
+        },
+        "cacheKeeper.digestDays": {
+          "type": "number",
+          "default": 7,
+          "minimum": 0,
+          "description": "Every this many days, the spend analysis of that period runs in the background and one notification says what keeping warm and shorter chats would have saved, only when that is real money (5 times cacheKeeper.nudgeMinCredits). 0 = never."
         }
       }
     }

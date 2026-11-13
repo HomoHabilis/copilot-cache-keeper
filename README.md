@@ -417,11 +417,63 @@ side) with `code --uninstall-extension local.copilot-cache-keeper`.
 | `cacheKeeper.lookbackHours` | 48 | Read chats whose log changed within this many hours; older ones are never listed |
 | `cacheKeeper.handoffMaxAgeDays` | 7 | Delete handoff summaries older than this (to the trash where possible), except the newest `handoffKeep`; 0 = never |
 | `cacheKeeper.handoffKeep` | 5 | How many of the newest handoff summaries per folder always stay |
+| `cacheKeeper.nudges` | true | The nudges below (split, Auto keep warm offer, waiting agent, cost per call, commit hint, context-size tip, digest). Off: none of them |
+| `cacheKeeper.nudgeMinCredits` | 100 | Real spending, in credits (100 = $1): nothing below is shown for less. See [Nudges](#nudges-only-for-real-spending) for what each one compares with it |
+| `cacheKeeper.splitNudgeMinCredits` | 300 | The split nudge needs a saving of at least this many credits |
+| `cacheKeeper.splitNudgeMinPercent` | 25 | ... and of at least this share of what the chat has cost |
+| `cacheKeeper.digestDays` | 7 | How often the background digest looks back over that many days; 0 = never |
 
 Fixed values, not shown in the Settings UI: 5 s keep-alive lead, 5% keep-alive jitter, 60-day
 maximum age for learned cache lifetimes. They can still be overridden in `settings.json`
 (`cacheKeeper.keepAliveLeadSeconds`, `keepAliveJitterPercent`, `lifetimeMaxAgeDays`), mainly for testing.
 Also hidden: `cacheKeeper.compactHarnesses` (`["local"]`), the harnesses where Compact is used.
+
+## Nudges, only for real spending
+
+The warnings above are about one event, a cache about to expire. These look at the whole chat, and
+say something only when a different habit would have saved real money. The rule for all of them:
+below an amount in credits (`cacheKeeper.nudgeMinCredits`, 100 = $1 by default) nothing is shown,
+not even a passive line. Each is said once and has a **Not for this chat**. None is shown while
+the agent works, except the one that is about the agent waiting. `cacheKeeper.nudges: false` turns
+them all off.
+
+A chat that runs unattended for an hour is never a reason by itself. What counts is context
+carried across your messages, and pauses.
+
+- **This chat would have cost much less in 2 or 3 chats.** Once the agent is done: `"Build the
+  importer" has cost 1,820 cr ($18.20). In 3 chats it would have been about 1,240 cr (32% less).
+  From here, a new chat saves about 4.5 cr on every model call.` Shown when the saving is at least
+  25% of what the chat cost (`splitNudgeMinPercent`) and at least 300 credits
+  (`splitNudgeMinCredits`), and the context is still growing. **Continue in new chat** writes the
+  handoff summary and opens the new chat from it as soon as it is written. It comes back only once
+  the chat has cost twice as much. The figures are the spend report's what-if, run on this chat.
+- **Auto keep warm, after two paid expiries.** `"Build the importer" has paid for 2 expired caches
+  after pauses (288 cr). Keeping it warm through them would have cost about 30 cr.` Shown on a warm
+  cache, when keeping warm would have saved at least `nudgeMinCredits`. One click turns Auto keep
+  warm on for that chat (same cap and time limit as always).
+- **The agent may be waiting for you.** In the middle of a turn, when the agent has made no model
+  call for almost a whole cache lifetime and its next call would re-send a context worth at least
+  `nudgeMinCredits`: `the agent has made no model call for 4 min: it may be waiting for your
+  approval (or running a long command). Its cache expires in 58s; the next step would then re-send
+  the context, +144 cr.` Once per message of yours. Nothing is sent: a keep-alive cannot go into a
+  chat whose agent is working. A long command looks the same in the logs, so this also shows for
+  one; nothing can be done about that case.
+- **Passive, in the status-bar tooltip:**
+  - what each model call costs just to re-read the context, and what it would cost in a new chat
+    (`Each model call re-reads 310k tokens: 6.2 cr. In a new chat from a handoff summary: about
+    1.5 cr`), when 50 more calls would cost `nudgeMinCredits` more than in a new chat. The chat's
+    menu then also has **Continue in new chat**.
+  - **Just committed:** when the agent ran a `git commit`, `git push` or `gh pr create` since your
+    last message, the status bar adds `new chat?` until you write again: a piece of work is done, a
+    cheap moment to start fresh. Same amount as above.
+- **Context-size tip, once ever.** The first time a Local chat grows past the model's smaller
+  context-size option (200K for Opus 5.5, from Copilot's price sheet) and an expiry there would
+  add at least `nudgeMinCredits`: with the smaller option VS Code would have compacted by now.
+- **Digest.** Every 7 days (`digestDays`), the spend analysis of that period runs in the
+  background. One notification, only when keeping warm and shorter chats would have saved at least
+  5 times `nudgeMinCredits`, with **Open report** and **Don't show again**.
+
+What each chat was already told is kept across restarts.
 
 ## Spend report
 

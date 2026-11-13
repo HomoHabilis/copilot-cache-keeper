@@ -47,6 +47,10 @@ function filesIn(args) {
 // ---------------------------------------------------------------- Local (VS Code's own agent)
 // Agent Debug Log: workspaceStorage/<id>/GitHub.copilot-chat/debug-logs/<chat>/main.jsonl
 
+// A commit, a push or a pull request the agent ran (a terminal tool's arguments): a piece of work was
+// just finished, a cheap moment to go on in a new chat. { t: "commit", ts }
+const COMMIT_COMMAND = /\bgit\s+(?:-\S+\s+)*(?:commit|push)\b|\bgh\s+pr\s+create\b/;
+const ranCommit = v => COMMIT_COMMAND.test(typeof v === "string" ? v : JSON.stringify(v || ""));
 const LOCAL_EDIT_TOOLS = /apply_patch|create_file|replace_string|insert_edit|edit_file|write_file|edit_notebook/i;
 
 function localTrace(mainText) {
@@ -72,6 +76,7 @@ function localTrace(mainText) {
       }
     } else if (e.type === "tool_call") {
       ev.push({ t: "activity", ts });
+      if (ranCommit(a.args)) ev.push({ t: "commit", ts });
       if (LOCAL_EDIT_TOOLS.test(e.name || "")) ev.push({ t: "edit", ts, files: filesIn(String(a.args || "")) });
     } else if (e.type === "agent_response") {
       ev.push({ t: "reply", ts, text: Object.values(a).filter(v => typeof v === "string" && v.length > 1).join(" ").slice(0, 4000) });
@@ -120,6 +125,7 @@ function sdkTrace(eventsText, yaml = {}) {
       case "assistant.message": ev.push({ t: "reply", ts, text: String(d.content || "").slice(0, 4000) }); break;
       case "tool.execution_start":
         ev.push({ t: "activity", ts });
+        if (ranCommit(d.arguments)) ev.push({ t: "commit", ts });
         if (SDK_EDIT_TOOLS.test(d.toolName || "")) ev.push({ t: "edit", ts, files: filesIn(d.arguments) });
         break;
       case "tool.execution_complete": ev.push({ t: "activity", ts }); break;
@@ -201,6 +207,7 @@ function claudeTrace(text) {
       for (const p of Array.isArray(m.content) ? m.content : []) {
         if (p.type === "text" && p.text) ev.push({ t: "reply", ts, text: p.text.slice(0, 4000) });
         if (p.type === "tool_use" && CLAUDE_EDIT_TOOLS.test(p.name || "")) ev.push({ t: "edit", ts, files: filesIn(p.input) });
+        if (p.type === "tool_use" && ranCommit(p.input)) ev.push({ t: "commit", ts });
       }
       if (CLAUDE_TURN_DONE.test(m.stop_reason || "")) ev.push({ t: "turn_end", ts });
     }
@@ -252,6 +259,7 @@ function codexTrace(text) {
     else if (/_call_output$/.test(p.type || "")) { ev.push({ t: "activity", ts }); lastInput = ts; }
     else if (/_call$/.test(p.type || "")) {
       ev.push({ t: "activity", ts });
+      if (ranCommit(p.arguments || p.input)) ev.push({ t: "commit", ts });
       if (/apply_patch/.test(p.name || "")) ev.push({ t: "edit", ts, files: filesIn(p.arguments || p.input) });
     }
   }
