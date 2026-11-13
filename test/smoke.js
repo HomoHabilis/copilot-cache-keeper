@@ -1702,17 +1702,18 @@ const never = () => new Promise(() => {});
     assert.ok(Math.abs(ins.carry.perCall - 400000 * 20e-6) < 0.01 && ins.carry.newPerCall < 2, JSON.stringify(ins.carry));
     const o = nudges.options(() => undefined), s = { id: "chat-1", title: "Build the importer", busy: false, routed: false, ttl: 300, model: "claude-opus-5.5",
       ctx: 400000, cost: { missExtra: 190 }, lastRealUserTs: end - 300000 };
-    assert.deepStrictEqual([o.on, o.minCredits, o.splitMinCredits, o.splitMinPercent], [true, 100, 300, 25]);
+    assert.deepStrictEqual([o.on, o.minCredits, o.splitMinCredits, o.splitMinPercent, o.digestDays], [true, 100, 300, 25, 7]);
+    assert.ok(nudges.KINDS.every(k => o[k] === true), "every nudge on by default");
     // the split nudge
     const sp = nudges.splitNudge(s, ins, {}, o);
     assert.ok(sp && /would have been about/.test(sp.text) && /% less/.test(sp.text) && sp.buttons[0] === nudges.CONTINUE, sp && sp.text);
     assert.strictEqual(nudges.splitNudge({ ...s, busy: true }, ins, {}, o), null, "never while the agent works");
-    assert.strictEqual(nudges.splitNudge(s, ins, { splitNever: true }, o), null, "not for this chat");
+    assert.strictEqual(nudges.splitNudge(s, ins, { splitNever: true }, o), null, "muted for this chat");
     assert.strictEqual(nudges.splitNudge(s, ins, { splitAt: ins.billed * 0.8 }, o), null, "already said");
     assert.ok(nudges.splitNudge(s, ins, { splitAt: ins.billed * 0.4 }, o), "again once the chat has cost twice as much");
     assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, splitMinCredits: 1e6 }), null, "below the amount");
     assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, splitMinPercent: 95 }), null, "below the share");
-    assert.strictEqual(nudges.splitNudge(s, ins, {}, { ...o, on: false }), null, "cacheKeeper.nudges off");
+    assert.strictEqual(nudges.splitNudge(s, ins, {}, nudges.options(k => k === "nudges.enabled" ? false : undefined)), null, "cacheKeeper.nudges.enabled off");
     // a small chat: nothing at all, not even the passive lines
     const small = report.liveInsight(localEvents(longChatLog(end, { msgs: 3, per: 5, from: 30000, to: 45000 })), { sheetFor: () => opusSheet, ttl: 300 });
     assert.strictEqual(nudges.splitNudge(s, small, {}, o), null);
@@ -1728,6 +1729,14 @@ const never = () => new Promise(() => {});
     // the agent may be waiting for you: busy, almost a whole lifetime without a call, a costly expiry
     const busy = { ...s, busy: true };
     assert.ok(/may be waiting for your approval/.test(nudges.waitingWarning(busy, {}, o, 50, 60).text));
+    assert.deepStrictEqual(nudges.waitingWarning(busy, {}, o, 50, 60).buttons, ["Got it", "Mute for this chat"], "nothing to choose: close it, or stop it for the chat");
+    // "Mute for this chat" on any one nudge silences them all for that chat
+    const mute = { muted: true };
+    assert.strictEqual(nudges.waitingWarning(busy, mute, o, 50, 60), null);
+    assert.strictEqual(nudges.splitNudge(s, ins, mute, o), null);
+    assert.strictEqual(nudges.keepWarmOffer(s, ins, mute, o, 200), null);
+    for (const n of [nudges.splitNudge(s, ins, {}, o), nudges.keepWarmOffer(s, ins, {}, o, 200), nudges.waitingWarning(busy, {}, o, 50, 60)])
+      assert.strictEqual(n.buttons[n.buttons.length - 1], "Mute for this chat", n.kind);
     assert.strictEqual(nudges.waitingWarning(busy, {}, o, 200, 60), null, "not yet");
     assert.strictEqual(nudges.waitingWarning(busy, { waitFor: busy.lastRealUserTs }, o, 50, 60), null, "once per message of yours");
     assert.strictEqual(nudges.waitingWarning({ ...busy, cost: { missExtra: 40 } }, {}, o, 50, 60), null, "a cheap expiry: not a word");
@@ -1746,6 +1755,283 @@ const never = () => new Promise(() => {});
     const a = { total: 5000, whatIf: { rows: [1, 2], billed: 4000, coldPause: 300, coldWait: 50, both: 900 } };
     assert.ok(/would have saved about 900 cr \(23%/.test(nudges.digest(a, 7, o).text), nudges.digest(a, 7, o).text);
     assert.strictEqual(nudges.digest({ ...a, whatIf: { ...a.whatIf, both: 200 } }, 7, o), null, "small savings: no digest");
+  });
+
+  // The same long chat in every harness's own log format: `msgs` messages of yours, `per` model calls
+  // each, the context growing evenly; a pause longer than the cache lifetime before the messages in
+  // `coldAt`; a commit run by the agent just before the last call (`commitLast`). Ends at `end`.
+  const longChatIn = (kind, end, { msgs = 6, per = 25, from = 50000, to = 400000, coldAt = [], commitLast = false, cwd = "/w" } = {}) => {
+    if (kind === "local") return longChatLog(end, { msgs, per, from, to, coldAt, commitLast });
+    const pause = kind === "codex" ? 2200 : 460;        // Sol 6.1 keeps its cache 30 min
+    const n = msgs * per, lines = [];
+    let t = end - (n * 10 + msgs * 60 + coldAt.length * (pause - 60)) * 1000, prev = 0;
+    if (kind === "sdk") lines.push(ev("session.start", t - 100));
+    if (kind === "codex") lines.push(cx("session_meta", t - 100, { id: "thread-1", cwd, originator: "vscode_agent_host", model_provider: "vscode-proxy" }),
+                                     cx("turn_context", t - 50, { model: "gpt-6.1-sol", cwd }));
+    for (let m = 0; m < msgs; m++) {
+      t += (coldAt.includes(m) ? pause : 60) * 1000;
+      const text = m ? `Step ${m}` : "Build the importer";
+      if (kind === "sdk") lines.push(ev("user.message", t, { content: text }));
+      if (kind === "claude") lines.push(cl("user", t, { cwd, message: { role: "user", content: [{ type: "text", text }] } }));
+      if (kind === "codex") lines.push(cx("event_msg", t, { type: "task_started" }), cxUser(t + 10, text));
+      for (let i = 0; i < per; i++) {
+        const j = m * per + i, ctx = Math.round(from + (to - from) * j / (n - 1)), cached = j === 0 || (i === 0 && coldAt.includes(m)) ? 0 : prev;
+        const commit = commitLast && m === msgs - 1 && i === per - 2, lastOne = i === per - 1;
+        t += 10000;
+        if (kind === "sdk") {
+          lines.push(ev("assistant.turn_start", t - 5, { turnId: String(j) }), sdkUsage(t, 2000, { input: ctx, read: cached, out: 500 }));
+          if (commit) lines.push(ev("tool.execution_start", t + 2100, { toolName: "bash", arguments: { command: "git commit -m importer" } }),
+                                 ev("tool.execution_complete", t + 2900, {}));
+          lines.push(ev("assistant.turn_end", t + 3000, { turnId: String(j) }));
+          if (lastOne) lines.push(ev("session.usage_checkpoint", t + 3010));
+        } else if (kind === "claude") {
+          const written = ctx - cached - 2;
+          lines.push(cl("api-request", t, { id: "r" + j }), cl("assistant", t + 2000, { requestRef: "r" + j, message: { id: "msg_r" + j,
+            model: "claude-opus-5-5", stop_reason: lastOne ? "end_turn" : "tool_use",
+            content: commit ? [{ type: "tool_use", name: "Bash", input: { command: "git commit -m importer" } }] : [{ type: "text", text: "Working on it." }],
+            usage: { input_tokens: 2, cache_read_input_tokens: cached, cache_creation_input_tokens: written, output_tokens: 500,
+                     cache_creation: { ephemeral_5m_input_tokens: written, ephemeral_1h_input_tokens: 0 } } } }));
+          if (!lastOne) lines.push(cl("user", t + 2500, { message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } }));
+        } else {
+          lines.push(cxUsage(t, ctx, cached, 500));
+          if (!lastOne) lines.push(cx("response_item", t + 2100, { type: "function_call", name: "shell",
+                                     arguments: JSON.stringify({ command: commit ? "git commit -m importer" : "ls" }) }),
+                                   cx("response_item", t + 2900, { type: "function_call_output", output: "ok" }));
+        }
+        prev = ctx;
+      }
+      if (kind === "codex") lines.push(cx("event_msg", t + 3000, { type: "task_complete" }));
+    }
+    return lines.map(e => JSON.stringify(e)).join("\n") + "\n";
+  };
+  const H = require("../harnesses");
+  const traceOf = { local: H.localTrace, sdk: H.sdkTrace, claude: H.claudeTrace, codex: H.codexTrace };
+  const sheets = m => core.priceSheetFrom(MODELS, m);
+
+  await check("nudges: each has its own switch (cacheKeeper.nudges.<name>), nudges.enabled turns them all off, and package.json lists them all", () => {
+    const end = now - 20000;
+    const ins = report.liveInsight(localEvents(longChatLog(end, { coldAt: [2, 4], commitLast: true })), { sheetFor: () => opusSheet, ttl: 300 });
+    const s = { id: "chat-1", title: "Build the importer", busy: false, routed: false, ttl: 300, model: "claude-opus-5.5",
+      ctx: 400000, cost: { missExtra: 190 }, lastRealUserTs: end - 300000 };
+    const a = { total: 5000, whatIf: { rows: [1, 2], billed: 4000, coldPause: 300, coldWait: 50, both: 900 } };
+    const shown = o => ({ split: !!nudges.splitNudge(s, ins, {}, o), autoKeepWarmOffer: !!nudges.keepWarmOffer(s, ins, {}, o, 200),
+      waitingWarning: !!nudges.waitingWarning({ ...s, busy: true }, {}, o, 50, 60), costPerCall: !!nudges.carryLine(ins, o),
+      commitHint: !!nudges.commitHint(s, ins, o), contextSizeTip: !!nudges.contextTip(s, 200000, o, false), digest: !!nudges.digest(a, 7, o) });
+    const all = Object.fromEntries(nudges.KINDS.map(k => [k, true])), none = Object.fromEntries(nudges.KINDS.map(k => [k, false]));
+    assert.deepStrictEqual(shown(nudges.options(() => undefined)), all, "all on by default");
+    assert.deepStrictEqual(shown(nudges.options(k => k === "nudges.enabled" ? false : undefined)), none, "nudges.enabled: all off at once");
+    for (const kind of nudges.KINDS)   // one switched off: that one only
+      assert.deepStrictEqual(shown(nudges.options(k => k === `nudges.${kind}` ? false : undefined)), { ...all, [kind]: false }, kind);
+    // nudges.enabled off wins over a switch left on
+    assert.deepStrictEqual(shown(nudges.options(k => k === "nudges.enabled" ? false : true)), none);
+    // the settings, as VS Code lists them: a section of their own, the master switch first, one per nudge
+    const conf = require("../package.json").contributes.configuration;
+    const sec = conf.find(c => /Nudges/.test(c.title)), keys = Object.keys(sec.properties);
+    assert.deepStrictEqual(keys.slice(0, 1 + nudges.KINDS.length), ["enabled", ...nudges.KINDS].map(k => `cacheKeeper.nudges.${k}`));
+    assert.deepStrictEqual(keys.slice(1 + nudges.KINDS.length), ["minCredits", "splitMinCredits", "splitMinPercent", "digestDays"].map(k => `cacheKeeper.nudges.${k}`));
+    keys.forEach((k, i) => { assert.strictEqual(sec.properties[k].order, i, k); assert.ok(sec.properties[k].description.length > 20, k); });
+    assert.ok(!conf.some(c => Object.keys(c.properties).some(k => /^cacheKeeper\.(nudges|nudgeMinCredits|digestDays)$/.test(k))), "no key that would shadow the nudges.* ones");
+  });
+
+  await check("nudges on every harness: the same long chat gives the same what-ifs from a Local, Copilot SDK, Claude and Codex log", () => {
+    const end = now - 20000, got = {};
+    for (const kind of ["local", "sdk", "claude", "codex"]) {
+      const tr = traceOf[kind](longChatIn(kind, end, { coldAt: [2, 4], commitLast: true }));
+      const s = core.analyzeTrace(kind, `/x/${kind}-chat`, tr, { now, priceFor: sheets });
+      assert.ok(s && s.events === tr.events, `${kind}: the chat's state carries its events`);
+      const ins = report.liveInsight(s.events, { sheetFor: sheets, ttl: s.ttl });
+      assert.ok(ins, `${kind}: what-ifs`);
+      got[kind] = ins;
+      assert.strictEqual(ins.calls, 150, `${kind}: calls`);
+      assert.deepStrictEqual([ins.paid.pause.count, ins.paid.wait.count], [2, 0], `${kind}: the two pauses are paid expiries, none is the agent's wait`);
+      assert.ok(ins.paid.pause.credits > 0 && ins.keeperSaving > 0 && ins.keeperSaving < ins.paid.pause.credits, `${kind}: keeping warm ${ins.keeperSaving} of ${ins.paid.pause.credits}`);
+      assert.ok(ins.split && ins.split.share > 0.2 && ins.split.chats >= 2, `${kind}: split ${JSON.stringify(ins.split)}`);
+      assert.ok(ins.carry.perCall > 3 * ins.carry.newPerCall && ins.growing, `${kind}: carry ${JSON.stringify(ins.carry)}`);
+      assert.ok(ins.lastCommit > s.lastRealUserTs, `${kind}: the agent's commit is seen`);
+      for (const v of [ins.billed, ins.keeperSaving, ins.split.saving, ins.carry.perCall]) assert.ok(Number.isFinite(v), `${kind}: no NaN`);
+      const o = nudges.options(() => undefined);
+      assert.ok(nudges.carryLine(ins, o) && nudges.commitHint({ ...s, busy: false }, ins, o), `${kind}: passive lines`);
+      assert.ok(nudges.keepWarmOffer({ ...s, busy: false }, ins, {}, { ...o, minCredits: 50 }, 100), `${kind}: Auto keep warm offer`);
+    }
+    // the three Opus chats cost the same whatever logged them; the logs differ in what they record, not in the result
+    for (const kind of ["sdk", "claude"]) {
+      assert.ok(Math.abs(got[kind].billed - got.local.billed) < 0.02 * got.local.billed, `${kind} billed ${got[kind].billed} vs Local ${got.local.billed}`);
+      assert.ok(Math.abs(got[kind].split.saving - got.local.split.saving) < 0.05 * got.local.split.saving, `${kind} split saving`);
+      assert.ok(Math.abs(got[kind].keeperSaving - got.local.keeperSaving) < 0.05 * got.local.keeperSaving, `${kind} keep-warm saving`);
+    }
+  });
+
+  await check("nudges with less data: no price, no lifetime, a one-call chat, an empty log: nothing shown, nothing thrown", () => {
+    const end = now - 20000, o = nudges.options(() => undefined);
+    for (const kind of ["local", "sdk", "claude", "codex"]) {
+      const tr = traceOf[kind](longChatIn(kind, end, { coldAt: [2, 4], commitLast: true }));
+      // no price sheet (a remote machine with only Claude or Codex logs): Copilot SDK logs carry their own rates
+      const blind = report.liveInsight(tr.events, { sheetFor: () => null, ttl: 300 });
+      if (kind === "sdk") assert.ok(blind && blind.split, "sdk: priced from its own log");
+      else assert.strictEqual(blind, null, `${kind}: no price, no what-ifs`);
+      // no cache lifetime known: no expiry is judged, the rest still works
+      const noTtl = report.liveInsight(tr.events.map(e => ({ ...e, ttl: undefined })), { sheetFor: sheets, ttl: 0 });
+      assert.deepStrictEqual([noTtl.paid.pause.count, noTtl.keeperSaving], [0, 0], `${kind}: no lifetime, no expiry judged`);
+      assert.ok(noTtl.split && Number.isFinite(noTtl.split.saving), `${kind}: split still estimated`);
+      // a chat's first call only, and nothing at all
+      const firstCall = tr.events.slice(0, tr.events.findIndex(e => e.t === "call") + 1);
+      assert.strictEqual(report.liveInsight(firstCall, { sheetFor: sheets, ttl: 300 }), null, `${kind}: one call`);
+    }
+    assert.strictEqual(report.liveInsight([], { sheetFor: sheets, ttl: 300 }), null);
+    const s = { id: "x", busy: false, routed: false, ttl: 300, model: "?", ctx: 400000, cost: null, lastRealUserTs: 1 };
+    // every decision takes "no what-ifs" and "no price" as "say nothing"
+    assert.strictEqual(nudges.splitNudge(s, null, {}, o), null);
+    assert.strictEqual(nudges.keepWarmOffer(s, null, {}, o, 100), null);
+    assert.strictEqual(nudges.waitingWarning({ ...s, busy: true }, {}, o, 30, 60), null, "no price: no warning");
+    assert.strictEqual(nudges.carryLine(null, o), null);
+    assert.strictEqual(nudges.commitHint(s, null, o), null);
+    assert.strictEqual(nudges.contextTip(s, 200000, o, false), null, "no price: no tip");
+    assert.strictEqual(nudges.digest(null, 7, o), null);
+    assert.strictEqual(nudges.digest({ total: 0, whatIf: { rows: [], billed: 0, both: 0 } }, 7, o), null);
+    // a chat whose bill the price sheet does not explain: no split figure, so no split nudge, but no crash
+    const odd = traceOf.local(longChatIn("local", end, {})).events.map(e => e.t === "call" ? { ...e, credits: e.credits * 5 } : e);
+    const ins = report.liveInsight(odd, { sheetFor: sheets, ttl: 300 });
+    assert.ok(ins && ins.split === null && ins.keeperSaving === 0);
+    assert.strictEqual(nudges.splitNudge({ ...s, cost: { missExtra: 190 } }, ins, {}, o), null);
+  });
+
+  for (const kind of ["sdk", "claude", "codex"]) {
+    await check(`extension, ${kind} chat: the split nudge, the cost per call and the commit hint work as on a Local chat`, async () => {
+      const h = await harness({ answer: never, kind, ctx: 600000 });
+      try {
+        fs.writeFileSync(h.logFile, longChatIn(kind, h.clock - 20000, { coldAt: [2], per: 40, to: 600000, commitLast: true, cwd: h.dir }));
+        await h.run(12);
+        const said = h.infos.filter(m => /would have been about/.test(m));
+        assert.strictEqual(said.length, 1, h.infos.join("\n") || "no notification at all");
+        assert.ok(/has cost .* cr \(\$\d+\.\d\d\)\. In \d chats/.test(said[0]), said[0]);
+        assert.ok(h.status.tooltip.includes("Each model call re-reads") && h.status.tooltip.includes("Just committed"), String(h.status.tooltip));
+        assert.ok(/\$\(git-commit\) new chat\?/.test(h.status.text), h.status.text);
+      } finally { h.close(); }
+    });
+
+    await check(`extension, ${kind} chat: the agent quiet in the middle of a turn gets the one warning before a costly cache expires`, async () => {
+      const h = await harness({ answer: never, kind, ctx: 600000 });
+      try {
+        const t = h.clock;
+        h.append(kind === "sdk" ? [ev("user.message", t, { content: "Run the migration" }), ev("assistant.turn_start", t + 5, { turnId: "9" }),
+                                    sdkUsage(t + 10, 2000, { input: 602000, read: 600000, out: 300 })]
+          : kind === "claude" ? [cl("user", t, { cwd: h.dir, message: { role: "user", content: [{ type: "text", text: "Run the migration" }] } }),
+                                 ...claudeCall(t + 10, t + 2010, { input: 602000, read: 600000, stop: "tool_use", id: "w1" })]
+          : [cx("event_msg", t, { type: "task_started" }), cxUser(t + 10, "Run the migration"), cxUsage(t + 2000, 602000, 600000, 300),
+             cx("response_item", t + 2100, { type: "function_call", name: "shell", arguments: "{}" })]);
+        await h.run(kind === "codex" ? 1830 : 320);
+        const w = h.warnings.filter(x => /may be waiting for your approval/.test(x.msg));
+        assert.strictEqual(w.length, 1, h.warnings.map(x => x.msg).join("\n") || "no warning");
+        assert.strictEqual(h.sent.length, 0, "nothing is sent while the agent works");
+      } finally { h.close(); }
+    });
+  }
+
+  await check("extension: previewNudges shows every nudge on a made-up chat through the real code; nothing sent, nothing remembered, gone afterwards", async () => {
+    const h = await harness({ answer: never, infoAnswer: (m, b) => b[0] });      // every first button clicked: it must do nothing
+    try {
+      const pv = h.commands["cacheKeeper.previewNudges"];
+      await pv("split");
+      assert.ok(h.infos.some(m => /"Build the importer" has cost .* In \d chats it would have been about/.test(m)), h.infos.join("\n"));
+      await pv("keepWarm");
+      assert.ok(h.infos.some(m => /paid for 2 expired caches after pauses/.test(m)), h.infos.join("\n"));
+      await pv("tip");
+      assert.ok(h.infos.some(m => /past claude-opus-5\.5's 200K context-size option/.test(m)), h.infos.join("\n"));
+      await pv("waiting");
+      assert.ok(h.warnings.some(x => /may be waiting for your approval/.test(x.msg)), h.warnings.map(x => x.msg).join("\n"));
+      await pv("digest");
+      assert.ok(h.infos.some(m => /Cache Keeper, last 7 days/.test(m)));
+      await pv("commit");
+      assert.ok(/\$\(git-commit\) new chat\?/.test(h.status.text) && h.status.tooltip.includes("Just committed") &&
+        h.status.tooltip.includes("Each model call re-reads 400k tokens"), h.status.text + "\n" + h.status.tooltip);
+      await h.run(8);
+      assert.strictEqual(h.sent.length, 0, "nothing sent");
+      assert.strictEqual(h.submits.length, 0);
+      assert.ok(!h.memento.get("nudgeMemory") || !h.memento.get("nudgeMemory")["preview-chat"], "nothing remembered");
+      assert.ok(!h.memento.get("contextTipShown"), "the real one-time tip is still to come");
+      await pv("off");
+      await h.run(3);
+      assert.ok(!/git-commit/.test(h.status.text) && !String(h.status.tooltip).includes("Build the importer"), h.status.text);
+    } finally { h.close(); }
+  });
+
+  await check("extension: Ignore silences the nudges for that chat too, until you write in it again", async () => {
+    const h = await harness({ answer: never, ctx: 400000, settings: { "nudges.enabled": false },
+                              menu: items => items.find(i => i.label === "Ignore") });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2, 4], commitLast: true }));
+      await h.run(3);                                  // (nudges off while the chat is first read, so none is said yet)
+      h.settings["nudges.enabled"] = true;
+      await h.commands["cacheKeeper.options"]();       // the status-bar list, this chat, Ignore
+      await new Promise(r => setImmediate(r));
+      await h.run(10);
+      const nudged = () => h.infos.filter(m => /would have been about|paid for 2 expired caches/.test(m)).length;
+      assert.strictEqual(nudged(), 0, h.infos.join("\n"));
+      assert.ok(!/git-commit/.test(h.status.text) && !h.status.tooltip.includes("Just committed"), "nor the commit hint: " + h.status.text);
+      h.userTypes();                                   // you write in it again: back to normal
+      await h.run(10);
+      assert.strictEqual(nudged(), 1, h.infos.join("\n"));
+    } finally { h.close(); }
+  });
+
+  await check("extension: cacheKeeper.notifications off: no warning and no notice pop up; the status bar asks for the whole warning time; no-click behaviour unchanged", async () => {
+    const h = await harness({ answer: never, ctx: 150000, settings: { notifications: false } });
+    try {
+      await h.run(250, () => /click to choose/.test(h.status.text));
+      const left = 300 - (h.clock - h.cacheFrom) / 1000;
+      assert.ok(/\$\(bell\).*click to choose/.test(h.status.text) && left > 45 && left <= 61, `${h.status.text} with ${left}s left`);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.warningBackground");
+      assert.strictEqual(h.warnings.length, 0, "no expiry warning: " + h.warnings.map(x => x.msg).join("\n"));
+      await h.run(70);                                 // through the expiry
+      assert.strictEqual(h.sent.filter(x => x.text.startsWith("[summary]")).length, 1, "the automatic summary still goes out");
+      assert.strictEqual(h.warnings.length, 0);
+      assert.strictEqual(h.infos.filter(m => /cache expired|writing the handoff summary/.test(m)).length, 0, h.infos.join("\n"));
+    } finally { h.close(); }
+    // with notifications on, the same chat gets the warning and the notices (the default)
+    const on = await harness({ answer: never, ctx: 150000 });
+    try {
+      await on.run(320);
+      assert.strictEqual(on.warnings.length, 1);
+      assert.ok(on.infos.some(m => /writing the handoff summary/.test(m)), on.infos.join("\n"));
+    } finally { on.close(); }
+  });
+
+  await check("extension: cacheKeeper.notifications off: a nudge is a tooltip line with a light bulb on the bar, the waiting warning an orange bar; a question before spending is still asked", async () => {
+    const h = await harness({ answer: never, ctx: 600000, settings: { notifications: false } });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2], per: 40, to: 600000 }));
+      await h.run(8);
+      assert.strictEqual(h.infos.filter(m => /would have been about/.test(m)).length, 0, h.infos.join("\n"));
+      assert.ok(/\$\(lightbulb\)/.test(h.status.text), h.status.text);
+      assert.ok(/^\$\(lightbulb\) "Build the importer" has cost .* would have been about .*Continue in new chat/.test(h.status.tooltip.value.split("\n")[0]), h.status.tooltip.value);
+      // the agent quiet in the middle of a turn: no warning window, the bar says it
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Run the migration" } }, { type: "turn_start", ts: h.clock + 5 },
+                { type: "llm_request", ts: h.clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+                  inputTokens: 602000, cachedTokens: 600000, outputTokens: 300, copilotUsageNanoAiu: 13e9 } }]);
+      await h.run(260);
+      assert.strictEqual(h.warnings.length, 0, h.warnings.map(x => x.msg).join("\n"));
+      assert.ok(/working.*\$\(warning\)/.test(h.status.text) && h.status.tooltip.includes("may be waiting for your approval"), h.status.text);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.warningBackground");
+    } finally { h.close(); }
+    // Keep warm now on an expired chat costs a whole re-send: that question is still asked
+    const cold = await harness({ answer: never, ctx: 150000, settings: { notifications: false, autoAction: "off" } });
+    try {
+      await cold.run(320);
+      assert.strictEqual(cold.warnings.length, 0);
+      cold.commands["cacheKeeper.keepWarmNow"]();
+      await new Promise(r => setTimeout(r, 50));
+      assert.ok(cold.warnings.some(x => /already expired/.test(x.msg)), "asked before a cold keep-alive");
+    } finally { cold.close(); }
+  });
+
+  await check("extension: Claude chat with no price sheet anywhere: no nudge, no cost line, no error", async () => {
+    const h = await harness({ answer: never, kind: "claude", ctx: 600000, noPrices: true });
+    try {
+      fs.writeFileSync(h.logFile, longChatIn("claude", h.clock - 20000, { coldAt: [2, 4], per: 40, to: 600000, commitLast: true, cwd: h.dir }));
+      await h.run(12);
+      assert.strictEqual(h.infos.filter(m => /would have been|expired caches after pauses|context-size option/.test(m)).length, 0, h.infos.join("\n"));
+      assert.ok(h.status.tooltip && !h.status.tooltip.includes("Each model call re-reads") && !/git-commit/.test(h.status.text));
+    } finally { h.close(); }
   });
 
   await check("extension: a costly long chat gets the split nudge once the agent is done; Continue in new chat summarizes, then opens the new chat", async () => {
@@ -1773,7 +2059,7 @@ const never = () => new Promise(() => {});
       assert.strictEqual(h.infos.filter(m => /would have been|expired caches after pauses|context-size option/.test(m)).length, 0, h.infos.join("\n"));
       assert.ok(!h.status.tooltip.includes("Each model call re-reads"));
     } finally { h.close(); }
-    const off = await harness({ answer: never, settings: { nudges: false } });
+    const off = await harness({ answer: never, settings: { "nudges.enabled": false } });
     try {
       fs.writeFileSync(off.logFile, longChatLog(off.clock - 20000, { coldAt: [2, 4], commitLast: true }));
       await off.run(12);
@@ -1782,19 +2068,54 @@ const never = () => new Promise(() => {});
     } finally { off.close(); }
   });
 
-  await check("extension: two paid expiries, then the Auto keep warm offer (once the split nudge was declined for the chat); a commit shows on the status bar", async () => {
-    const h = await harness({ answer: never, infoAnswer: (m, b) => b.includes("Auto keep warm") ? "Auto keep warm" : b.includes("Not for this chat") ? "Not for this chat" : undefined });
+  await check("extension: two paid expiries get the Auto keep warm offer; a commit shows on the status bar until you write again", async () => {
+    // (the split nudge would come first on this chat: it is switched off here, alone)
+    const h = await harness({ answer: never, settings: { "nudges.split": false },
+                              infoAnswer: (m, b) => b.includes("Auto keep warm") ? "Auto keep warm" : undefined });
     try {
       fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2, 4], commitLast: true }));
       await h.run(8);
-      assert.strictEqual(h.memento.get("nudgeMemory")["sess-1"].splitNever, true, "Not for this chat");
-      assert.ok(/\$\(git-commit\) new chat\?/.test(h.status.text) && h.status.tooltip.includes("Just committed"), h.status.text);
-      h.userTypes();                       // a new cache window: at most one nudge per window
-      await h.run(8);
-      const offers = h.infos.filter(m => /paid for 2 expired caches after pauses/.test(m));
-      assert.strictEqual(offers.length, 1, h.infos.join("\n"));
+      assert.strictEqual(h.infos.filter(m => /paid for 2 expired caches after pauses/.test(m)).length, 1, h.infos.join("\n"));
       assert.ok(h.infos.some(m => /will send a keep-alive/.test(m)), "Auto keep warm is on");
+      assert.ok(/\$\(git-commit\) new chat\?/.test(h.status.text) && h.status.tooltip.includes("Just committed"), h.status.text);
+      h.userTypes();
+      await h.run(8);
+      assert.strictEqual(h.infos.filter(m => /paid for 2 expired caches after pauses/.test(m)).length, 1, "offered once");
       assert.ok(!/git-commit/.test(h.status.text), "you wrote since the commit");
+    } finally { h.close(); }
+  });
+
+  await check("extension: Mute for this chat on one nudge silences every nudge for that chat, the commit hint too; the tooltip's cost line stays", async () => {
+    const h = await harness({ answer: (m, b) => b.includes("Mute for this chat") ? "Mute for this chat" : new Promise(() => {}),
+                              infoAnswer: (m, b) => b.includes("Mute for this chat") ? "Mute for this chat" : undefined });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { coldAt: [2, 4], commitLast: true }));
+      await h.run(8);
+      assert.strictEqual(h.infos.filter(m => /would have been about/.test(m)).length, 1, "the split nudge, muted there");
+      assert.strictEqual(h.memento.get("nudgeMemory")["sess-1"].muted, true);
+      assert.ok(!/git-commit/.test(h.status.text) && !h.status.tooltip.includes("Just committed"), "no commit hint");
+      assert.ok(h.status.tooltip.includes("Each model call re-reads"), "the tooltip's cost line stays");
+      h.userTypes();                       // a new cache window, where the Auto keep warm offer would come
+      await h.run(8);
+      assert.strictEqual(h.infos.filter(m => /paid for 2 expired caches|would have been about/.test(m)).length, 1, h.infos.join("\n"));
+      // ... and the agent quiet in the middle of a turn: no warning either
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Run the migration" } }, { type: "turn_start", ts: h.clock + 5 },
+                { type: "llm_request", ts: h.clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+                  inputTokens: 404000, cachedTokens: 402000, outputTokens: 300, copilotUsageNanoAiu: 9e9 } }]);
+      await h.run(300);
+      assert.strictEqual(h.warnings.filter(x => /may be waiting for your approval/.test(x.msg)).length, 0, h.warnings.map(x => x.msg).join("\n"));
+    } finally { h.close(); }
+  });
+
+  await check("extension: Mute for this chat on the waiting warning is remembered", async () => {
+    const h = await harness({ ctx: 300000, answer: (m, b) => b.includes("Mute for this chat") ? "Mute for this chat" : new Promise(() => {}) });
+    try {
+      h.append([{ type: "user_message", ts: h.clock, attrs: { content: "Run the migration" } }, { type: "turn_start", ts: h.clock + 5 },
+                { type: "llm_request", ts: h.clock + 10, dur: 2000, attrs: { debugName: "panel/editAgent", model: "claude-opus-5.5",
+                  inputTokens: 302000, cachedTokens: 300000, outputTokens: 300, copilotUsageNanoAiu: 8e9 } }]);
+      await h.run(300);
+      assert.strictEqual(h.warnings.filter(x => /may be waiting for your approval/.test(x.msg)).length, 1);
+      assert.strictEqual(h.memento.get("nudgeMemory")["sess-1"].muted, true);
     } finally { h.close(); }
   });
 

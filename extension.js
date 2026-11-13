@@ -27,6 +27,20 @@ let all = [];                  // sessions from the last log read, newest first
 const sessions = new Map();    // id -> per-chat state
 
 function cfg(key) { return vscode.workspace.getConfiguration("cacheKeeper").get(key); }
+/**
+ * cacheKeeper.notifications off: nothing pops up on its own. The status bar still counts down, turns
+ * orange and asks for a choice before an expiry, and its tooltip carries what a notification would
+ * have said. Still shown: questions before spending credits, things that went wrong, and the answer
+ * to something you clicked or ran yourself.
+ */
+function quietUi() { return cfg("notifications") === false; }
+/** A notification nobody asked for (a warning, a notice, a nudge): not shown with cacheKeeper.notifications off. */
+function unprompted(level, text, ...buttons) {
+  if (quietUi()) { logx(`not shown (cacheKeeper.notifications is off): ${text}`); return Promise.resolve(undefined); }
+  return vscode.window[level === "warn" ? "showWarningMessage" : "showInformationMessage"](text, ...buttons);
+}
+/** With cacheKeeper.notifications off, a nudge becomes a line of the status-bar tooltip for that cache window. */
+function hint(st, s, text, urgent = false) { st.hint = { for: s.cacheFrom, text, urgent }; }
 function lead() {
   // configured lead, plus a margin while the clock offset to the remote machine is still unknown
   // (a local window reads its logs on the same clock: no margin needed)
@@ -931,7 +945,7 @@ function setAll(r) {
     const ready = kind === "local" ? !!logRootPath : !!sdkLoc;
     if (!baseline[kind] && ready) baseline[kind] = new Map(r.filter(x => x.kind === kind).map(x => [x.id, x.cacheFrom]));
   }
-  all = r;
+  all = preview ? [preview.chat, ...r] : r;         // a preview (previewNudges) stays listed until it ends
   return recoverHandoffs(r);
 }
 /** This chat's state read again from its own log (Local or SDK). */
@@ -955,6 +969,7 @@ function aboveThreshold(s) { return !!s.cost && s.ctx >= thresholdTokens(); }
  * Cache Keeper's own keep-alives and summaries, or another chat's agent, make those newer.)
  */
 function currentChat() {
+  if (preview && all.includes(preview.chat)) return preview.chat;   // a preview is what the status bar shows
   const list = all.filter(managed);
   return list.reduce((best, s) => !best || (s.lastRealUserTs || 0) > (best.lastRealUserTs || 0) ? s : best, null);
 }
@@ -1031,6 +1046,7 @@ function withUi(fn) {
 }
 
 async function trySend(context, s, text, label, opts = {}) {
+  if (s.preview) return false;                      // a preview: nothing is ever sent
   if (sending) { logx(`${label} for ${s.id.slice(0, 8)} waits: another chat is being handled`); return false; }
   return withUi(() => sendNow(context, s, text, label, opts));
 }
@@ -1418,7 +1434,8 @@ async function summary(context, s, why, opts = {}) {
   st.handoffLang = s.lang;
   st.handoffKind = s.kind;
   st.handoffCovers = s.lastRealUserTs;
-  vscode.window.showInformationMessage(`Cache Keeper: writing the handoff summary of ${chatName(s)} (${why}) to ${rel}.`);
+  (why === "on request" ? vscode.window.showInformationMessage.bind(vscode.window) : (...a) => unprompted("info", ...a))(
+    `Cache Keeper: writing the handoff summary of ${chatName(s)} (${why}) to ${rel}.`);
   return true;
 }
 
@@ -1524,7 +1541,7 @@ async function compact(context, s, why, opts = {}) {
   }
   if (!(await trySend(context, s, core.compactPrompt(s.lang), "compaction", opts))) return false;
   st.mode = "done";
-  vscode.window.showInformationMessage(`Cache Keeper: compacting ${chatName(s)} (${why}). You can go on in the same chat` +
+  (why === "on request" ? vscode.window.showInformationMessage.bind(vscode.window) : (...a) => unprompted("info", ...a))(`Cache Keeper: compacting ${chatName(s)} (${why}). You can go on in the same chat` +
     (s.cost ? `; your next message there re-sends about ${Math.round(s.cost.compacted / 1000)}k tokens instead of ${Math.round(s.ctx / 1000)}k.` : "."));
   return true;
 }
@@ -1566,7 +1583,7 @@ const NEW_FROM_HANDOFF = "New chat from handoff";
 
 async function choose(context, s, pick) {
   const st = stateFor(s.id);
-  if (!pick) return;
+  if (!pick || s.preview) return;                   // a preview is only shown
   pick = choiceOf(pick);
   // answered here (status-bar list) counts as answering this window's warning too
   if (st.offer && st.offer.for === s.cacheFrom) st.offer.answered = true;
@@ -1655,6 +1672,8 @@ async function offer(context, s) {
   // One warning per cache window. An older one still open counts as not answered (VS Code cannot
   // take a notification back), so it never blocks the warning for a later window.
   const o = st.offer = { for: s.cacheFrom, answered: false, timedOut: false };
+  // no notification: the status bar asks (orange, "click to choose") for the whole warning time
+  if (quietUi()) { logx(`${s.id.slice(0, 8)}: expiry warning on the status bar only (cacheKeeper.notifications is off)`); return; }
   const c = s.cost;
   // Short: a toast cuts long text. Every choice with its cost is in More... (the per-chat menu).
   const msg = `${chatName(s)} expires in ${s.ttlAssumed ? "~" : ""}${Math.max(0, Math.round(live(s)))}s` +
@@ -1698,7 +1717,7 @@ async function offerAtCap(context, s) {
     `No click: ${closing(s) ? `${autoText(s)}, then it expires` : "it expires"}.`;
   const [keep] = warningButtons(s, false);
   const again = `Auto keep warm (new cap ~${core.fmt(fresh)} cr${timeUp ? `, ${fmtDuration(maxWarmMs())}` : ""})`;
-  const pick = await vscode.window.showWarningMessage(msg, keep, again, MORE);
+  const pick = await unprompted("warn", msg, keep, again, MORE);
   if (pick === MORE) { st.quietFor = undefined; await chatMenu(context, all.find(x => x.id === s.id) || s); }
   else if (pick) { st.quietFor = undefined; await choose(context, s, pick); }
 }
@@ -1735,7 +1754,9 @@ function awaitingAnswer() {
   for (const s of all.filter(managed)) {
     const st = stateFor(s.id), r = live(s);
     if (s.busy || st.mode !== "ask" || !st.offer || st.offer.for !== s.cacheFrom || st.offer.answered || st.offer.timedOut) continue;
-    if (r > 0 && r <= LAST_CHANCE_S && (!best || r < live(best))) best = s;
+    // with notifications off the status bar is the warning: for all of it, not just its last seconds
+    const from = quietUi() ? Math.max(LAST_CHANCE_S, Number(cfg("warnSeconds")) || 0) : LAST_CHANCE_S;
+    if (r > 0 && r <= from && (!best || r < live(best))) best = s;
   }
   return best;
 }
@@ -1798,7 +1819,8 @@ async function chatMenu(context, cs) {
       (cs.cost ? ` (first message ≈ ${core.fmt(cs.cost.restart)} cr)` : "") }] : [];
   // carrying this context costs real money: going on in a new chat, in one step
   const ins = insightFor(cs), per = nudges.perCallSaving(ins);
-  const fresh = !handoff.length && !cs.routed && nudges.carryMatters(ins, nudgeOptions()) ? [{ label: nudges.CONTINUE,
+  const mopt = optionsFor(cs);
+  const fresh = !handoff.length && !cs.routed && mopt.costPerCall && nudges.carryMatters(ins, mopt) ? [{ label: nudges.CONTINUE,
     detail: `Write the handoff summary, then open a new chat from it (about ${core.fmt(per)} cr less on every model call)` }] : [];
   const pick = await vscode.window.showQuickPick([...handoff, ...fresh, ...choiceItems(st, cs)],
     { placeHolder: `${describe(cs)}: what should happen before its cache expires? (now: ${modeLabel(st.mode)})` });
@@ -1843,7 +1865,7 @@ function choiceItems(st, s) {
           : `Compact the chat now (/compact)` + (c ? ` (${cr(c.compact)})` : "") + (s.busy ? ", once the agent is done" : "")) +
           (c ? `; your next message then re-sends ~${Math.round(c.compacted / 1000)}k tokens instead of ${Math.round(s.ctx / 1000)}k` : "") +
           ". Changes the chat in place, no undo" }] : []),
-    { label: "Ignore", description: mark("ignore"), detail: "Leave this chat alone: no summary, no warnings, until you write in it again" },
+    { label: "Ignore", description: mark("ignore"), detail: "Leave this chat alone: no summary, no warnings, no nudges, until you write in it again" },
     { label: DEFAULT_CHOICE, description: mark("ask"),
       detail: s.routed ? `Fusion chat: nothing automatic, no warnings (${ROUTED_WHY})` : `Warn ${cfg("warnSeconds")} s before expiry; no click: ${noClickText(st, s)}` },
   ];
@@ -1860,8 +1882,9 @@ function modeLabel(m) {
 // What to say is decided in nudges.js; here: the chat's what-ifs, what each chat was already told
 // (kept across restarts, so nothing is said twice), and showing it.
 const NUDGE_KEY = "nudgeMemory", NUDGE_KEEP = 200;
-function nudgeMem(id) { return ((globalState && globalState.get(NUDGE_KEY)) || {})[id] || {}; }
+function nudgeMem(id) { return id === PREVIEW_ID ? (preview ? preview.mem : {}) : ((globalState && globalState.get(NUDGE_KEY)) || {})[id] || {}; }
 function rememberNudge(id, patch) {
+  if (id === PREVIEW_ID) { if (preview) Object.assign(preview.mem, patch); return; }
   if (!globalState) return;
   const m = { ...(globalState.get(NUDGE_KEY) || {}) };
   m[id] = { ...(m[id] || {}), ...patch, at: Date.now() };
@@ -1870,6 +1893,8 @@ function rememberNudge(id, patch) {
   globalState.update(NUDGE_KEY, m);
 }
 function nudgeOptions() { return nudges.options(cfg); }
+/** A preview shows every nudge, whatever the settings say. */
+function optionsFor(s) { return s && s.preview ? nudges.options(() => undefined) : nudgeOptions(); }
 
 /** A chat's what-ifs (report.liveInsight), computed again only when it has made a new call; while the agent works, the last ones. */
 const insights = new Map();    // id -> { key, ins }
@@ -1880,7 +1905,7 @@ function insightFor(s) {
   if (had && (had.key === key || s.busy)) return had.ins;
   if (s.busy) return null;
   let ins = null;
-  try { ins = report.liveInsight(s.events, { sheetFor: priceFor, ttl: s.ttl }); } catch (e) { logx("what-ifs: " + e.message); }
+  try { ins = report.liveInsight(s.events, { sheetFor: m => sheetOf(s, m), ttl: s.ttl }); } catch (e) { logx("what-ifs: " + e.message); }
   insights.set(s.id, { key, ins });
   return ins;
 }
@@ -1908,15 +1933,18 @@ async function openIfAsked(st) {
  * waiting for you. The others once it is done, on a warm cache, away from the expiry warning.
  */
 function nudge(context, s, st) {
-  const o = nudgeOptions();
-  if (!o.on || !managed(s) || st.mode === "ignore" || !seenLive(s) || st.pending) return;
+  const o = optionsFor(s);
+  // Ignore ("leave this chat alone until I write in it again") covers the nudges too
+  if (!o.on || !managed(s) || st.mode === "ignore" || !(seenLive(s) || s.preview) || st.pending) return;
   const mem = nudgeMem(s.id), r = live(s), cur = () => all.find(x => x.id === s.id) || s;
-  const notThisChat = (a, what) => { if (a === nudges.NOT_THIS_CHAT) rememberNudge(s.id, { [what]: true }); };
+  // "Mute for this chat", on any nudge: no more nudges of any kind for it (the tooltip's cost line stays)
+  const muted = a => { if (a === nudges.MUTE_THIS_CHAT) { rememberNudge(s.id, { muted: true }); logx(`${s.id.slice(0, 8)}: nudges muted for this chat`); } };
+  const act = fn => { if (!s.preview) fn(); };     // a preview's buttons do nothing
   const wait = nudges.waitingWarning(s, mem, o, r, cfg("warnSeconds"));
   if (wait) {
     rememberNudge(s.id, { waitFor: s.lastRealUserTs });
     logx(`${s.id.slice(0, 8)}: agent quiet, cache about to expire in the middle of a turn: warned`);
-    vscode.window.showWarningMessage(wait.text, ...wait.buttons).then(a => notThisChat(a, "waitNever"));
+    if (quietUi()) hint(st, s, wait.text, true); else vscode.window.showWarningMessage(wait.text, ...wait.buttons).then(muted);
     return;
   }
   if (s.busy || core.isOwnMessage(s.lastUserText) || st.nudgedFor === s.cacheFrom || !(r > cfg("warnSeconds") + 10)) return;
@@ -1926,9 +1954,10 @@ function nudge(context, s, st) {
     st.nudgedFor = s.cacheFrom;
     rememberNudge(s.id, { splitAt: split.billed });
     logx(`${s.id.slice(0, 8)}: split nudge (${split.text})`);
-    vscode.window.showInformationMessage(split.text, ...split.buttons).then(a => {
-      notThisChat(a, "splitNever");
-      if (a === nudges.CONTINUE) continueInNewChat(context, cur()).catch(e => logx("continue in new chat: " + e.message));
+    if (quietUi()) hint(st, s, split.text + " Click, pick this chat, *Continue in new chat*.");
+    else vscode.window.showInformationMessage(split.text, ...split.buttons).then(a => {
+      muted(a);
+      if (a === nudges.CONTINUE) act(() => continueInNewChat(context, cur()).catch(e => logx("continue in new chat: " + e.message)));
     });
     return;
   }
@@ -1937,28 +1966,31 @@ function nudge(context, s, st) {
     st.nudgedFor = s.cacheFrom;
     rememberNudge(s.id, { keepOffered: true });
     logx(`${s.id.slice(0, 8)}: auto keep warm offered after ${ins.paid.pause.count} paid expiries`);
-    vscode.window.showInformationMessage(keep.text, ...keep.buttons).then(a => {
-      if (a === nudges.AUTO_KEEP_WARM) choose(context, cur(), "Auto keep warm").catch(e => logx("auto keep warm: " + e.message));
+    if (quietUi()) hint(st, s, keep.text + " Click, pick this chat, *Auto keep warm*.");
+    else vscode.window.showInformationMessage(keep.text, ...keep.buttons).then(a => {
+      muted(a);
+      if (a === nudges.AUTO_KEEP_WARM) act(() => choose(context, cur(), "Auto keep warm").catch(e => logx("auto keep warm: " + e.message)));
     });
     return;
   }
   // once ever: the model's smaller context-size option (Local chats: the option is VS Code's)
-  const tip = s.kind === "local" && nudges.contextTip(s, report.tierMax(priceFor(s.model)), o, globalState && globalState.get("contextTipShown"));
+  const tipShown = s.preview ? !!mem.tipShown : globalState && globalState.get("contextTipShown");
+  const tip = s.kind === "local" && !quietUi() && nudges.contextTip(s, report.tierMax(sheetOf(s, s.model)), o, tipShown);
   if (tip) {
     st.nudgedFor = s.cacheFrom;
-    if (globalState) globalState.update("contextTipShown", true);
+    if (s.preview) mem.tipShown = true; else if (globalState) globalState.update("contextTipShown", true);
     logx(`${s.id.slice(0, 8)}: context-size tip shown (once)`);
-    vscode.window.showInformationMessage(tip.text);
+    vscode.window.showInformationMessage(tip.text, ...tip.buttons);
   }
 }
 
-// The digest: every cacheKeeper.digestDays (default 7, 0 = never), the spend analysis of that period
+// The digest: every cacheKeeper.nudges.digestDays (default 7, 0 = never), the spend analysis of that period
 // runs in the background; one notification, only when keeping warm and shorter chats would have saved
 // real money. One window does it (the date is taken before the logs are read).
 const DIGEST_CHECK_MS = 10 * 60000;
 async function maybeDigest(context) {
-  const days = Number(cfg("digestDays") === undefined ? 7 : cfg("digestDays")), o = nudgeOptions();
-  if (!o.on || !(days > 0) || !globalState || globalState.get("digestOff")) return;
+  const o = nudgeOptions(), days = o.digestDays;
+  if (!o.digest || !(days > 0) || !globalState || globalState.get("digestOff") || quietUi()) return;
   if (Date.now() - (globalState.get("digestAt") || 0) < days * 86400000) return;
   await globalState.update("digestAt", Date.now());
   const since = Date.now() - days * 86400000;
@@ -1972,11 +2004,66 @@ async function maybeDigest(context) {
   if (a === nudges.OPEN_REPORT) await spendReport(context, days);
 }
 
+// ---------------------------------------------------------------- preview (no chat, no credits)
+// cacheKeeper.previewNudges (not in the Command Palette: for test/live/preview.sh and for checking
+// the wording by eye): a made-up costly chat goes through the real code (its what-ifs, the decisions,
+// the status bar and its tooltip), so what shows is exactly what a real chat would show. Nothing is
+// sent anywhere, the buttons do nothing, and nothing a real chat was told is touched.
+const PREVIEW_ID = "preview-chat", PREVIEW_MS = 120000;
+const PREVIEW_SHEET = { batch_size: 1e6,
+  default: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 2000, max_prompt_tokens: 200000 },
+  long_context: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 2000, max_prompt_tokens: 1000000 } };
+let preview = null;            // { chat, mem, until }
+function sheetOf(s, model) { return s.preview ? PREVIEW_SHEET : priceFor(model); }
+
+/** The made-up chat: 6 messages, 150 calls, 50k to 400k tokens, two pauses paid cold, on Opus 5.5 prices. */
+function previewChat(stage, now) {
+  const ev = [], msgs = 6, per = 25, n = msgs * per, cold = [2, 4], waiting = stage === "waiting";
+  let t = now - (waiting ? 245000 : 20000) - (n * 10 + msgs * 60 + cold.length * 400) * 1000, prev = 0;
+  for (let m = 0; m < msgs; m++) {
+    t += (cold.includes(m) ? 460 : 60) * 1000;
+    ev.push({ t: "user", ts: t, text: m ? `Step ${m}` : "Build the importer" }, { t: "turn_start", ts: t + 5 });
+    for (let i = 0; i < per; i++) {
+      const j = m * per + i, input = Math.round(50000 + 350000 * j / (n - 1)), cached = j === 0 || (i === 0 && cold.includes(m)) ? 0 : prev;
+      t += 10000;
+      if (stage === "commit" && m === msgs - 1 && i === per - 2) ev.push({ t: "commit", ts: t - 2000 });
+      ev.push({ t: "call", ts: t, end: t + 2000, model: "claude-opus-5.5", input, cached, out: 500,
+                credits: (cached * 20 + (input - cached) * 500 + 500 * 2000) / 1e6 });
+      prev = input;
+    }
+    if (!(waiting && m === msgs - 1)) ev.push({ t: "turn_end", ts: t + 2500 });   // waiting: the last turn is still open
+  }
+  const s = core.analyzeTrace("local", `preview/${PREVIEW_ID}`, { events: ev, info: {} }, { now, priceFor: () => PREVIEW_SHEET });
+  return Object.assign(s, { preview: true });
+}
+
+async function previewNudges(context, stage = "split") {
+  const now = Date.now() + (clockOffset || 0);
+  if (stage === "off") { preview = null; all = all.filter(x => !x.preview); updateStatus(context); return; }
+  if (stage === "digest") {
+    const d = nudges.digest({ total: 4210, whatIf: { rows: new Array(12), billed: 3890, coldPause: 520, coldWait: 90, both: 1104 } }, 7, nudges.options(() => undefined));
+    vscode.window.showInformationMessage(d.text, ...d.buttons);
+    return;
+  }
+  // what the made-up chat "was already told", so the stage's own nudge is the one that shows
+  const mem = { split: {}, keepWarm: { splitNever: true }, waiting: { splitNever: true, keepOffered: true },
+                tip: { splitNever: true, keepOffered: true }, commit: { splitNever: true, keepOffered: true, tipShown: true },
+                status: { splitNever: true, keepOffered: true, tipShown: true } }[stage];
+  if (!mem) { vscode.window.showErrorMessage(`Cache Keeper preview: unknown stage "${stage}" (split, keepWarm, waiting, tip, commit, status, digest, off).`); return; }
+  preview = { chat: previewChat(stage, now), mem, until: Date.now() + PREVIEW_MS };
+  insights.delete(PREVIEW_ID);
+  sessions.delete(PREVIEW_ID);
+  all = [preview.chat, ...all.filter(x => !x.preview)];
+  await decide(context);
+}
+
 async function decide(context) {
   await verifyPending();
+  if (preview && Date.now() > preview.until) { preview = null; all = all.filter(x => !x.preview); }
   for (const s of all) {
     const st = stateFor(s.id);
     try { nudge(context, s, st); } catch (e) { logx("nudge: " + (e.stack || e.message)); }
+    if (s.preview) continue;     // shown, never acted on
     if (!managed(s) || s.busy || st.pending) {
       // (a pending message is our own keep-alive still being answered: expected, not worth logging)
       if (!st.pending && (st.mode === "auto" || st.mode === "once") && live(s) > 0 && live(s) <= lead() && st.skipFor !== s.cacheFrom) {
@@ -2066,7 +2153,7 @@ async function decide(context) {
       } else if (!closing(s)) {
         st.actedFor = s.cacheFrom; st.mode = "done";
         logx(`auto keep warm for ${s.id.slice(0, 8)} reached its ${limit} after ${fmtDuration(warmMs(st))}: stopped, no summary`);
-        vscode.window.showInformationMessage(`Cache Keeper: auto keep warm reached its ${limit}; ` +
+        unprompted("info", `Cache Keeper: auto keep warm reached its ${limit}; ` +
           `the cache now expires (${describe(s)}).`);
       } else if (await autoRun(context, s, `auto keep warm reached its ${limit}`)) {
         st.actedFor = s.cacheFrom;
@@ -2098,7 +2185,7 @@ async function decide(context) {
       }
       if (st.offer && st.offer.for === s.cacheFrom && !st.offer.answered) goQuiet(st, s, "warning not answered");
       const actions = await findHandoff(st) ? [NEW_FROM_HANDOFF] : [];
-      vscode.window.showInformationMessage(
+      unprompted("info",
         `Copilot cache expired (${describe(s)}). Your next message there re-sends the context` +
           (s.cost ? `: ~${core.fmt(s.cost.missExtra)} extra credits.` : "."),
         ...actions).then(a => { if (a) newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || s.kind); });
@@ -2200,11 +2287,19 @@ function updateStatus(context) {
         "Click here, pick this chat, then *New chat from handoff*."
       : "Consider starting a new chat from a handoff summary instead.", "");
   }
-  // only when the carried context costs real money (cacheKeeper.nudgeMinCredits): what each call costs, and
+  // only when the carried context costs real money (cacheKeeper.nudges.minCredits): what each call costs, and
   // a finished piece of work as a good moment for a new chat
-  const ins = s.routed ? null : insightFor(s), nopt = nudgeOptions();
-  const committed = nudges.commitHint(s, ins, nopt), carry = nudges.carryLine(ins, nopt);
+  const ins = s.routed ? null : insightFor(s), nopt = optionsFor(s);
+  // Ignore (or a closed warning): no nudge for this chat until you write in it again, the hints here included
+  const ignored = st.mode === "ignore";
+  const committed = nudges.commitHint(s, ins, nopt, ignored ? { muted: true } : nudgeMem(s.id)), carry = nudges.carryLine(ins, nopt);
   if (committed) { md.push(committed, ""); if (r > 0 && !s.busy) statusItem.text += " · $(git-commit) new chat?"; }
+  // cacheKeeper.notifications off: what a nudge would have said, here, for this cache window
+  const hinted = st.hint && st.hint.for === s.cacheFrom && quietUi() && !ignored ? st.hint : null;
+  if (hinted) {
+    md.unshift(`$(${hinted.urgent ? "warning" : "lightbulb"}) ${hinted.text.replace(/^Cache Keeper: /, "")}`, "");
+    statusItem.text += hinted.urgent ? " · $(warning)" : " · $(lightbulb)";
+  }
   if (carry) md.push(carry, "");
   if (s.cost) {
     md.push("| | |", "|---|--:|",
@@ -2221,7 +2316,7 @@ function updateStatus(context) {
   const tip = new vscode.MarkdownString(md.join("\n"), true);
   statusItem.tooltip = tip;
   statusItem.backgroundColor = red ||
-    (costlyRestart || (!s.routed && r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
+    (costlyRestart || (hinted && hinted.urgent) || (!s.routed && r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
   statusItem.show();
 }
 
@@ -2265,6 +2360,7 @@ function activate(context) {
       logx("spend report: " + (e.stack || e.message));
       vscode.window.showErrorMessage("Cache Keeper: spend report failed: " + e.message);
     })),
+    vscode.commands.registerCommand("cacheKeeper.previewNudges", stage => previewNudges(context, stage).catch(e => logx("preview: " + (e.stack || e.message)))),
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = await target("Keep warm now"); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = await target("Write handoff summary now"); if (s) await summaryNow(context, s); }),
