@@ -1606,6 +1606,63 @@ const never = () => new Promise(() => {});
     assert.ok(/\| Local, older chats \| claude-opus-5\.5 \| 3 msgs \|/.test(report.spendMarkdown(a, { days: 60 })));
   });
 
+  // an older chat whose file has each message's calls ("rounds", with the time each ended, s after the message)
+  const roundsFile = (t0, msgs) => [
+    JSON.stringify({ kind: 0, v: { requests: [] } }),
+    JSON.stringify({ kind: 2, k: ["requests"], v: msgs.map((m, i) => ({ timestamp: t0 + m.at * 1000, message: { text: m.text || `step ${i}` },
+      modelId: "copilot/claude-opus-5.5", promptTokens: 200000, completionTokens: 0, elapsedMs: 5000, copilotCredits: m.credits,
+      result: { metadata: { toolCallRounds: m.rounds.map(r => ({ timestamp: String(t0 + (m.at + r) * 1000) })) } } })) })].join("\n") + "\n";
+  const opus = { batch_size: 1e6, default: { input_price: 400, cache_read_price: 20, cache_write_price: 500, output_price: 2000 } };
+  const warm = 200000 * 20e-6, cold = 200000 * 500e-6;
+  const PY_WHATIF = [94.22, 94.22, 85.88, 104.97, 109.21];   // expiries after pauses, while the agent waited; kept warm, split, both
+
+  await check("chat files with call rounds: a cold send is read from the bill (pause, agent's wait), not from the pause alone; what-ifs", () => {
+    const t0 = now - 4 * 3600000;
+    const m = report.chatFileMessages([roundsFile(t0, [
+      { at: 0, credits: 100, rounds: [10] },
+      { at: 20 * 60, credits: warm, rounds: [10] },                    // 20 min later, but billed warm: no expiry
+      { at: 21 * 60, credits: 2 * warm, rounds: [10, 20] },
+      { at: 31 * 60, credits: cold, rounds: [10] },                    // 10 min later, billed a full re-send
+      { at: 32 * 60, credits: warm + cold, rounds: [10, 500] },        // the agent waited 8 min inside the turn
+      { at: 42 * 60, credits: warm, rounds: [10], text: core.KEEPALIVES[0] }])]);
+    assert.deepStrictEqual(m.events[4].rounds.length, 2);
+    const a = report.analyzeSpend([{ kind: "local-msg", id: "old", title: m.title, events: m.events, sheetFor: () => opus }], { since: 0, now });
+    assert.deepStrictEqual(a.misses.map(x => [Math.round((x.ts - t0) / 60000), x.expired, !!x.waited]), [[31, true, false], [32, false, true]]);
+    for (const x of a.misses) assert.ok(Math.abs(x.extra - 200000 * 480e-6) < 5 && x.extra <= x.credits, "never more than the message was billed");
+    assert.strictEqual(a.factors.find(f => f.name === "Expired caches while the agent waited").count, 1);
+    const wi = a.whatIf;
+    assert.strictEqual(wi.rows.length, 1);
+    assert.ok(Math.abs(wi.coldPause - 92) < 6 && Math.abs(wi.coldWait - 92) < 6, `${wi.coldPause} ${wi.coldWait}`);
+    // the 10 min pause takes 2 keep-alives (a read of 200k each): about 92 - 8 saved; the agent's wait is not saved
+    assert.ok(Math.abs(wi.keeper - 84) < 6, String(wi.keeper));
+    // the same figures as the Python helper gives for this chat (test_analyze_spend.py: BillCheckedExpiryTests)
+    assert.deepStrictEqual([wi.coldPause, wi.coldWait, wi.keeper, wi.split, wi.both].map(x => +x.toFixed(2)), PY_WHATIF);
+    const md = report.spendMarkdown(a, { days: 60 });
+    assert.ok(/## What Cache Keeper and shorter chats would have saved/.test(md) && /\(the agent waited\)/.test(md), md);
+  });
+
+  await check("chat files: keep-alives that kept the cache warm until your next message count as an avoided expiry", () => {
+    const t0 = now - 3600000;
+    const m = report.chatFileMessages([roundsFile(t0, [
+      { at: 0, credits: 100, rounds: [10] },
+      { at: 285, credits: 4, rounds: [5], text: core.KEEPALIVES[0] },
+      { at: 570, credits: 4, rounds: [5], text: core.KEEPALIVES[1] },
+      { at: 720, credits: 4, rounds: [5] }])]);                         // back after 12 min, on a warm cache
+    const a = report.analyzeSpend([{ kind: "local-msg", id: "old", title: m.title, events: m.events, sheetFor: () => opus }], { since: 0, now });
+    assert.deepStrictEqual([a.kept.pings, a.kept.avoided, a.kept.spent], [2, 1, 8]);
+    assert.ok(Math.abs(a.kept.avoidedCredits - 199000 * 0.955 * 480e-6) < 1e-6);
+    assert.ok(/2 keep-alives cost 8\.00 credits and avoided 1 expired caches/.test(report.spendMarkdown(a, { days: 60 })));
+  });
+
+  await check("Local debug log: an expiry with no message since the previous call is the agent's wait, not a pause", () => {
+    const call = (ts, cached) => ({ t: "call", ts, model: "claude-opus-5.5", input: 100000, cached, out: 10, credits: 1 });
+    const t0 = now - 3600000;
+    const evs = [{ t: "user", ts: t0, text: "go" }, call(t0 + 1000, 0), call(t0 + 401000, 0),          // waited 400 s inside the turn
+                 { t: "user", ts: t0 + 900000, text: "next" }, call(t0 + 901000, 0)];                   // then a pause
+    const a = report.analyzeSpend([{ kind: "local", id: "l", events: evs, sheetFor: () => opus }], { since: 0, now });
+    assert.deepStrictEqual(a.misses.map(x => [!!x.waited, x.expired]), [[true, false], [false, true]]);
+  });
+
   await check("spend report command: asks the days (60), reads Local logs and older chat files, saves the file, shows its preview", async () => {
     const h = await harness({ answer: never });
     try {

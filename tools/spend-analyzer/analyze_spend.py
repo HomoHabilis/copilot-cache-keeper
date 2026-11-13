@@ -33,6 +33,7 @@ import base64
 import collections
 import datetime as dt
 import glob
+import itertools
 import json
 import os
 import re
@@ -285,9 +286,63 @@ def estimate_credits(model: str, ctx: int, cached: int, written: int, out: int) 
 
 def call(**kw) -> dict:
     base = dict(source="", session="", workspace="", ts=0, model="?", effort=None, ctx=0, cached=0,
-                written=0, out=0, reasoning=0, credits=None, exact=False, kind="agent", user_msg=False)
+                written=0, out=0, reasoning=0, credits=None, exact=False, kind="agent", user_msg=False, own=None)
     base.update(kw)
     return base
+
+
+# Cache Keeper's own messages, as in the extension (core.js: KEEPALIVES_BY_LANG, SUMMARY_TAGS, COMPACT_COMMAND,
+# MARKER). Keep-alives are matched exactly, the rest by how they start. Only add to these lists.
+KEEPALIVES = {
+    "Stepping away for a few minutes. Just reply OK, no tools needed.",
+    "Back shortly. Please reply with only OK and don't run any tools.",
+    "Taking a short break. Reply OK only, no tools.",
+    "Away for a moment. Answer with just OK, without using tools.",
+    "Pausing here for a bit. Only reply OK, no tool calls.",
+    "Be right back. Reply with OK and nothing else, no tools.",
+    "Quick break, I'll continue soon. Just say OK, don't use tools.",
+    "Hold on, I'm away for a few minutes. Reply only OK, no tools.",
+    "Give me a moment. Please answer just OK, no tools.",
+    "I'll be back in a bit. Reply OK, nothing more, no tools.",
+    "Short pause on my side. Just OK please, no tools.",
+    "One moment, I'm stepping out. Reply only with OK, no tools.",
+    "Mi allontano qualche minuto. Rispondi solo OK, senza usare strumenti.",
+    "Torno subito. Rispondi soltanto OK e non usare strumenti.",
+    "Faccio una breve pausa. Rispondi solo OK, niente strumenti.",
+    "Un attimo, sono via per poco. Scrivi solo OK, senza strumenti.",
+    "Pausa veloce, poi riprendo. Rispondi OK e basta, niente strumenti.",
+    "Arrivo tra poco. Solo OK per favore, senza usare strumenti.",
+    "Je m'absente quelques minutes. Réponds juste OK, sans outils.",
+    "Je reviens vite. Réponds seulement OK et n'utilise aucun outil.",
+    "Petite pause. Réponds uniquement OK, pas d'outils.",
+    "Un instant, je m'éloigne. Écris juste OK, sans outils.",
+    "Courte pause, je reprends bientôt. Juste OK, sans outils.",
+    "Je reviens dans un moment. Réponds OK, rien d'autre, sans outils.",
+    "Me ausento unos minutos. Responde solo OK, sin usar herramientas.",
+    "Vuelvo enseguida. Responde únicamente OK y no uses herramientas.",
+    "Hago una pausa corta. Solo OK, sin herramientas.",
+    "Un momento, me alejo un poco. Escribe solo OK, sin herramientas.",
+    "Pausa rápida, sigo pronto. Responde OK y nada más, sin herramientas.",
+    "Vuelvo en un rato. Solo OK por favor, sin herramientas.",
+    "Ich bin ein paar Minuten weg. Antworte nur mit OK, ohne Tools.",
+    "Bin gleich zurück. Bitte nur OK antworten und keine Tools nutzen.",
+    "Kurze Pause. Antworte nur OK, keine Tools.",
+    "Einen Moment, ich bin kurz weg. Schreib nur OK, ohne Tools.",
+    "Kurze Unterbrechung, gleich geht es weiter. Nur OK, keine Tools.",
+    "Ich melde mich gleich wieder. Antworte OK, sonst nichts, ohne Tools.",
+}
+OWN_PREFIXES = ("[cache-keeper]", "[summary]", "[riepilogo]", "[résumé]", "[resumen]", "[Zusammenfassung]", "/compact")
+
+
+def own_kind(text) -> str | None:
+    """'keepalive', 'other' (a summary request, /compact) or None for a message you wrote yourself."""
+    t = str(text or "").strip()
+    if t in KEEPALIVES:
+        return "keepalive"
+    if t.startswith(OWN_PREFIXES):
+        # older versions tagged every message; their summary requests said so
+        return "other" if not t.startswith("[cache-keeper]") or "handoff" in t.lower() else "keepalive"
+    return None
 
 
 def uri_to_local_path(uri: str) -> Path | None:
@@ -370,9 +425,9 @@ def collect_vscode_debug(roots: list[Path], since_ms: int, labels: dict) -> tupl
                     except ValueError:
                         continue
                     if o.get("type") == "user_message" and not sub:
-                        c = str((o.get("attrs") or {}).get("content", ""))
+                        own = own_kind((o.get("attrs") or {}).get("content", ""))
                         calls.append(call(source="vscode", session=sid, workspace=labels.get(ws, ws[:8]),
-                                          ts=o.get("ts", 0), kind="message", user_msg=not c.startswith("[cache-keeper]")))
+                                          ts=o.get("ts", 0), kind="message", user_msg=own is None, own=own))
                         continue
                     if o.get("type") != "llm_request" or o.get("ts", 0) < since_ms:
                         continue
@@ -423,7 +478,9 @@ def turns_as_calls(turns: list[dict], covered: set) -> list[dict]:
             continue
         out.append(call(source="vscode-messages", session=t["session"], workspace=t["workspace"], ts=t["ts"],
                         model=t["model"], effort=t["effort"], ctx=t["prompt"], out=t["out"], credits=t["credits"],
-                        exact=True, kind="message-total", gap=t["gap"], ours=t["ours"], tool_share=t["tool_share"]))
+                        exact=True, kind="message-total", gap=t["gap"], ours=t["ours"], own=t.get("own"),
+                        tool_share=t["tool_share"], rounds=t.get("rounds") or [], nrounds=t.get("nrounds") or 0,
+                        end=t.get("end"), elapsed=t.get("elapsed")))
     return out
 
 
@@ -527,6 +584,19 @@ def session_turns(f: Path, since_ms: int, ws_name: str) -> list[dict]:
         det = {d.get("label"): d.get("percentageOfPrompt") for d in (q.get("promptTokenDetails") or [])}
         msg = q.get("message") or {}
         text = msg.get("text", "") if isinstance(msg, dict) else ""
+        # each model call of the message ("round") with the time its answer ended: the message really ends
+        # with the last one (elapsedMs leaves out the time spent waiting for you to approve a tool)
+        rounds_raw = ((q.get("result") or {}).get("metadata") or {}).get("toolCallRounds") or []
+        rounds = []
+        for r in rounds_raw:
+            try:
+                rounds.append(int(r.get("timestamp")))
+            except (TypeError, ValueError, AttributeError):
+                pass
+        if len(rounds) != len(rounds_raw):
+            rounds = []
+        end = max([ts + el] + rounds) if ts and el else None
+        own = own_kind(text)
         if ts >= since_ms and q.get("copilotCredits") is not None:
             turns.append(dict(source="vscode-turn", session=f.stem, workspace=ws_name, ts=ts,
                               turn=i, model=str(q.get("modelId", "")).split("/")[-1],
@@ -534,10 +604,10 @@ def session_turns(f: Path, since_ms: int, ws_name: str) -> list[dict]:
                               credits=float(q.get("copilotCredits") or 0), prompt=int(q.get("promptTokens") or 0),
                               out=int(q.get("completionTokens") or 0), elapsed=el,
                               tool_share=(det.get("Tool Definitions") or 0) / 100,
-                              ours=text.startswith("[cache-keeper]"),
+                              ours=own is not None, own=own, rounds=rounds, nrounds=len(rounds_raw), end=end,
                               gap=(ts - prev_end) / 1000 if ts and prev_end else None, complete=bool(el)))
-        if ts and el:
-            prev_end = ts + el
+        if end:
+            prev_end = end
     return turns
 
 
@@ -577,8 +647,9 @@ def collect_cli(roots: list[Path], since_ms: int) -> tuple[list[dict], dict]:
                     compactions[sid] += 1
                     last_compaction = ts
                 elif t == "user.message" and ts >= since_ms:
+                    own = own_kind(re.sub(r"\n*<reminder>[\s\S]*$", "", str(d.get("content") or "")))
                     records.append(call(source=src, session=sid, workspace=Path(cwd).name or sid[:8], ts=ts,
-                                        kind="message", user_msg=True))
+                                        kind="message", user_msg=own is None, own=own))
                 elif t == "session.usage_record":
                     u = d.get("usage") or {}
                     nano = (u.get("copilotUsage") or {}).get("totalNanoAiu")
@@ -660,7 +731,9 @@ def claude_calls(f: Path, sid: str, ws: str, since_ms: int) -> list[dict]:
                 if isinstance(c, list) else ""
             tool = isinstance(c, list) and any(isinstance(p, dict) and p.get("type") == "tool_result" for p in c)
             if text.strip() and not tool and not re.match(r"\s*<(local-command|system-reminder)", text):
-                out.append(call(source="claude-harness", session=sid, workspace=ws, ts=ts, kind="message", user_msg=True))
+                own = own_kind(text)
+                out.append(call(source="claude-harness", session=sid, workspace=ws, ts=ts, kind="message",
+                                user_msg=own is None, own=own))
         elif e.get("type") == "assistant" and m.get("usage"):
             start = starts.get(e.get("requestRef"), ts)
             if start < since_ms:
@@ -702,7 +775,9 @@ def codex_calls(f: Path, sid: str, ws: str, since_ms: int) -> list[dict]:
             last_input = ts
             # Codex adds its own context blocks as user messages (<environment_context>, ...): not yours
             if text and not re.fullmatch(r"<[a-z_]+>[\s\S]*</[a-z_]+>", text) and ts >= since_ms:
-                out.append(call(source="codex-harness", session=sid, workspace=ws, ts=ts, kind="message", user_msg=True))
+                own = own_kind(text)
+                out.append(call(source="codex-harness", session=sid, workspace=ws, ts=ts, kind="message",
+                                user_msg=own is None, own=own))
         elif e.get("type") == "response_item" and str(p.get("type", "")).endswith("_call_output"):
             last_input = ts
     return out
@@ -794,6 +869,253 @@ def fmt(x: float) -> str:
     return f"{x:,.0f}" if abs(x) >= 100 else f"{x:,.1f}"
 
 
+# ---------------------------------------------------------------- a chat as a series of calls
+# Every chat becomes a list of its agent calls: {mi (which message of yours), ctx, new (tokens not read
+# from the cache when all goes well), out, cold (None, "pause", "wait" or "other"), gap (s), model, ttl}.
+# The what-ifs (kept warm, split, smaller window) re-price that list.
+
+COLD_KEPT = 0.045        # share of a prompt still read from the cache on a cold send (measured: the system prompt)
+NEAR_TTL = 0.8           # a wait this close to the cache lifetime explains a cold send the bill shows
+MSG_NEW = 800            # tokens a message of yours adds
+KEEP_LEAD = 15           # s before expiry a keep-alive goes out
+KEEP_MAX = 2 * 3600      # Cache Keeper's keep-warm time limit
+KEEP_CAP = 0.5           # ... and its cap: keep-alives may cost this share of what the expiry would add
+PING_NEW, PING_OUT = 60, 15                       # a keep-alive: tokens added, tokens answered
+SUMMARY_OUT, SUMMARY_TOK = 2500, 2500             # a handoff summary: tokens written, tokens read by the new chat
+REREAD, EXTRA_CALLS = 25_000, 4                   # a new chat reads files again: tokens, and extra calls to do it
+NEW_CHAT_MAX = 50_000                             # a new chat's first prompt is the chat's own first prompt, at most this
+WINDOW, WINDOW_AFTER, COMPACT_OUT = 200_000, 0.35, 8000   # a smaller context window: size, share left by a compaction, its output
+MAX_CHATS = 3            # split what-if: at most this many chats
+SPLIT_CANDIDATES = 30    # ... cutting at this many of your messages at most
+WHATIF_TOP, WHATIF_MIN = 30, 50                   # what-ifs for the costliest chats, of at least this many credits
+FIT_RANGE = (0.6, 1.6)   # a chat is simulated only if the price-sheet model lands this close to its bill
+
+
+def _w(r: dict) -> float:
+    return r["write"] or r["input"]
+
+
+def model_cost(c: dict, cold=None) -> float:
+    """One call by the price sheet: the cached part read, the new part written; cold, nearly all written again."""
+    r = rates(c["model"], c["ctx"])
+    cold = c["cold"] if cold is None else cold
+    out = c["out"] * r["out"]
+    if cold:
+        return c["ctx"] * (COLD_KEPT * r["read"] + (1 - COLD_KEPT) * _w(r)) + out
+    new = min(c["new"], c["ctx"])
+    return (c["ctx"] - new) * r["read"] + new * _w(r) + out
+
+
+def rebuild_messages(msgs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """An older chat (one record per message) as a series of calls, and its cold sends.
+
+    A message's calls are its tool-call rounds (their end times are in the chat file; else your median
+    number of calls per message), the context growing evenly up to the message's prompt. A cold send is
+    not guessed from the pause: it is read from the bill. When a message was billed about one (two, ...)
+    full re-send(s) more than its calls cost warm, that many calls were cold: the ones after the longest
+    waits. A wait near the cache lifetime makes it an expiry, before the message (a pause) or between
+    two of its calls (the agent waited for an approval or a long command); otherwise it is unexplained.
+    The pause before a message runs from the start of the previous message's last call, as the cache lifetime does."""
+    series, misses, prev, last_start = [], [], None, None
+    for mi, m in enumerate(sorted(msgs, key=lambda m: m["ts"])):
+        r = rates(m["model"], m["ctx"])
+        if not r or not m["ctx"] or not _w(r):
+            prev, last_start = None, None
+            series = []          # no price: nothing after it can be modelled from what came before
+            continue
+        ends = m.get("rounds") or []
+        n = max(m.get("nrounds") or len(ends) or round(calls_per_message(m)), 1)
+        if len(ends) != n:
+            ends = None
+        compacted = prev is not None and m["ctx"] < 0.8 * prev["ctx"]
+        if prev is None:
+            start = min(m["ctx"], max(20_000, ((m.get("tool_share") or 0.13) + 0.03) * m["ctx"] + 3000))
+        else:
+            start = min(m["ctx"], prev["ctx"] + MSG_NEW) if not compacted else 0.9 * m["ctx"]
+        ttl = ttl_for(m["model"])
+        mine = []
+        for k in range(n):
+            ctx = m["ctx"] if n == 1 else start + (m["ctx"] - start) * k / (n - 1)
+            if k == 0:
+                wait = (m["ts"] - last_start) / 1000 if last_start else 0   # since the cache was last refreshed
+            else:
+                wait = (ends[k] - ends[k - 1]) / 1000 if ends else 0
+            before = series[-1]["ctx"] if series else 0
+            c = dict(mi=mi, k=k, ts=m["ts"] if k == 0 else (ends[k - 1] if ends else m["ts"]), ctx=ctx,
+                     new=max(0, ctx - before) if series and not (compacted and k == 0) else ctx, out=m["out"] / n,
+                     cold=None, gap=max(wait, 0), model=m["model"], ttl=ttl)
+            series.append(c)
+            mine.append(c)
+        warm = sum(model_cost(c, False) for c in mine)
+        resid = m["credits"] - warm
+        one = m["ctx"] * (1 - COLD_KEPT) * (_w(r) - r["read"])
+        judged = prev is not None and not compacted and not m.get("ours") and ttl and m["ctx"] >= MISS_MIN_CTX and one > 0
+        if judged and not m.get("nrounds"):
+            # a chat file that does not say how many calls the message made: the bill cannot be checked, so the
+            # pause decides (longer than the lifetime: expired), for at most what the message cost beyond its output
+            if mine[0]["gap"] >= ttl:
+                mine[0]["cold"] = "pause"
+                misses.append(dict(m, ctx=round(mine[0]["ctx"]), gap=mine[0]["gap"], cause="expired after a pause",
+                                   extra=min(one, max(0, m["credits"] - m["out"] * r["out"]))))
+        else:
+            ncold = max(min(int(resid / one + 0.5), n), 0) if judged else 0
+            for c in sorted(mine, key=lambda c: -c["gap"])[:ncold]:
+                near = c["gap"] >= NEAR_TTL * ttl
+                c["cold"] = ("pause" if c["k"] == 0 else "wait") if near else "other"
+                cause = {"pause": "expired after a pause", "wait": "expired while the agent waited",
+                         "other": "compaction / changed prompt"}[c["cold"]]
+                misses.append(dict(m, ctx=round(c["ctx"]), gap=c["gap"], extra=resid / ncold, cause=cause))
+        m["cold_first"] = bool(mine and mine[0]["cold"])
+        # the cache lifetime runs from the start of the message's last call: the end of the round before it
+        prev = m
+        last_start = (ends[-2] if n > 1 else m["ts"]) if ends else (m.get("end") or m["ts"])
+    return series, misses
+
+
+def call_series(evs: list[dict]) -> list[dict]:
+    """A chat with a record per call (debug logs, Copilot SDK, Claude, Codex, OpenCode) as a series of calls."""
+    series, mi, prev = [], 0, None
+    for c in evs:
+        if c["kind"] == "message":
+            mi += 1 if c["user_msg"] else 0
+            continue
+        if c["kind"] != "agent" or not c["ctx"] or not rates(c["model"], c["ctx"]):
+            continue
+        cold = c.get("cold")
+        new = max(0, c["ctx"] - prev["ctx"]) if (cold and prev) else max(0, c["ctx"] - c["cached"])
+        series.append(dict(mi=mi, k=0 if not prev or prev["mi"] != mi else 1, ts=c["ts"], ctx=c["ctx"], new=new,
+                           out=c["out"], cold=cold, gap=c.get("cold_gap", 0), model=c["model"],
+                           ttl=ttl_for(c["model"], c.get("ttl")), credits=c["credits"]))
+        prev = series[-1]
+    return series
+
+
+def sim_total(series: list[dict], keeper: bool = False) -> float:
+    """The series by the price sheet. keeper: every expiry after a pause that Cache Keeper could have kept
+    warm (within its time limit and its cap) costs its keep-alives instead."""
+    total = 0.0
+    for c in series:
+        if keeper and c["cold"] == "pause" and c["ttl"]:
+            r = rates(c["model"], c["ctx"])
+            n = int(c["gap"] // (c["ttl"] - KEEP_LEAD))
+            ping = (c["ctx"] - min(c["new"], c["ctx"])) * r["read"] + PING_NEW * _w(r) + PING_OUT * r["out"]
+            extra = model_cost(c) - model_cost(c, False)
+            if n >= 1 and c["gap"] <= KEEP_MAX + c["ttl"] and n * ping <= KEEP_CAP * extra:
+                total += model_cost(c, False) + n * ping
+                continue
+        total += model_cost(c)
+    return total
+
+
+def sim_reshape(series: list[dict], cuts=(), window: int | None = None) -> tuple[list[dict], float]:
+    """The same work in shorter chats: a new chat (from a handoff summary) at the start of each message in
+    `cuts`, and/or a compaction whenever the context passes `window`. Returns the new series and what
+    the summaries, the new chats' first prompts, the files read again and the compactions cost."""
+    out, shift, over, prev_mi = [], 0.0, 0.0, None
+    base = min(series[0]["ctx"], NEW_CHAT_MAX)
+    for c in series:
+        r = rates(c["model"], c["ctx"])
+        cold = c["cold"]
+        if c["mi"] in cuts and c["mi"] != prev_mi and out:
+            start = base + SUMMARY_TOK + REREAD
+            if c["ctx"] - shift - c["new"] > start:
+                over += (out[-1]["ctx"] * r["read"] + 300 * _w(r) + SUMMARY_OUT * r["out"] + start * _w(r)
+                         + EXTRA_CALLS * ((base + SUMMARY_TOK + REREAD / 2) * r["read"] + 300 * r["out"]))
+                shift, cold = c["ctx"] - c["new"] - start, None
+        elif window and c["ctx"] - shift > window:
+            after = window * WINDOW_AFTER
+            over += (c["ctx"] - shift) * r["read"] + COMPACT_OUT * r["out"] + after * _w(r)
+            shift = c["ctx"] - after
+        prev_mi = c["mi"]
+        ctx = max(c["ctx"] - shift, min(c["ctx"], base + SUMMARY_TOK))
+        out.append(dict(c, ctx=ctx, new=min(c["new"], ctx), cold=cold))
+    return out, over
+
+
+def best_split(series: list[dict], keeper: bool) -> tuple[float, tuple]:
+    """The cheapest way to do the chat in at most MAX_CHATS chats, cutting at your messages."""
+    starts = sorted({c["mi"] for i, c in enumerate(series) if i and c["mi"] != series[i - 1]["mi"]})
+    if len(starts) > SPLIT_CANDIDATES:
+        starts = [starts[round(i * (len(starts) - 1) / (SPLIT_CANDIDATES - 1))] for i in range(SPLIT_CANDIDATES)]
+    best = (sim_total(series, keeper), ())
+    for n in range(1, MAX_CHATS):
+        for cuts in itertools.combinations(starts, n):
+            s2, over = sim_reshape(series, set(cuts))
+            t = sim_total(s2, keeper) + over
+            if t < best[0] - 1e-9:
+                best = (t, cuts)
+    return best
+
+
+def what_if(series_by_session: dict, credits_by_session: dict) -> dict:
+    """For the costliest chats: what the expiries cost, and what keeping warm, splitting and a smaller
+    context window would have saved. Savings are the price-sheet model's, scaled to the chat's bill."""
+    rows, skipped = [], 0
+    top = sorted(series_by_session, key=lambda k: -credits_by_session.get(k, 0))[:WHATIF_TOP]
+    for key in top:
+        series, billed = series_by_session[key], credits_by_session.get(key, 0)
+        if billed < WHATIF_MIN or len(series) < 2:
+            continue
+        base = sim_total(series)
+        scale = billed / base if base else 0
+        if not FIT_RANGE[0] <= scale <= FIT_RANGE[1]:
+            skipped += 1
+            continue
+        cold = lambda kinds: sum(model_cost(c) - model_cost(c, False) for c in series if c["cold"] in kinds) * scale
+        split, cuts = best_split(series, False)
+        both, cuts_both = best_split(series, True)
+        win = None
+        if max(c["ctx"] for c in series) > WINDOW:
+            s2, over = sim_reshape(series, window=WINDOW)
+            win = (base - sim_total(s2, True) - over) * scale
+        rows.append(dict(key=key, billed=billed, start=series[0]["ts"], max_ctx=max(c["ctx"] for c in series),
+                         cold_pause=cold(("pause",)), cold_wait=cold(("wait",)), cold_other=cold(("other",)),
+                         keeper=(base - sim_total(series, True)) * scale, split=(base - split) * scale,
+                         both=(base - both) * scale, chats=len(cuts_both) + 1, window=win))
+    return dict(rows=rows, skipped=skipped, billed=sum(r["billed"] for r in rows),
+                **{k: sum(r[k] or 0 for r in rows) for k in ("cold_pause", "cold_wait", "keeper", "split", "both", "window")})
+
+
+def kept_warm(by_session: dict) -> dict:
+    """What Cache Keeper's own messages did so far: keep-alives sent and their cost, the expiries they
+    avoided (your next message came after the cache would have expired, and found it warm), summaries."""
+    k = dict(pings=0, spent=0.0, avoided=0, avoided_credits=0.0, summaries=0, summary_credits=0.0)
+    for evs in by_session.values():
+        pending, last_real, cur, first = 0, None, None, False
+        for c in evs:
+            cr = c["credits"] or 0
+            if c["kind"] == "message":
+                cur, first = c.get("own"), True
+                k["pings"] += cur == "keepalive"
+                k["summaries"] += cur == "other"
+                pending += cur == "keepalive"
+                continue
+            own = c.get("own") if c["kind"] == "message-total" else cur
+            if c["kind"] == "message-total":
+                k["pings"] += own == "keepalive"
+                k["summaries"] += own == "other"
+                pending += own == "keepalive"
+            elif c["kind"] != "agent":
+                continue
+            if own == "keepalive":
+                k["spent"] += cr
+            elif own == "other":
+                k["summary_credits"] += cr
+                pending = 0
+            else:
+                ttl, r = ttl_for(c["model"], c.get("ttl")), rates(c["model"], c["ctx"])
+                was_cold = c.get("cold_first") if c["kind"] == "message-total" else c.get("cold")
+                starts = c["kind"] == "message-total" or first
+                if starts and pending and ttl and r and last_real and (c["ts"] - last_real) / 1000 > ttl and not was_cold:
+                    k["avoided"] += 1
+                    k["avoided_credits"] += max(0, c["ctx"] - TYPICAL_NEW) * (1 - COLD_KEPT) * (_w(r) - r["read"])
+                if starts:
+                    pending = 0
+                last_real = c.get("end") or c["ts"]
+            first = False
+    return k
+
+
 def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict:
     model_calls = [c for c in calls if c["kind"] != "message" and c["credits"] is not None]
     msgs = [c for c in model_calls if c["kind"] == "message-total"]       # older VS Code chats, per message
@@ -805,10 +1127,23 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
 
     # 1. expired caches and other misses
     misses = []
+    series_by_session, credits_by_session = {}, {}
     for key, evs in by_session.items():
+        if key[0] == "vscode-messages":
+            # older chats, one record per message: cold sends read from the bill (rebuild_messages)
+            mine = [c for c in evs if c["kind"] == "message-total" and c["credits"] is not None]
+            series, found = rebuild_messages(mine)
+            misses += found
+            if series:
+                series_by_session[key] = series
+                credits_by_session[key] = sum(c["credits"] for c in mine)
+            continue
         prev = None
+        has_messages = any(c["kind"] == "message" for c in evs)
+        message_since = False        # a message (yours or Cache Keeper's) since the previous call
         for c in evs:
             if c["kind"] == "message":
+                message_since = True
                 continue
             if c["kind"] not in ("agent", "compaction"):
                 continue
@@ -818,17 +1153,24 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
                 lost = max(0, c["ctx"] - c["cached"] - TYPICAL_NEW)
                 extra = lost * ((r["write"] or r["input"]) - r["read"]) if r else 0.0
                 ttl = ttl_for(c["model"], c.get("ttl"))
-                cause = ("expired after a pause" if ttl and gap >= ttl - 5 else
+                # expired with no message in between: the agent itself waited (an approval, a long command)
+                waited = has_messages and not message_since
+                cause = (("expired while the agent waited" if waited else "expired after a pause")
+                         if ttl and gap >= ttl - 5 else
                          "compaction / changed prompt" if ttl else "unknown cache lifetime")
+                c["cold"] = "wait" if cause.endswith("waited") else "pause" if cause.startswith("expired") else "other"
+                c["cold_gap"] = gap
                 misses.append(dict(c, gap=gap, extra=extra, cause=cause))
             prev = c
-    for c in msgs:
-        ttl = ttl_for(c["model"])
-        if ttl and c.get("gap") is not None and not c.get("ours") and c["ctx"] >= MISS_MIN_CTX and c["gap"] >= ttl:
-            r = rates(c["model"], c["ctx"])
-            extra = max(0, c["ctx"] - TYPICAL_NEW) * ((r["write"] or r["input"]) - r["read"]) if r else 0.0
-            misses.append(dict(c, extra=extra, cause="expired after a pause"))
-    expired = [m for m in misses if m["cause"].startswith("expired")]
+            message_since = False
+        series = call_series(evs)
+        if series:
+            series_by_session[key] = series
+            credits_by_session[key] = sum(c["credits"] or 0 for c in series)
+    expired = [m for m in misses if m["cause"] == "expired after a pause"]
+    waited = [m for m in misses if m["cause"] == "expired while the agent waited"]
+    whatif = what_if(series_by_session, credits_by_session)
+    kept = kept_warm(by_session)
 
     # 2. reasoning effort: extra output vs the same model's cheapest effort level
     eff = collections.defaultdict(list)
@@ -931,6 +1273,12 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
          "(Claude 5 min, Sol 6.1 30 min).",
          "Reply within the cache lifetime, keep the cache warm with a short message, or start a new chat with a "
          "summary after a long break (Copilot Cache Keeper automates this in VS Code)."),
+        ("Expired caches while the agent waited", sum(m["extra"] for m in waited),
+         f"{len(waited)} calls re-sent their whole context in the middle of a turn: the agent waited longer than the "
+         "cache lifetime for a tool approval or a long command. Keeping warm cannot help here: nothing can be sent "
+         "while the agent works.",
+         "Approve tools quickly or auto-approve the safe ones; run long builds and tests in the background or in a "
+         "terminal of your own, then tell the agent the result."),
         ("Large context re-read on every call", big_extra,
          f"Context above {BIG_CTX // 1000}k tokens is re-read, at the cache price, by every model call.",
          "Start new chats per task; use a smaller context-size setting (e.g. 200K for Claude) so compaction happens "
@@ -956,7 +1304,8 @@ def analyze(calls: list[dict], turns: list[dict], cli_compactions: dict) -> dict
          "Usually small; check if a cheap subagent model is configured."),
     ]
     factors.sort(key=lambda f: -f[1])
-    return dict(total=total, calls=model_calls, misses=misses, expired=expired, effort_rows=effort_rows,
+    return dict(total=total, calls=model_calls, misses=misses, expired=expired, waited=waited, effort_rows=effort_rows,
+                whatif=whatif, kept=kept,
                 unpriced=[c for c in calls if c["kind"] != "message" and c["credits"] is None],
                 mcp_frac=default_frac, tool_share=default_share,
                 ctx_rows=ctx_rows, setting_rows=setting_rows, pause=pause, sessions=sess, factors=factors,
@@ -986,6 +1335,39 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
         w(f"| {i} | {name} | {fmt(val)} | {100 * val / max(a['total'], 1e-9):.0f}% | {what} | {todo} |")
     w("\nFactors overlap (an expired cache on a big context counts in both), so don't add them up.\n")
 
+    wi, kp = a["whatif"], a["kept"]
+    if wi["rows"]:
+        pc = lambda x: f"{fmt(x)} ({100 * x / max(wi['billed'], 1e-9):.0f}%)"
+        w("## What Cache Keeper and shorter chats would have saved\n")
+        w(f"Your {len(wi['rows'])} costliest chats ({fmt(wi['billed'])} credits), priced again call by call. "
+          f"Expired caches cost {pc(wi['cold_pause'])} after pauses and {pc(wi['cold_wait'])} while the agent waited.\n")
+        w(f"- **Kept warm** by Cache Keeper (keep-alives paid, within its 2 h limit and its cap): **{pc(wi['keeper'])}** saved.")
+        w(f"- **Split** into at most {MAX_CHATS} chats with a handoff summary, at the best of your messages: {pc(wi['split'])} saved.")
+        w(f"- **Both: {pc(wi['both'])}** saved.")
+        if wi["window"]:
+            w(f"- A {WINDOW // 1000}k context window (it compacts earlier), kept warm: {pc(wi['window'])} saved, on the chats that went past it.")
+        w("\nThese are alternatives for the same chats: don't add them up.\n")
+        w("| Start | Tool | Workspace | Credits | Max context | Expired: pauses | Expired: agent waited | Kept warm | Split | Both | In chats | "
+          f"{WINDOW // 1000}k window |")
+        w("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        ws_of = {(c["source"], c["session"]): c["workspace"] for c in calls}
+        pr = lambda x, r: f"{fmt(x)} ({100 * x / r['billed']:.0f}%)" if x > 0.005 else "-"
+        for r in wi["rows"][:15]:
+            w(f"| {dt.datetime.fromtimestamp(r['start'] / 1000):%m-%d %H:%M} | {r['key'][0]} | {ws_of.get(r['key'], '')} | "
+              f"{fmt(r['billed'])} | {r['max_ctx'] / 1000:.0f}k | {pr(r['cold_pause'], r)} | {pr(r['cold_wait'], r)} | "
+              f"{pr(r['keeper'], r)} | {pr(r['split'], r)} | {pr(r['both'], r)} | {r['chats']} | "
+              f"{pr(r['window'], r) if r['window'] is not None else ''} |")
+        if wi["skipped"]:
+            w(f"\n{wi['skipped']} chat(s) left out: the price sheet does not explain their bill well enough to simulate them.")
+        w("")
+    if kp["pings"] or kp["summaries"]:
+        net = kp["avoided_credits"] - kp["spent"]
+        w("## What Cache Keeper did so far\n")
+        w(f"{kp['pings']} keep-alives cost {fmt(kp['spent'])} credits and avoided {kp['avoided']} expired caches worth "
+          f"{fmt(kp['avoided_credits'])} credits: **{fmt(abs(net))} credits {'saved' if net >= 0 else 'lost'}**. "
+          f"{kp['summaries']} summaries or compactions cost {fmt(kp['summary_credits'])} credits "
+          "(what the new chats saved is not counted).\n")
+
     w("## By tool and model\n")
     w("`vscode` = Agent Debug Logs, one row per model call. `vscode-messages` = older chats that only have chat "
       "session files, one row per message (a message usually triggers several model calls).\n")
@@ -1005,7 +1387,8 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
     if a["misses"]:
         ex = a["expired"]
         w(f"{len(a['misses'])} calls over {MISS_MIN_CTX // 1000}k context had less than half their prompt cached; "
-          f"{len(ex)} came after a pause longer than the cache lifetime.\n")
+          f"{len(ex)} came after a pause longer than the cache lifetime, {len(a['waited'])} after the agent itself "
+          "waited that long in the middle of a turn.\n")
         w("| When | Tool | Workspace | Model | Context | Cached | Pause | Credits | Extra vs cached | Cause |")
         w("|---|---|---|---|---:|---:|---:|---:|---:|---|")
         for m in sorted(a["misses"], key=lambda m: -m["extra"])[:15]:
@@ -1057,7 +1440,21 @@ def report(a: dict, calls: list[dict], days: int, sources: dict) -> str:
       "(from data only: the call's log, Copilot CLI/SDK logs, the longest gap after which a Local chat still hit the "
       "cache, once longer than 5 min" + (f" ({', '.join(f'{m} ≥{ttl_for(m)}s' for m in sorted(MEASURED_TTLS) if m not in TTLS and ttl_for(m) and ttl_for(m) >= GUESS_TTL + MEASURED_MARGIN)})" if MEASURED_TTLS else "") +
       f", else {', '.join(f'{p} {t}s' for p, t in KNOWN_TTLS)}; other models with no data: not judged). "
-      "Extra = uncached tokens × (write/input price − cache-read price).")
+      "Extra = uncached tokens × (write/input price − cache-read price). \"Expired while the agent waited\": the "
+      "same, with no message between the two calls.")
+    w("- Older VS Code chats (one record per message): a cold send is read from the bill, not guessed from the pause. "
+      "The message's calls are priced warm from the price sheet (its tool-call rounds, the context growing evenly up to "
+      "the message's prompt); when it was billed about one full re-send more than that, one call was cold: the one "
+      f"after the longest wait. A wait of at least {NEAR_TTL:.0%} of the cache lifetime makes it an expiry (before the "
+      "message: a pause; between two of its calls: the agent waited). Pauses are measured from the start of the previous "
+      "message's last call, as the cache lifetime is. Extra = what was billed beyond the warm price.")
+    w(f"- What-ifs: each chat as its series of calls, priced by the price sheet and scaled to its bill; chats the "
+      f"model misses by more than {FIT_RANGE[0]:.0%}-{FIT_RANGE[1]:.0%} are left out. Kept warm: every expiry after a "
+      f"pause of at most {KEEP_MAX // 3600} h costs its keep-alives instead (one per cache lifetime, a read of the whole "
+      f"context each), unless they would cost more than {KEEP_CAP:.0%} of the expiry. Split: a new chat at the best one "
+      f"or two of your messages; each pays a summary ({SUMMARY_OUT} tokens written), its first prompt, {REREAD // 1000}k "
+      f"tokens of files read again and {EXTRA_CALLS} extra calls. {WINDOW // 1000}k window: a compaction (to "
+      f"{WINDOW_AFTER:.0%} of the window) each time the context passes it. What a summary or compaction loses is not priced.")
     w("- Effort: extra output tokens vs the median output of the same model at the lowest effort you used, priced at "
       "the output rate; only counted for xhigh/max.")
     w(f"- Large context: tokens above {BIG_CTX // 1000}k × cache-read price, per agent call.")

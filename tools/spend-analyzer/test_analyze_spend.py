@@ -159,6 +159,102 @@ class ChatFileTests(unittest.TestCase):
         msgs = spend.turns_as_calls(turns, set())
         self.assertEqual([(c["session"], c["workspace"], c["credits"]) for c in msgs], [("empty", "(no folder)", 30.0)])
 
+OPUS = {"batch_size": 1_000_000, "default": {"input_price": 400, "cache_read_price": 20, "cache_write_price": 500,
+                                             "output_price": 2000}}
+
+
+def message(ts, ctx, credits, rounds, out=0, **kw):
+    """One message of an older chat: its calls end at `rounds` (s after it was sent)."""
+    ends = [ts + r * 1000 for r in rounds]
+    return spend.call(source="vscode-messages", session="old", ts=ts, model="claude-opus-5.5", ctx=ctx, out=out,
+                      credits=credits, kind="message-total", rounds=ends, nrounds=len(ends), end=ends[-1],
+                      ours=bool(kw.get("own")), **kw)
+
+
+class BillCheckedExpiryTests(unittest.TestCase):
+    """Older chats (a record per message): a cold send is read from the bill, not guessed from the pause."""
+
+    def setUp(self):
+        prices = spend.PRICES.copy()
+        spend.PRICES.clear()
+        spend.PRICES["claude-opus-5.5"] = OPUS
+        self.addCleanup(spend.PRICES.update, prices)
+        self.addCleanup(spend.PRICES.clear)
+        m = 60_000
+        warm = lambda ctx: ctx * 20e-6            # one call reading its whole prompt from the cache
+        cold = lambda ctx: ctx * 500e-6           # ... writing it all again
+        self.msgs = [
+            message(0, 200_000, 100, [10]),                                   # the chat's first message
+            message(20 * m, 200_000, warm(200_000), [10]),                    # 20 min later, but billed warm: no expiry
+            message(21 * m, 200_000, 2 * warm(200_000), [10, 20]),            # warm
+            message(31 * m, 200_000, cold(200_000), [10]),                    # 10 min later, billed a full re-send
+            message(32 * m, 200_000, warm(200_000) + cold(200_000), [10, 500]),   # the agent waited 8 min in the turn
+            message(42 * m, 200_000, warm(200_000), [10], own="keepalive"),   # Cache Keeper's own: not judged
+        ]
+
+    def test_cold_sends_follow_the_bill(self):
+        a = spend.analyze(self.msgs, [], {})
+        self.assertEqual([(m["ts"] // 60_000, m["cause"]) for m in a["misses"]],
+                         [(31, "expired after a pause"), (32, "expired while the agent waited")])
+        for m in a["misses"]:
+            self.assertAlmostEqual(m["extra"], 200_000 * 480e-6, delta=5)
+            self.assertLessEqual(m["extra"], m["credits"], "never more than the message was billed")
+        names = [f[0] for f in a["factors"]]
+        self.assertIn("Expired caches while the agent waited", names)
+
+    def test_what_if_keeps_the_pause_warm_but_not_the_agents_wait(self):
+        a = spend.analyze(self.msgs, [], {})
+        wi = a["whatif"]
+        self.assertEqual(len(wi["rows"]), 1)
+        self.assertAlmostEqual(wi["cold_pause"], 92, delta=6)
+        self.assertAlmostEqual(wi["cold_wait"], 92, delta=6)
+        # the 10 min pause takes 2 keep-alives (a read of 200k each): about 92 - 8 saved; the wait is not saved
+        self.assertAlmostEqual(wi["keeper"], 84, delta=6)
+        self.assertIn("## What Cache Keeper and shorter chats would have saved", spend.report(a, self.msgs, 60, {}))
+
+    def test_a_pause_past_the_keep_warm_limit_is_not_counted_as_saved(self):
+        late = [dict(m) for m in self.msgs[:3]] + [message(4 * 3_600_000, 200_000, 100, [10])]
+        a = spend.analyze(late, [], {})
+        self.assertEqual([m["cause"] for m in a["misses"]], ["expired after a pause"])
+        self.assertEqual(a["whatif"]["keeper"], 0)
+
+
+class OwnMessageTests(unittest.TestCase):
+    def test_keep_alives_and_summaries_are_recognised(self):
+        self.assertEqual(spend.own_kind(" Stepping away for a few minutes. Just reply OK, no tools needed. "), "keepalive")
+        self.assertEqual(spend.own_kind("[summary] I'm pausing and this chat's cache will expire"), "other")
+        self.assertEqual(spend.own_kind("/compact keep the goal"), "other")
+        self.assertEqual(spend.own_kind("[cache-keeper] keep-alive, reply OK"), "keepalive")
+        self.assertIsNone(spend.own_kind("Stepping away, please continue the refactoring"))
+
+    def test_same_lists_as_the_extension(self):
+        core = Path(__file__).resolve().parents[2] / "core.js"
+        if not core.exists():
+            self.skipTest("core.js is not next to this helper")
+        text = core.read_text(encoding="utf-8")
+        block = text[text.index("const KEEPALIVES_BY_LANG"):text.index("const KEEPALIVE_SET")]
+        import json as _json
+        wordings = {_json.loads(x) for x in __import__("re").findall(r'^\s+("(?:[^"\\]|\\.)*"),\s*$', block, flags=8)}
+        self.assertEqual(wordings, spend.KEEPALIVES, "copy core.js's keep-alive wordings into KEEPALIVES")
+        tags = set(__import__("re").findall(r'"(\[[^"\]]+\])"', text[text.index("const SUMMARY_TAGS"):text.index("const COMPACT_COMMAND")]))
+        self.assertTrue(tags and tags <= set(spend.OWN_PREFIXES))
+
+    def test_kept_warm_counts_what_the_keep_alives_avoided(self):
+        prices = spend.PRICES.copy()
+        spend.PRICES.clear()
+        spend.PRICES["claude-opus-5.5"] = OPUS
+        self.addCleanup(spend.PRICES.update, prices)
+        self.addCleanup(spend.PRICES.clear)
+        m = 60_000
+        msgs = [message(0, 200_000, 100, [10]),
+                message(285_000, 200_000, 4.0, [5], own="keepalive"),
+                message(570_000, 200_000, 4.0, [5], own="keepalive"),
+                message(12 * m, 200_000, 4.0, [5])]                      # back after 12 min, on a warm cache
+        k = spend.analyze(msgs, [], {})["kept"]
+        self.assertEqual((k["pings"], k["avoided"]), (2, 1))
+        self.assertAlmostEqual(k["spent"], 8.0)
+        self.assertAlmostEqual(k["avoided_credits"], 199_000 * 0.955 * 480e-6, places=3)
+
 
 if __name__ == "__main__":
     unittest.main()

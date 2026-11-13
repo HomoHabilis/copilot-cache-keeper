@@ -432,6 +432,27 @@ added, context re-read above 100k, and the costliest misses and chats. The repor
 Cache Keeper's storage (`spend-reports/spend-report-<date>-<days>d.md`, the notification says
 where) and opened as a preview.
 
+It also says what you would have saved, on your 30 costliest chats priced again call by call:
+
+- **Kept warm:** every expiry after a pause that Cache Keeper could have kept warm (within its 2 h
+  limit and its cap), minus what the keep-alives cost.
+- **Split:** the same work in at most 3 chats, a new one from a handoff summary at the best of your
+  messages. Each new chat pays its summary, its first prompt, 25k tokens of files read again and
+  4 extra calls.
+- **Both**, and a **200k context window** (it compacts earlier) for the chats that went past it.
+- **What Cache Keeper did so far:** the keep-alives it sent, what they cost, and the expiries they
+  avoided (your next message came after the cache would have expired and found it warm).
+
+Expired caches come in two kinds. *After a pause* is the one keeping warm prevents. *While the
+agent waited* is an expiry in the middle of a turn (a tool approval or a command that took longer
+than the cache lifetime): nothing can be sent while the agent works, so only quicker approvals or
+background commands avoid it.
+
+For older chats, which only have one record per message, an expiry is read from the bill and not
+guessed from the pause: the message's calls are priced warm, and a message billed about one full
+re-send more than that had a cold call. The what-ifs are estimates: what a summary or a compaction
+loses is not priced.
+
 It reads every chat, not just this window's, on the window's side (WSL, SSH host or container)
 and, for a remote window, on this computer too: Local chats of every workspace, older Local chats
 whose debug log VS Code has removed (from VS Code's own chat files, per message, including windows
