@@ -11,6 +11,81 @@ one window: **Local** (VS Code's own agent), **Copilot** (the Copilot SDK harnes
 (Claude Agent SDK) and **Codex**, the last three run by VS Code's Agent Host.
 See [Supported chat harnesses](#supported-chat-harnesses).
 
+## A session with and without Cache Keeper
+
+One chat, one feature, about five hours of work on Opus 5.5. The example is made up, but its shape is
+the usual one: the context grows with every call, and a few pauses come longer than the 5-minute
+cache. It is priced call by call with Copilot's own prices, by the same model as the
+[spend report](#spend-report), which gives you these figures for your own chats.
+
+![One chat, one working session: the context grows from 42k to 644k tokens over 416 model calls; seven times the cache expired and the whole context was sent again, for $0.88 to $3.02 each](docs/img/example-day.png)
+
+Two things make this session cost $50.53:
+
+- **Expired caches, $13.29.** Six pauses outlasted the cache, and once the agent itself waited seven
+  minutes in the middle of a turn. Each time, the next call sent the whole context again at 25
+  times the cached price. The later in the session, the more that costs: $0.88 at 180k tokens,
+  $3.02 at 630k.
+- **A context that only grows, $27.83.** Every one of the 416 calls re-reads all of it. At 600k
+  tokens that is 12 credits a call before the agent has done anything.
+
+![What the session cost: $50.53 as it happened, $41.69 kept warm by Cache Keeper (17% less), $27.24 as the same work in 3 chats (46% less), $24.74 with both (51% less)](docs/img/example-savings.png)
+
+- **Kept warm:** Cache Keeper sends a tiny message just before each expiry, about 4 to 13 credits
+  each here instead of 88 to 302. Five of the six pauses were short enough to keep warm, so most
+  of that $13.29 goes; the agent's own wait cannot be kept warm, and lunch is better spent on a
+  new chat.
+- **Shorter chats:** the same work in three chats, each started from a handoff summary of the
+  previous one, never carries more than about 350k tokens. This is the larger saving, because it
+  cuts what every call re-reads.
+- **Both** halve the bill. What the summaries leave out is not priced: a new chat reads some files
+  again (counted here), and may have to be told something twice (not counted).
+
+![The bill through the session: as it happened it reaches $50.53, with steps at each expired cache and a slope that steepens as the context grows; kept warm and in 3 chats it reaches $24.74](docs/img/example-bill.png)
+
+### What you see in VS Code
+
+The status bar always shows where the chat you are in stands. Click it to choose what happens.
+
+| | |
+|---|---|
+| ![countdown](docs/img/bar-countdown.png) | The cache of this chat lives 4:36 more. |
+| ![click to choose](docs/img/bar-choose.png) | It is about to expire: keep it warm, summarize, compact or ignore. |
+| ![expired](docs/img/bar-expired.png) | Expired, and large: your next message here would add 192 credits. A new chat from the handoff summary costs a fraction of that. |
+| ![working](docs/img/bar-waiting.png) | The agent has been quiet for almost a cache lifetime: it may be waiting for you. |
+| ![new chat?](docs/img/bar-commit.png) | The agent just committed: a cheap moment to go on in a new chat. |
+
+One minute before a cache expires you are asked once, with what each choice costs:
+
+![The warning: "Build the importer" expires in 50s. Expiry: +192 cr. Buttons: Keep warm (~8.6 cr), Auto keep warm, More...](docs/img/warning.png)
+
+When a chat is costing real money that a different habit would save, it says so, once
+([Nudges](#nudges-only-for-real-spending); each can be switched off, or muted for one chat):
+
+| | |
+|---|---|
+| ![split nudge](docs/img/nudge-split.png) | **Continue in new chat** writes the handoff summary and opens the new chat from it, in one click. |
+| ![Auto keep warm offer](docs/img/nudge-keepwarm.png) | After two paid expiries: one click keeps this chat warm from now on, within a spending cap. |
+| ![the agent may be waiting](docs/img/nudge-waiting.png) | The one expiry keeping warm cannot prevent: approve the tool, or let it be. |
+| ![digest](docs/img/nudge-digest.png) | Once a week, only if it is worth reading. **Open report** shows chat by chat where it went. |
+
+The tooltip of the status bar has the figures for this chat, and the same one-click **Continue in
+new chat**:
+
+![The status-bar tooltip: each model call re-reads 400k tokens, 8.0 cr (in a new chat: about 1.6 cr), with a link "Continue in new chat"; keep-alive ~8.6 cr, expiry adds ~192 cr, handoff summary ~20 cr, session so far 1232 cr](docs/img/tooltip.png)
+
+Prefer no pop-ups at all? With [`cacheKeeper.notifications`](#status-bar-only) off, the status bar
+does all the telling.
+
+### Three habits that do most of it
+
+1. **Away for more than a few minutes on a big chat? Keep it warm**, or let Cache Keeper do it
+   (*Auto keep warm*). A keep-alive costs a few credits; an expiry costs twenty-five times that.
+2. **One piece of work done? Continue in a new chat.** The handoff summary carries the goal, the
+   state, the decisions and the next steps. Every call after that re-reads a fraction.
+3. **Look at the [spend report](#spend-report) now and then.** It shows, for your own chats, what
+   expired caches cost and what the two habits above would have saved.
+
 ## What it does
 
 - **Status bar:** the countdown for the chat where you last typed, kept short, for example
@@ -134,6 +209,13 @@ See [Supported chat harnesses](#supported-chat-harnesses).
   chat it offers **Keep warm now** (asks first, with the cost) instead of Keep warm and Auto keep
   warm. Auto keep warm is only offered when the model's price is known, since its cap is in credits.
   Each choice shows what it does and costs for that chat right now, and the current one is marked.
+- **Continue in new chat** does both steps at once: it asks the agent for the handoff summary and,
+  as soon as the file is written, opens the new chat with it attached and a first message ready for
+  you to send. It is in every chat's menu, in the status-bar tooltip (a link, when the context
+  costs real money to carry), on the split nudge, and in the Command Palette (*Cache Keeper:
+  Continue in new chat*, which you can bind to a key). If a summary written since your last
+  message is still there, the new chat opens right away. On an expired cache it asks first, with
+  the cost, like *Summarize*.
 - **New chat from handoff** opens the new chat in the same harness as the old one (Claude, Codex,
   Copilot SDK) when VS Code has a "new session" command for it; otherwise in a Local chat, and it
   tells you so.

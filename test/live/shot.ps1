@@ -1,5 +1,5 @@
 # Screenshot of one window (by part of its title) into a PNG. Used by preview.sh.
-param([string]$Title = "Extension Development Host", [string]$Out = "shot.png", [switch]$Front)
+param([string]$Title = "Extension Development Host", [string]$Out = "shot.png", [switch]$Front, [switch]$Hover, [switch]$PageDown)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -8,6 +8,9 @@ public class CkWin {
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern void keybd_event(byte k, byte s, uint f, UIntPtr e);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  public struct POINT { public int X, Y; }
   public struct RECT { public int L, T, R, B; }
 }
 "@
@@ -26,8 +29,19 @@ $r = New-Object CkWin+RECT
 [CkWin]::GetWindowRect($p.MainWindowHandle, [ref]$r) | Out-Null
 $w = $r.R - $r.L; $h = $r.B - $r.T
 if ($w -le 0 -or $h -le 0) { Write-Output "MINIMIZED"; exit 1 }
+# -Hover: the mouse goes over Cache Keeper's status-bar entry (the one left of the notification bell, bottom
+# right) so its tooltip opens, and comes back to where it was after the picture.
+# -PageDown: scroll what has the focus (the extension's page) one screen down, then the picture
+if ($PageDown) { [CkWin]::keybd_event(0x22, 0, 0, [UIntPtr]::Zero); [CkWin]::keybd_event(0x22, 0, 2, [UIntPtr]::Zero); Start-Sleep -Milliseconds 900 }
+$was = New-Object CkWin+POINT
+if ($Hover) {
+  [CkWin]::GetCursorPos([ref]$was) | Out-Null
+  [CkWin]::SetCursorPos($r.R - 74, $r.B - 19) | Out-Null; Start-Sleep -Milliseconds 120
+  [CkWin]::SetCursorPos($r.R - 70, $r.B - 19) | Out-Null; Start-Sleep -Milliseconds 1600
+}
 $bmp = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $g.CopyFromScreen($r.L, $r.T, 0, 0, $bmp.Size)
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+if ($Hover) { [CkWin]::SetCursorPos($was.X, $was.Y) | Out-Null }
 Write-Output "OK $w x $h"

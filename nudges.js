@@ -104,8 +104,7 @@ function carryLine(ins, o) {
 function commitHint(s, ins, o, mem = {}) {
   if (!o.commitHint || !ins || s.busy || s.routed || mem.muted || !carryMatters(ins, o)) return null;
   if (!(ins.lastCommit > (s.lastRealUserTs || 0))) return null;
-  return `$(git-commit) **Just committed:** a good moment for a new chat (about ${cr(perCallSaving(ins))} cr less per model call). ` +
-    "Click, pick this chat, *Continue in new chat*.";
+  return `$(git-commit) **Just committed:** a good moment for a new chat (about ${cr(perCallSaving(ins))} cr less per model call). ${continueLink(s)}`;
 }
 
 /**
@@ -136,6 +135,15 @@ function digest(a, days, o) {
     buttons: [OPEN_REPORT, DONT_SHOW_AGAIN] };
 }
 
+/**
+ * A link for the status-bar tooltip that does it in one click: the handoff summary is written, then
+ * the new chat opens from it (the command cacheKeeper.continueInNewChat, for this chat).
+ */
+const CONTINUE_COMMAND = "cacheKeeper.continueInNewChat";
+function continueLink(s) {
+  return `[$(arrow-right) ${CONTINUE}](command:${CONTINUE_COMMAND}?${encodeURIComponent(JSON.stringify([String(s.id)]))} "Write the handoff summary, then open a new chat from it")`;
+}
+
 function name(s) {
   const t = s.title || String(s.id).slice(0, 8);
   return `"${t.length > 30 ? t.slice(0, 29) + "…" : t}"`;
@@ -145,5 +153,5 @@ const CONTINUE = "Continue in new chat", AUTO_KEEP_WARM = "Auto keep warm",
       OPEN_REPORT = "Open report", DONT_SHOW_AGAIN = "Don't show again", GOT_IT = "Got it",
       MUTE_THIS_CHAT = "Mute for this chat";
 
-module.exports = { options, splitNudge, keepWarmOffer, waitingWarning, carryLine, commitHint, contextTip, digest, carryMatters, perCallSaving,
+module.exports = { options, continueLink, CONTINUE_COMMAND, splitNudge, keepWarmOffer, waitingWarning, carryLine, commitHint, contextTip, digest, carryMatters, perCallSaving,
   DEFAULTS, KINDS, CARRY_CALLS, DIGEST_FACTOR, GOT_IT, MUTE_THIS_CHAT, CONTINUE, AUTO_KEEP_WARM, OPEN_REPORT, DONT_SHOW_AGAIN };

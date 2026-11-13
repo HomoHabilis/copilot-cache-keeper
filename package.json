@@ -33,6 +33,10 @@
         "title": "Cache Keeper: Write handoff summary now"
       },
       {
+        "command": "cacheKeeper.continueInNewChat",
+        "title": "Cache Keeper: Continue in new chat (handoff summary, then a new chat from it)"
+      },
+      {
         "command": "cacheKeeper.compactNow",
         "title": "Cache Keeper: Compact chat now"
       },

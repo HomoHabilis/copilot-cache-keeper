@@ -20,6 +20,19 @@ async function main() {
   for (let i = 0; i < 40 && !(await vscode.commands.getCommands(true)).includes("cacheKeeper.previewNudges"); i++) await sleep(500);
   if (!(await vscode.commands.getCommands(true)).includes("cacheKeeper.previewNudges")) { say("ERROR Cache Keeper's preview command is not there"); return; }
   await sleep(2000);
+  if (SHOW === "readme") {
+    // the extension's own page, as VS Code shows the README (do its pictures load?), top and further down
+    const x = vscode.extensions.getExtension("local.copilot-cache-keeper-readme");
+    say(`NOTE readme extension ${x ? "loaded from " + x.extensionPath : "NOT loaded"}; all local.*: ${vscode.extensions.all.filter(e => e.id.startsWith("local.")).map(e => e.id).join(", ")}`);
+    await run("extension.open", "local.copilot-cache-keeper-readme");
+    await sleep(5000);
+    say("STAGE readme-1");
+    for (let i = 2; i <= 6; i++) { await sleep(3500); say(`STAGE readme-${i}`); }
+    await sleep(3000);
+    say("DONE");
+    await sleep(1500); await run("workbench.action.closeWindow");
+    return;
+  }
   if (SHOW) {
     await run("cacheKeeper.previewNudges", SHOW);
     say(`SHOWING ${SHOW}`);
@@ -33,23 +46,17 @@ async function main() {
     say(`STAGE ${stage}`);
     await sleep(HOLD_MS);
   }
-  // The status bar and its tooltip. A status-bar entry shows its hover when it has the keyboard focus:
-  // Cache Keeper's is the one before the last (the notification bell). "quiet-...": as with
-  // cacheKeeper.notifications off, where the bar does all the telling.
+  // The status bar and its tooltip (the script moves the mouse over the entry for that picture).
+  // "quiet-...": as with cacheKeeper.notifications off, where the bar does all the telling.
   for (const stage of ["commit", "warning", "quiet-warning", "quiet-split", "quiet-waiting", "quiet-expired"]) {
     await run("notifications.clearAll");
     await run("cacheKeeper.previewNudges", stage);
     await sleep(1800);
     say(`STAGE bar-${stage}`);
     await sleep(3500);
-    await run("cacheKeeper.previewNudges", "hold");     // no redraw every second: the hover stays open
-    await run("workbench.statusBar.focusLast");
-    await sleep(1200);                       // (one step at a time: the hover follows the focus only then)
-    await run("workbench.statusBar.focusPrevious");
-    await sleep(1500);
-    say(`STAGE tooltip-${stage}`);
-    await sleep(3000);
-    await run("workbench.action.focusActiveEditorGroup");
+    await run("cacheKeeper.previewNudges", "hold");     // no redraw every second: the tooltip stays open
+    say(`STAGE tooltip-${stage}`);            // the script puts the mouse over the entry and takes the picture
+    await sleep(4500);
     await run("cacheKeeper.previewNudges", "release");
     await sleep(400);
   }

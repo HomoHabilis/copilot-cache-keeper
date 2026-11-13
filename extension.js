@@ -936,6 +936,7 @@ function describe(s) {
 // Kept per kind of chat: Local chats are judged afresh when their log folder moves, SDK chats not.
 let baseline = {};             // kind -> (id -> cacheFrom at our first read)
 function seenLive(s) {
+  if (s.preview) return true;    // a preview chat is shown as one you are working in
   const b = baseline[s.kind || "local"];
   if (!b) return false;
   return !b.has(s.id) || b.get(s.id) !== s.cacheFrom;
@@ -1821,8 +1822,10 @@ async function chatMenu(context, cs) {
   // carrying this context costs real money: going on in a new chat, in one step
   const ins = insightFor(cs), per = nudges.perCallSaving(ins);
   const mopt = optionsFor(cs);
-  const fresh = !handoff.length && !cs.routed && mopt.costPerCall && nudges.carryMatters(ins, mopt) ? [{ label: nudges.CONTINUE,
-    detail: `Write the handoff summary, then open a new chat from it (about ${core.fmt(per)} cr less on every model call)` }] : [];
+  // always offered (a handoff already written has its own entry above); what it saves is said when that is real money
+  const fresh = !handoff.length && !cs.routed ? [{ label: nudges.CONTINUE,
+    detail: "Write the handoff summary, then open a new chat from it, in one step" +
+      (mopt.costPerCall && nudges.carryMatters(ins, mopt) ? ` (about ${core.fmt(per)} cr less on every model call)` : "") }] : [];
   const pick = await vscode.window.showQuickPick([...handoff, ...fresh, ...choiceItems(st, cs)],
     { placeHolder: `${describe(cs)}: what should happen before its cache expires? (now: ${modeLabel(st.mode)})` });
   if (pick && pick.label === nudges.CONTINUE) await continueInNewChat(context, all.find(x => x.id === cs.id) || cs);
@@ -1914,6 +1917,8 @@ function insightFor(s) {
 /** Summarize, then open the new chat from the handoff as soon as it is written. */
 async function continueInNewChat(context, s) {
   const st = stateFor(s.id);
+  if (s.preview) { vscode.window.showInformationMessage("Cache Keeper: this is a preview chat, so nothing is written or opened."); return; }
+  if (s.routed) { vscode.window.showInformationMessage(`Cache Keeper: ${chatName(s)} is a Fusion chat; use Summarize from its menu, then New chat from handoff.`); return; }
   if (await findHandoff(st) && st.handoffCovers === s.lastRealUserTs) {
     await newChatFromHandoff(st.handoff, st.handoffLang, st.handoffKind || s.kind);
     return;
@@ -1955,7 +1960,7 @@ function nudge(context, s, st) {
     st.nudgedFor = s.cacheFrom;
     rememberNudge(s.id, { splitAt: split.billed });
     logx(`${s.id.slice(0, 8)}: split nudge (${split.text})`);
-    if (quietUi()) hint(st, s, split.text + " Click, pick this chat, *Continue in new chat*.");
+    if (quietUi()) hint(st, s, split.text + " " + nudges.continueLink(s));
     else vscode.window.showInformationMessage(split.text, ...split.buttons).then(a => {
       muted(a);
       if (a === nudges.CONTINUE) act(() => continueInNewChat(context, cur()).catch(e => logx("continue in new chat: " + e.message)));
@@ -2313,7 +2318,7 @@ function updateStatus(context) {
     md.unshift(`$(${hinted.urgent ? "warning" : "lightbulb"}) ${hinted.text.replace(/^Cache Keeper: /, "")}`, "");
     statusItem.text += hinted.urgent ? " · $(warning)" : " · $(lightbulb)";
   }
-  if (carry) md.push(carry, "");
+  if (carry) md.push(carry + (committed || s.busy ? "" : " " + nudges.continueLink(s)), "");
   if (s.cost) {
     md.push("| | |", "|---|--:|",
       ...(s.routed ? [`| Cold message, worst case | ~${core.fmt(s.cost.missExtra)} cr |`]
@@ -2327,6 +2332,7 @@ function updateStatus(context) {
   if (costlyRestart) md.push(`*Orange: expired with at least ${Math.round(thresholdTokens() / 1000)}k tokens of context.*  `);
   md.push(`Click to manage the ${shownInList} chat(s) in the list.`);
   const tip = new vscode.MarkdownString(md.join("\n"), true);
+  tip.isTrusted = { enabledCommands: [nudges.CONTINUE_COMMAND] };   // the tooltip's "Continue in new chat" link
   statusItem.tooltip = tip;
   statusItem.backgroundColor = red ||
     (costlyRestart || (hinted && hinted.urgent) || (!s.routed && r > 0 && r <= cfg("warnSeconds") && !s.busy) ? new vscode.ThemeColor("statusBarItem.warningBackground") : undefined);
@@ -2377,6 +2383,11 @@ function activate(context) {
     vscode.commands.registerCommand("cacheKeeper.diagnose", () => diagnose(context).catch(e => logx("diagnostics: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.keepWarmNow", async () => { const s = await target("Keep warm now"); if (s) await keepWarmNow(context, s); }),
     vscode.commands.registerCommand("cacheKeeper.summaryNow", async () => { const s = await target("Write handoff summary now"); if (s) await summaryNow(context, s); }),
+    // one step: the handoff summary, then the new chat from it. With a chat's id (the tooltip's link): that chat
+    vscode.commands.registerCommand(nudges.CONTINUE_COMMAND, async id => {
+      const s = (typeof id === "string" && all.find(x => x.id === id)) || await target("Continue in new chat");
+      if (s) await continueInNewChat(context, s).catch(e => logx("continue in new chat: " + (e.stack || e.message)));
+    }),
     vscode.commands.registerCommand("cacheKeeper.compactNow", async () => { const s = await target("Compact now"); if (s) await compactNow(context, s); }),
     // Stop keeping warm: back to the default for every chat (expire, summary rule applies).
     vscode.commands.registerCommand("cacheKeeper.stop", () => {

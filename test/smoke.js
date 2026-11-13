@@ -2069,6 +2069,45 @@ const never = () => new Promise(() => {});
     } finally { h.close(); }
   });
 
+  await check("extension: Continue in new chat in one step: the command (and the tooltip's link, the chat's menu) writes the summary, then opens the new chat", async () => {
+    const h = await harness({ answer: never, ctx: 600000 });
+    try {
+      fs.writeFileSync(h.logFile, longChatLog(h.clock - 20000, { per: 40, to: 600000 }));
+      await h.run(6);
+      // the tooltip's link runs the command for this chat (VS Code only follows links to the commands a tooltip names)
+      const link = /\]\(command:cacheKeeper\.continueInNewChat\?([^ )]+)/.exec(h.status.tooltip.value);
+      assert.ok(link, h.status.tooltip.value);
+      assert.deepStrictEqual(JSON.parse(decodeURIComponent(link[1])), ["sess-1"]);
+      assert.deepStrictEqual(h.status.tooltip.isTrusted, { enabledCommands: ["cacheKeeper.continueInNewChat"] });
+      await h.commands["cacheKeeper.continueInNewChat"]("sess-1");
+      await h.run(20);
+      assert.strictEqual(h.sent.filter(x => x.text.startsWith("[summary]")).length, 1, "the handoff summary is asked for");
+      const opened = h.ran.filter(x => x.id === "workbench.action.chat.open" && x.a && x.a.attachFiles);
+      assert.strictEqual(opened.length, 1, "then the new chat opens with it attached");
+      assert.strictEqual(opened[0].a.isPartialQuery, true, "its first message is left for you to send");
+      // again right away: the summary is still up to date, so only the new chat opens
+      await h.commands["cacheKeeper.continueInNewChat"]("sess-1");
+      await h.run(3);
+      assert.strictEqual(h.sent.filter(x => x.text.startsWith("[summary]")).length, 1, "no second summary");
+      assert.strictEqual(h.ran.filter(x => x.id === "workbench.action.chat.open" && x.a && x.a.attachFiles).length, 2);
+    } finally { h.close(); }
+    // a cheap chat: no nudge, no cost line, but the action is in its menu and in the Command Palette all the same
+    let seen = null;
+    const small = await harness({ answer: never, menu: items => { seen = items.map(i => i.label); return undefined; } });
+    try {
+      small.userTypes();
+      await small.run(5);
+      await small.commands["cacheKeeper.options"]();
+      await new Promise(r => setImmediate(r));
+      assert.ok(seen && seen.includes("Continue in new chat"), JSON.stringify(seen));
+      assert.ok(require("../package.json").contributes.commands.some(c => c.command === "cacheKeeper.continueInNewChat"));
+      await small.commands["cacheKeeper.continueInNewChat"]();      // no id: the chat where you last typed
+      await small.run(15);
+      assert.strictEqual(small.sent.filter(x => x.text.startsWith("[summary]")).length, 1);
+      assert.ok(small.ran.some(x => x.id === "workbench.action.chat.open" && x.a && x.a.attachFiles));
+    } finally { small.close(); }
+  });
+
   await check("extension: a cheap chat gets no nudge and no cost-per-call line; cacheKeeper.nudges off silences a costly one", async () => {
     const h = await harness({ answer: never });
     try {

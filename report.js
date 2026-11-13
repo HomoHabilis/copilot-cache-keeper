@@ -840,5 +840,6 @@ function mcpFraction(toolsText) {
   } catch { return null; }
 }
 
-module.exports = { analyzeSpend, spendMarkdown, liveInsight, tierMax, callCredits, chatFileRequests, chatFileMessages, mcpFraction, subagentCalls, mergeChatEvents,
+// _sim: the call-by-call model itself, for the figures of the guide (docs/make-figures.js) and for tests
+module.exports = { _sim: { modelCost, simTotal, simReshape, bestSplit, ratesOf }, analyzeSpend, spendMarkdown, liveInsight, tierMax, callCredits, chatFileRequests, chatFileMessages, mcpFraction, subagentCalls, mergeChatEvents,
   sdkSessionTotal };
