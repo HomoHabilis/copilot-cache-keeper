@@ -167,7 +167,8 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   let clock = now;
   const opened = [];
   const sent = [], warnings = [], commands = {}, ran = [], lists = [], infos = [], submits = [], closed = [], listed = [];
-  let status;
+  const tooltipWrites = [];
+  let status, tooltip;
   const fakeFs = {
     stat: async u => { const st = fs.statSync(u.fsPath); return { mtime: st.mtimeMs, size: st.size }; },
     readFile: async u => fs.readFileSync(u.fsPath),
@@ -202,7 +203,9 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
                    return { uri: { scheme: "file", fsPath: f, path: f, with(o) { return { ...this, ...o, fsPath: o.path || this.fsPath }; } } };
                  }) },
     window: {
-      createStatusBarItem: () => (status = { show() {}, hide() {}, text: "" }),
+      createStatusBarItem: () => (status = { show() {}, hide() {}, text: "",
+        get tooltip() { return tooltip; },
+        set tooltip(value) { tooltip = value; tooltipWrites.push(value); } }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
       showWarningMessage: async (msg, ...buttons) => { warnings.push({ at: clock, msg }); return answer(msg, buttons, warnings.length); },
       showInformationMessage: async (m, ...buttons) => { infos.push(m); return infoAnswer ? infoAnswer(m, buttons) : undefined; },
@@ -262,7 +265,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
     },
     StatusBarAlignment: { Right: 2 },
     ProgressLocation: { Notification: 15 },
-    MarkdownString: class { constructor(v) { this.value = v; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
+    MarkdownString: class { constructor(v, supportThemeIcons = false) { this.value = v; this.supportThemeIcons = supportThemeIcons; } includes(x) { return this.value.includes(x); } toString() { return this.value; } },
     ThemeColor: class { constructor(id) { this.id = id; } },
     Range: class { constructor(...a) { this.a = a; } },
     WorkspaceEdit: class { constructor() { this.edits = []; } replace(uri, range, text) { this.edits.push([uri, text]); } },
@@ -307,7 +310,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   }
   await ext._read();
   const h = {
-    sent, warnings, commands, ran, dir: tmp, settings, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
+    sent, warnings, commands, ran, tooltipWrites, dir: tmp, settings, ext, get status() { return status; }, logFile: path.join(chat, logName), cacheFrom: clock - 7000 + 4000,
     memento, globalStorage, sdkRoot, lists, logs, opened, chatInput, otherInput, setText, infos, append, submits, closed, listed, vscode,
     get clock() { return clock; },
     /** You write in the chat: a real message and the agent's answer. */
@@ -348,6 +351,32 @@ const never = () => new Promise(() => {});
 
 (async () => {
   const now = Date.now();
+
+  await check("status bar: unchanged tooltip is not reassigned while countdown advances", async () => {
+    const h = await harness({ answer: never });
+    try {
+      await h.run(1);
+      const tooltip = h.status.tooltip, text = h.status.text, writes = h.tooltipWrites.length;
+      assert.ok(tooltip instanceof h.vscode.MarkdownString);
+      const transferred = JSON.parse(JSON.stringify(tooltip));
+      await h.run(3);
+      assert.notStrictEqual(h.status.text, text, "the countdown still advances");
+      assert.strictEqual(h.status.tooltip, tooltip, "reuse the unchanged MarkdownString");
+      assert.strictEqual(h.tooltipWrites.length, writes, "do not invoke the tooltip setter again");
+      assert.ok(!tooltip.value.includes("command:"), "no command link in this tooltip");
+      assert.ok(!tooltip.isTrusted, "no command permissions when there is no link");
+      const refreshed = JSON.parse(JSON.stringify(h.status.tooltip));
+      assert.strictEqual(refreshed.value, transferred.value);
+      assert.strictEqual(refreshed.isTrusted, transferred.isTrusted,
+        "VS Code's identity comparison still matches after separate IPC transfers");
+      assert.strictEqual(tooltip.supportThemeIcons, true);
+      h.userTypes();
+      await h.ext._read();
+      await h.run(3);
+      assert.notStrictEqual(h.status.tooltip.value, tooltip.value, "changed chat details still refresh the tooltip");
+      assert.ok(h.tooltipWrites.length > writes);
+    } finally { h.close(); }
+  });
 
   await check("analyze: prices, timing and costs for an Opus chat", () => {
     const s = core.analyze("/logs/abc123", chatLog(now - 60000), MODELS, now);
