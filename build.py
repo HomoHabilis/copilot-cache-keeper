@@ -61,23 +61,13 @@ types = """<?xml version="1.0" encoding="utf-8"?>
   <Default Extension=".json" ContentType="application/json"/><Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".md" ContentType="text/markdown"/><Default Extension=".vsixmanifest" ContentType="text/xml"/>
     <Default Extension="jpg" ContentType="image/jpeg"/>
+    <Default Extension="png" ContentType="image/png"/>
 </Types>"""
 
 
-def readme_with_pictures(root):
-    """The README as VS Code shows it on the extension's page: that page only loads pictures from
-    https or from the text itself, not files next to the README, so docs/img/*.png are put inside it."""
-    import base64, re
-    text = (root / "README.md").read_text(encoding="utf-8")
-
-    def inline(m):
-        f = root / m.group(2)
-        if not f.exists():
-            return m.group(0)
-        return f"{m.group(1)}data:image/png;base64,{base64.b64encode(f.read_bytes()).decode()})"
-    return re.sub(r"(!\[[^\]]*\]\()(docs/img/[\w.-]+\.png)\)", inline, text)
-
-
+readme = (here / "README.md").read_text(encoding="utf-8")
+details = re.sub(r"!\[([^\]]*)\]\(docs/img/[\w.-]+\.png\)", r"\1", readme)
+details = details.replace("\n\n", "\n\nOpen **Cache Keeper: Documentation** for the illustrated offline version.\n\n", 1)
 out = here / f"{pkg['name']}-{pkg['version']}.vsix"
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr("[Content_Types].xml", types)
@@ -87,5 +77,8 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
     for f in ("extension.js", "core.js", "sqlite.js", "harnesses.js", "report.js", "nudges.js"):
         if (here / f).exists():
             z.write(here / f, f"extension/{f}")
-    z.writestr("extension/README.md", readme_with_pictures(here))
+    z.writestr("extension/README.md", details)
+    z.write(here / "README.md", "extension/README-offline.md")
+    for image in sorted((here / "docs/img").glob("*.png")):
+        z.write(image, f"extension/{image.relative_to(here).as_posix()}")
 print(out)

@@ -280,6 +280,7 @@ async function harness({ answer, settings: extra = {}, ctx = 40000, first, busyO
   fs.mkdirSync(logs, { recursive: true });
   const memento = new Map();
   ext.activate({ storageUri: noFolder ? undefined : { fsPath: path.join(storage, "local.copilot-cache-keeper") }, subscriptions: [],
+                 extensionUri: vscode.Uri.file(path.join(tmp, "extension with spaces")),
                  globalStorageUri: { fsPath: path.join(globalStorage, "local.copilot-cache-keeper") },
                  globalState: { get: k => memento.get(k), update: async (k, v) => { memento.set(k, v); } } });
   await ext._read();                                  // first read: no chats yet
@@ -2188,6 +2189,21 @@ const never = () => new Promise(() => {});
         assert.strictEqual(w.length, expected, h.warnings.map(x => x.msg).join("\n"));
         if (expected) assert.ok(/expires in \d+s/.test(w[0].msg) && /\+\d+ cr/.test(w[0].msg), w[0].msg);
         assert.strictEqual(h.sent.length, 0, "nothing is ever sent while the agent works");
+      } finally { h.close(); }
+    }
+  });
+
+  await check("documentation command: previews the bundled README, also with no workspace open", async () => {
+    assert.ok(require("../package.json").contributes.commands.some(command => command.command === "cacheKeeper.documentation"));
+    for (const noFolder of [false, true]) {
+      const h = await harness({ answer: never, noFolder });
+      try {
+        await h.commands["cacheKeeper.documentation"]();
+        const shown = h.ran.find(command => command.id === "markdown.showPreview");
+        assert.ok(shown);
+        assert.strictEqual(shown.a.fsPath, path.join(h.dir, "extension with spaces", "README-offline.md"));
+        assert.strictEqual(h.sent.length, 0);
+        assert.strictEqual(h.opened.length, 0);
       } finally { h.close(); }
     }
   });

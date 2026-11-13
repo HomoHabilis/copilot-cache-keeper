@@ -26,6 +26,10 @@
         "title": "Cache Keeper: Manage chats in this window"
       },
       {
+        "command": "cacheKeeper.documentation",
+        "title": "Cache Keeper: Documentation"
+      },
+      {
         "command": "cacheKeeper.keepWarmNow",
         "title": "Cache Keeper: Keep warm now"
       },

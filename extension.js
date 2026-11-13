@@ -2375,6 +2375,9 @@ function activate(context) {
   };
   context.subscriptions.push(
     vscode.commands.registerCommand("cacheKeeper.options", () => pickChat(context)),
+    vscode.commands.registerCommand("cacheKeeper.documentation", () => vscode.commands.executeCommand(
+      "markdown.showPreview", vscode.Uri.joinPath(context.extensionUri, "README-offline.md")
+    ).catch(e => vscode.window.showErrorMessage("Cache Keeper: documentation preview failed: " + e.message))),
     vscode.commands.registerCommand("cacheKeeper.spendReport", days => spendReport(context, days).catch(e => {
       logx("spend report: " + (e.stack || e.message));
       vscode.window.showErrorMessage("Cache Keeper: spend report failed: " + e.message);

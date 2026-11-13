@@ -48,17 +48,27 @@ jobs:
           set -e
           VSIX=$(ls copilot-cache-keeper-*.vsix)
           python3 - "$VSIX" <<'EOF'
-          import json, sys, zipfile
+          import json, pathlib, re, sys, zipfile
           z = zipfile.ZipFile(sys.argv[1])
           names = set(z.namelist())
           need = {"[Content_Types].xml", "extension.vsixmanifest", "extension/package.json",
-                  "extension/extension.js", "extension/core.js", "extension/sqlite.js", "extension/harnesses.js"}
+              "extension/extension.js", "extension/core.js", "extension/sqlite.js", "extension/harnesses.js",
+              "extension/README.md", "extension/README-offline.md"}
           missing = need - names
           assert not missing, f"missing in vsix: {missing}"
           pkg = json.loads(z.read("extension/package.json"))
           manifest = z.read("extension.vsixmanifest").decode()
           assert f'Version="{pkg["version"]}"' in manifest, "manifest version differs from package.json"
           assert pkg["main"] == "./extension.js"
+          readme = z.read("extension/README-offline.md")
+          assert readme == pathlib.Path("README.md").read_bytes(), "README changed during packaging"
+          details = z.read("extension/README.md").decode()
+          assert not re.search(r'!\[[^\]]*\]\(', details), "images cannot load in the extension Details tab"
+          assert "Cache Keeper: Documentation" in details
+          images = re.findall(r'!\[[^\]]*\]\((docs/img/[\w.-]+\.png)\)', readme.decode())
+          assert images, "README images missing"
+          for image in images:
+              assert z.read(f"extension/{image}") == pathlib.Path(image).read_bytes(), image
           print(f"{sys.argv[1]}: {len(names)} files, version {pkg['version']}, OK")
           EOF
 
