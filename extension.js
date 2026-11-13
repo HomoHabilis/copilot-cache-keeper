@@ -33,7 +33,7 @@ function cfg(key) { return vscode.workspace.getConfiguration("cacheKeeper").get(
  * have said. Still shown: questions before spending credits, things that went wrong, and the answer
  * to something you clicked or ran yourself.
  */
-function quietUi() { return cfg("notifications") === false; }
+function quietUi() { return cfg("notifications") === false || !!(preview && preview.quiet); }   // (or a preview of it)
 /** A notification nobody asked for (a warning, a notice, a nudge): not shown with cacheKeeper.notifications off. */
 function unprompted(level, text, ...buttons) {
   if (quietUi()) { logx(`not shown (cacheKeeper.notifications is off): ${text}`); return Promise.resolve(undefined); }
@@ -1687,6 +1687,7 @@ async function offer(context, s) {
   // Closed (X): a deliberate "not now", so the same as Ignore: nothing automatic, nothing spent,
   // no more warnings until you write in the chat again. (A warning that just slides into the
   // notification center is not closed: it stays unanswered, see decide().)
+  if (s.preview) return;         // a preview: shown, never acted on
   if (!pick) { goQuiet(st, s, "warning closed"); setMode(st, s, "ignore"); return; }
   st.quietFor = undefined;
   // Clicked late, from the notification center: the warning's cache window may be over. A keep-warm
@@ -2013,13 +2014,15 @@ const PREVIEW_ID = "preview-chat", PREVIEW_MS = 120000;
 const PREVIEW_SHEET = { batch_size: 1e6,
   default: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 2000, max_prompt_tokens: 200000 },
   long_context: { input_price: 400, cache_write_price: 500, cache_read_price: 20, output_price: 2000, max_prompt_tokens: 1000000 } };
-let preview = null;            // { chat, mem, until }
+let preview = null;            // { chat, mem, until, quiet (shown as with cacheKeeper.notifications off) }
 function sheetOf(s, model) { return s.preview ? PREVIEW_SHEET : priceFor(model); }
 
 /** The made-up chat: 6 messages, 150 calls, 50k to 400k tokens, two pauses paid cold, on Opus 5.5 prices. */
 function previewChat(stage, now) {
+  // how long ago its last call started: just now, almost a cache lifetime (a warning is due), or more (expired)
   const ev = [], msgs = 6, per = 25, n = msgs * per, cold = [2, 4], waiting = stage === "waiting";
-  let t = now - (waiting ? 245000 : 20000) - (n * 10 + msgs * 60 + cold.length * 400) * 1000, prev = 0;
+  const age = { waiting: 245000, warning: 250000, expired: 330000 }[stage] || 20000;
+  let t = now - age - (n * 10 + msgs * 60 + cold.length * 400) * 1000, prev = 0;
   for (let m = 0; m < msgs; m++) {
     t += (cold.includes(m) ? 460 : 60) * 1000;
     ev.push({ t: "user", ts: t, text: m ? `Step ${m}` : "Build the importer" }, { t: "turn_start", ts: t + 5 });
@@ -2039,7 +2042,12 @@ function previewChat(stage, now) {
 
 async function previewNudges(context, stage = "split") {
   const now = Date.now() + (clockOffset || 0);
+  // "quiet-<stage>": the same, as with cacheKeeper.notifications off (status bar only)
+  const quiet = /^quiet-/.test(stage);
+  stage = stage.replace(/^quiet-/, "");
   if (stage === "off") { preview = null; all = all.filter(x => !x.preview); updateStatus(context); return; }
+  // hold / release: the status bar stops being redrawn every second, so a hover on it stays open (for a screenshot)
+  if (stage === "hold" || stage === "release") { if (preview) preview.hold = stage === "hold"; if (stage === "release") updateStatus(context); return; }
   if (stage === "digest") {
     const d = nudges.digest({ total: 4210, whatIf: { rows: new Array(12), billed: 3890, coldPause: 520, coldWait: 90, both: 1104 } }, 7, nudges.options(() => undefined));
     vscode.window.showInformationMessage(d.text, ...d.buttons);
@@ -2048,11 +2056,15 @@ async function previewNudges(context, stage = "split") {
   // what the made-up chat "was already told", so the stage's own nudge is the one that shows
   const mem = { split: {}, keepWarm: { splitNever: true }, waiting: { splitNever: true, keepOffered: true },
                 tip: { splitNever: true, keepOffered: true }, commit: { splitNever: true, keepOffered: true, tipShown: true },
-                status: { splitNever: true, keepOffered: true, tipShown: true } }[stage];
-  if (!mem) { vscode.window.showErrorMessage(`Cache Keeper preview: unknown stage "${stage}" (split, keepWarm, waiting, tip, commit, status, digest, off).`); return; }
-  preview = { chat: previewChat(stage, now), mem, until: Date.now() + PREVIEW_MS };
+                status: { splitNever: true, keepOffered: true, tipShown: true },
+                // the expiry warning and the expired chat: no nudge on top
+                warning: { muted: true, tipShown: true }, expired: { muted: true, tipShown: true } }[stage];
+  if (!mem) { vscode.window.showErrorMessage(`Cache Keeper preview: unknown stage "${stage}" (split, keepWarm, waiting, tip, commit, status, warning, expired, digest, off; quiet-<stage> for the status bar only).`); return; }
+  preview = { chat: previewChat(stage, now), mem, until: Date.now() + PREVIEW_MS, quiet };
   insights.delete(PREVIEW_ID);
   sessions.delete(PREVIEW_ID);
+  // the expiry warning: shown as for a real chat (a preview chat is otherwise never acted on)
+  if (stage === "warning") offer(context, preview.chat);
   all = [preview.chat, ...all.filter(x => !x.preview)];
   await decide(context);
 }
@@ -2226,6 +2238,7 @@ function mmss(r) { return `${Math.floor(r / 60)}:${String(Math.floor(r % 60)).pa
 function countdown(s, r = live(s)) { return (s.ttlAssumed ? "~" : "") + mmss(r); }
 
 function updateStatus(context) {
+  if (preview && preview.hold) return;              // a preview's hover is being looked at
   const list = all.filter(managed);
   const s = currentChat();      // the chat where you last typed
   if (!s) { statusItem.hide(); return; }

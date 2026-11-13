@@ -1949,7 +1949,25 @@ const never = () => new Promise(() => {});
       assert.strictEqual(h.submits.length, 0);
       assert.ok(!h.memento.get("nudgeMemory") || !h.memento.get("nudgeMemory")["preview-chat"], "nothing remembered");
       assert.ok(!h.memento.get("contextTipShown"), "the real one-time tip is still to come");
+      // the expiry warning itself, then the same as with cacheKeeper.notifications off: the status bar only
+      const before = { infos: h.infos.length, warnings: h.warnings.length };
+      await pv("warning");
+      assert.ok(h.warnings.slice(before.warnings).some(x => /"Build the importer" expires in \d+s/.test(x.msg)), "the usual warning");
+      await pv("quiet-warning");
+      assert.ok(/\$\(bell\) Build the importer .* click to choose/.test(h.status.text), h.status.text);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.warningBackground");
+      await pv("quiet-split");
+      assert.ok(/\$\(lightbulb\)/.test(h.status.text) && /^\$\(lightbulb\) "Build the importer" has cost/.test(h.status.tooltip.value), h.status.text);
+      await pv("quiet-waiting");
+      assert.ok(/working.*\$\(warning\)/.test(h.status.text) && h.status.tooltip.includes("may be waiting for your approval"), h.status.text);
+      assert.strictEqual(h.status.backgroundColor.id, "statusBarItem.warningBackground");
+      await pv("quiet-expired");
+      assert.ok(/\$\(warning\) expired · \+192 cr/.test(h.status.text), h.status.text);
+      assert.strictEqual(h.infos.length + h.warnings.length, before.infos + before.warnings + 1, "the quiet stages pop up nothing");
+      await h.run(8);
+      assert.strictEqual(h.sent.length, 0, "still nothing sent");
       await pv("off");
+      assert.strictEqual(h.settings.notifications, undefined, "the setting itself is untouched");
       await h.run(3);
       assert.ok(!/git-commit/.test(h.status.text) && !String(h.status.tooltip).includes("Build the importer"), h.status.text);
     } finally { h.close(); }

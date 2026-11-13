@@ -75,6 +75,16 @@ Palette), so the wording, the buttons and the wrapping are what a real chat woul
 is opened and nothing is sent: it costs no credits.** It takes a screenshot of that window at each
 step and closes it after about a minute.
 
+It also shows the status bar on its own: after a commit, with the usual expiry warning, and as
+with `cacheKeeper.notifications` off (stages `quiet-warning`, `quiet-split`, `quiet-waiting`,
+`quiet-expired`), where the bar does all the telling. For each it tries to open the tooltip by
+giving the entry the keyboard focus; that does not always take, so some `tooltip-...` screenshots
+show no tooltip. To look at one yourself:
+
+```bash
+test/live/preview.sh --show quiet-split      # that stage only, on screen for 2 minutes: hover the status bar
+```
+
 Use it after changing a nudge's text: a notification with no button is cut to one line, long ones
 wrap to four or five, and a button label that is too long is cut. Look at the screenshots.
 
